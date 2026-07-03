@@ -7,5 +7,6 @@ source("scripts/context.R")
 for (f in sort(list.files("scripts/metrics", pattern = "\\.R$", full.names = TRUE))) source(f)
 source("scripts/analyze.R")
 source("scripts/export.R")
+source("scripts/update.R")
 
 test_dir("tests/testthat", stop_on_failure = TRUE)

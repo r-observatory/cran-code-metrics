@@ -38,6 +38,10 @@ clone_package <- function(pkg, dest, base = CRAN_GIT_BASE, token = NULL) {
 #' @param repo  Path to a local git repository directory.
 #' @return data.frame(version, ref, date, commit) ordered by date ascending.
 #'   All columns are character.  Returns a zero-row frame when no tags match.
+#' @note Assumes the repository uses lightweight tags (as CRAN mirror repos do).
+#'   For lightweight tags, %(objectname) in for-each-ref output is the commit
+#'   SHA directly.  Annotated tags would require %(*objectname) to dereference,
+#'   which is not handled here.
 list_versions <- function(repo) {
   empty <- data.frame(
     version = character(0L), ref    = character(0L),
@@ -100,13 +104,14 @@ list_versions <- function(repo) {
   commits  <- commits[ord]
   dates    <- dates[ord]
 
-  # De-duplicate by commit SHA: keep first (oldest) occurrence
-  seen <- character(0L)
+  # De-duplicate by commit SHA: keep first (oldest) occurrence.
+  # Use a hashed environment for O(1) membership tests instead of O(n) %in%.
+  seen <- new.env(hash = TRUE, parent = emptyenv())
   keep <- logical(length(commits))
   for (i in seq_along(commits)) {
-    if (!commits[i] %in% seen) {
+    if (!exists(commits[i], envir = seen, inherits = FALSE)) {
       keep[i] <- TRUE
-      seen     <- c(seen, commits[i])
+      assign(commits[i], TRUE, envir = seen)
     }
   }
 
@@ -141,6 +146,31 @@ extract_version <- function(repo, ref, dest) {
              include.dirs = FALSE, no.. = TRUE)
 }
 
+# Resolve a git numstat path that contains a rename arrow ( => ).
+# git emits renames as either:
+#   brace form:  "pre/{old => new}/post"
+#   plain form:  "old/path => new/path"
+# Returns the new (right-hand) path in both cases.
+.resolve_rename_path <- function(path) {
+  if (!grepl(" => ", path, fixed = TRUE)) return(path)
+  # Brace form: pre/{a => b}/post
+  m <- regmatches(path, regexec("^(.*?)\\{([^}]*) => ([^}]*)\\}(.*)$", path))[[1L]]
+  if (length(m) == 5L) {
+    pre    <- m[2L]
+    b      <- m[4L]   # new name (right-hand side)
+    post   <- m[5L]
+    result <- paste0(pre, b, post)
+    # Collapse double slashes that arise when b is empty
+    result <- gsub("//+", "/", result, perl = TRUE)
+    # Strip a leading or trailing slash left by empty b
+    result <- sub("^/", "", result)
+    result <- sub("/$", "", result)
+    return(result)
+  }
+  # Plain form: "old => new" -- take the right-hand side
+  trimws(sub("^.* => ", "", path))
+}
+
 #' Compute per-file, per-commit churn from the full git history of a clone.
 #'
 #' Parses `git log --numstat --format=...` output in a single pass.
@@ -163,11 +193,14 @@ package_churn <- function(repo) {
   )
 
   # Separator: __C__<full_SHA>\t<authordate ISO>\t<subject>
-  # Use %09 (decimal) not %x09 (hex); Apple git does not expand %xNN in log format.
+  # git log --format uses %x09 (hex escape) for a literal tab.
+  # This is the OPPOSITE of for-each-ref, which requires %09 (decimal):
+  # Apple git 2.50+ does not expand %xNN in for-each-ref format strings
+  # but DOES expand them in git log pretty-format strings.
   raw <- suppressWarnings(
     system2("git",
             c("-C", repo, "log", "--numstat",
-              "--format=__C__%H%09%ai%09%s",
+              "--format=__C__%H%x09%ai%x09%s",
               "--diff-filter=ACMRD"),
             stdout = TRUE, stderr = FALSE)
   )
@@ -184,9 +217,10 @@ package_churn <- function(repo) {
       parts   <- strsplit(rest, "\t", fixed = TRUE)[[1L]]
       cur_commit  <- if (length(parts) >= 1L) parts[1L] else NA_character_
       subject     <- if (length(parts) >= 3L) parts[3L] else ""
-      # Extract version string from "version X.Y.Z" in the subject
+      # Extract version string from "version X.Y.Z" in the subject.
+      # Separator class includes dash so "0.20-45" and "3.5-7" parse fully.
       m <- regmatches(subject,
-                      regexpr("[0-9]+[._][0-9]+([._][0-9]+)*", subject,
+                      regexpr("[0-9]+[._-][0-9]+([._-][0-9]+)*", subject,
                               perl = TRUE))
       cur_version <- if (length(m) == 1L) m else NA_character_
     } else if (nzchar(trimws(line))) {
@@ -194,7 +228,7 @@ package_churn <- function(repo) {
       if (length(parts) < 3L) next
       add_s <- parts[1L]
       del_s <- parts[2L]
-      fpath <- parts[3L]
+      fpath <- .resolve_rename_path(parts[3L])
       # Binary files: numstat shows "-" for both counts
       added   <- if (add_s == "-") NA_integer_ else suppressWarnings(as.integer(add_s))
       deleted <- if (del_s == "-") NA_integer_ else suppressWarnings(as.integer(del_s))

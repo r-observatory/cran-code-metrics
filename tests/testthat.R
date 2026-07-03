@@ -4,7 +4,7 @@ library(testthat)
 source("scripts/config.R")
 source("scripts/git.R")
 source("scripts/context.R")
-source("scripts/metrics/structure.R")
+for (f in sort(list.files("scripts/metrics", pattern = "\\.R$", full.names = TRUE))) source(f)
 source("scripts/analyze.R")
 
 test_dir("tests/testthat", stop_on_failure = TRUE)

@@ -7,7 +7,15 @@
 #' Each value is a function(ctx) -> named list of scalar metric values.
 #' Add more groups here when new metric modules are implemented.
 METRIC_GROUPS <- list(
-  structure = metrics_structure
+  structure   = metrics_structure,
+  functions   = metrics_functions,
+  docs        = metrics_docs,
+  tests       = metrics_tests,
+  security    = metrics_security,
+  health      = metrics_health,
+  portability = metrics_portability,
+  legal       = metrics_legal,
+  meta        = metrics_meta
 )
 
 #' Compute all registered metrics for one package version.
@@ -84,81 +92,89 @@ analyze_package <- function(repo_dir, package) {
     date   <- versions_df$date[i]
     commit <- versions_df$commit[i]
 
-    # Extract this version's tree into a fresh temp directory
-    tmp <- tempfile(pattern = paste0("ccm_", package, "_"))
-    dir.create(tmp, recursive = TRUE)
-    files <- tryCatch(
-      extract_version(repo_dir, ref, tmp),
-      error = function(e) character(0L)
-    )
+    # Per-version work is wrapped in local() so on.exit fires per iteration
+    # rather than accumulating in the outer function's exit handlers.
+    # This ensures temp-dir cleanup even when the loop body throws.
+    iter <- local({
+      tmp <- tempfile(pattern = paste0("ccm_", package, "_"))
+      dir.create(tmp, recursive = TRUE)
+      on.exit(unlink(tmp, recursive = TRUE, force = TRUE), add = TRUE)
 
-    # Build a read_fn closed over this iteration's extraction directory
-    read_fn <- local({
-      .d <- tmp
-      function(path) {
-        full <- file.path(.d, path)
-        if (!file.exists(full)) return("")
-        paste(readLines(full, warn = FALSE), collapse = "\n")
+      files <- tryCatch(
+        extract_version(repo_dir, ref, tmp),
+        error = function(e) character(0L)
+      )
+
+      # Build a read_fn closed over this iteration's extraction directory
+      read_fn <- local({
+        .d <- tmp
+        function(path) {
+          full <- file.path(.d, path)
+          if (!file.exists(full)) return("")
+          paste(readLines(full, warn = FALSE), collapse = "\n")
+        }
+      })
+
+      # Subset churn_all to this version's commit
+      churn_v <- if (nrow(churn_all) > 0L && !is.na(commit)) {
+        # Commit SHAs from list_versions may be full or abbreviated;
+        # match on startsWith to handle both
+        mask <- startsWith(churn_all$commit, commit) |
+                startsWith(commit, churn_all$commit)
+        ch <- churn_all[mask, c("file", "added", "deleted"), drop = FALSE]
+        rownames(ch) <- NULL
+        ch
+      } else {
+        data.frame(file = character(0L), added = integer(0L),
+                   deleted = integer(0L), stringsAsFactors = FALSE)
       }
+
+      ctx <- build_context(
+        package      = package,
+        version      = v,
+        ref          = ref,
+        date         = date,
+        files        = files,
+        read_fn      = read_fn,
+        churn_df     = churn_v,
+        prev_exports = prev_exports
+      )
+
+      metrics <- analyze_version(ctx)
+
+      # Stamp identity columns
+      metrics[["package"]]  <- package
+      metrics[["version"]]  <- v
+      metrics[["released"]] <- date %||% NA_character_
+
+      # Coerce each metric to a length-1 scalar (guard against bad group output)
+      safe_metrics <- lapply(metrics, function(x) {
+        if (is.null(x) || length(x) != 1L) NA else x
+      })
+
+      # API diff
+      curr_exports <- tryCatch(ctx$namespace$exports, error = function(e) character(0L))
+      curr_exports <- curr_exports %||% character(0L)
+      added_exp    <- setdiff(curr_exports, prev_exports %||% character(0L))
+      removed_exp  <- setdiff(prev_exports %||% character(0L), curr_exports)
+
+      api_row <- data.frame(
+        package         = package,
+        version         = v,
+        exports_added   = as.character(
+          jsonlite::toJSON(added_exp,   auto_unbox = FALSE)),
+        exports_removed = as.character(
+          jsonlite::toJSON(removed_exp, auto_unbox = FALSE)),
+        n_exports       = length(curr_exports),
+        stringsAsFactors = FALSE
+      )
+
+      list(safe_metrics = safe_metrics, api_row = api_row, prev_exports = curr_exports)
     })
 
-    # Subset churn_all to this version's commit
-    churn_v <- if (nrow(churn_all) > 0L && !is.na(commit)) {
-      # Commit SHAs from list_versions may be full or abbreviated;
-      # match on startsWith to handle both
-      mask <- startsWith(churn_all$commit, commit) |
-              startsWith(commit, churn_all$commit)
-      ch <- churn_all[mask, c("file", "added", "deleted"), drop = FALSE]
-      rownames(ch) <- NULL
-      ch
-    } else {
-      data.frame(file = character(0L), added = integer(0L),
-                 deleted = integer(0L), stringsAsFactors = FALSE)
-    }
-
-    ctx <- build_context(
-      package      = package,
-      version      = v,
-      ref          = ref,
-      date         = date,
-      files        = files,
-      read_fn      = read_fn,
-      churn_df     = churn_v,
-      prev_exports = prev_exports
-    )
-
-    metrics <- analyze_version(ctx)
-
-    # Stamp identity columns
-    metrics[["package"]]  <- package
-    metrics[["version"]]  <- v
-    metrics[["released"]] <- date %||% NA_character_
-
-    # Coerce each metric to a length-1 scalar (guard against bad group output)
-    safe_metrics <- lapply(metrics, function(x) {
-      if (is.null(x) || length(x) != 1L) NA else x
-    })
-    summary_rows[[i]] <- safe_metrics
-
-    # API diff
-    curr_exports <- tryCatch(ctx$namespace$exports, error = function(e) character(0L))
-    curr_exports <- curr_exports %||% character(0L)
-    added_exp    <- setdiff(curr_exports, prev_exports %||% character(0L))
-    removed_exp  <- setdiff(prev_exports %||% character(0L), curr_exports)
-
-    api_rows[[i]] <- data.frame(
-      package         = package,
-      version         = v,
-      exports_added   = as.character(
-        jsonlite::toJSON(added_exp,   auto_unbox = FALSE)),
-      exports_removed = as.character(
-        jsonlite::toJSON(removed_exp, auto_unbox = FALSE)),
-      n_exports       = length(curr_exports),
-      stringsAsFactors = FALSE
-    )
-
-    prev_exports <- curr_exports
-    unlink(tmp, recursive = TRUE)
+    summary_rows[[i]] <- iter$safe_metrics
+    api_rows[[i]]     <- iter$api_row
+    prev_exports      <- iter$prev_exports
   }
 
   # Assemble summary data.frame from list of named lists

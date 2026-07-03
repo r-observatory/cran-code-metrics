@@ -174,3 +174,61 @@ test_that("clone_package returns FALSE for a non-existent repo (offline-safe)", 
   )
   expect_false(result)
 })
+
+test_that("package_churn parses dash-separated version strings fully", {
+  repo <- tempfile("ccm_dashver_")
+  on.exit(unlink(repo, recursive = TRUE), add = TRUE)
+
+  dir.create(repo)
+  system2("git", c("init", repo), stdout = FALSE, stderr = FALSE)
+  dir.create(file.path(repo, "R"))
+  writeLines("x <- 1", file.path(repo, "R", "x.R"))
+  .git(repo, "add", ".")
+  .gitc(repo, "commit", "-m", shQuote("version 1.0-3"))
+  .git(repo, "tag", "1.0-3")
+
+  # Also verify that a dot-only version still parses whole
+  writeLines("x <- 2", file.path(repo, "R", "x.R"))
+  .git(repo, "add", ".")
+  .gitc(repo, "commit", "-m", shQuote("version 1.14.8"))
+  .git(repo, "tag", "1.14.8")
+
+  ch <- package_churn(repo)
+
+  expect_s3_class(ch, "data.frame")
+  expect_true(nrow(ch) >= 1L)
+  # Dash version must be captured whole, not truncated to "1.0"
+  expect_true("1.0-3" %in% ch$version)
+  # Dot version must still parse whole
+  expect_true("1.14.8" %in% ch$version)
+})
+
+test_that("package_churn resolves renamed file paths to the new path", {
+  repo <- tempfile("ccm_rename_")
+  on.exit(unlink(repo, recursive = TRUE), add = TRUE)
+
+  dir.create(repo)
+  system2("git", c("init", repo), stdout = FALSE, stderr = FALSE)
+  dir.create(file.path(repo, "R"))
+  writeLines("old <- 1", file.path(repo, "R", "old.R"))
+  .git(repo, "add", ".")
+  .gitc(repo, "commit", "-m", shQuote("version 1.0"))
+  .git(repo, "tag", "1.0")
+
+  # Rename the file and commit
+  .git(repo, "mv", "R/old.R", "R/new.R")
+  .gitc(repo, "commit", "-m", shQuote("version 1.1"))
+  .git(repo, "tag", "1.1")
+
+  ch <- package_churn(repo)
+
+  expect_s3_class(ch, "data.frame")
+  # No file path in any row should contain the literal " => " arrow
+  expect_false(any(grepl(" => ", ch$file, fixed = TRUE)))
+  # The rename commit rows must record the new path, not the old one
+  rename_rows <- ch[!is.na(ch$version) & ch$version == "1.1", ]
+  expect_true(nrow(rename_rows) >= 1L)
+  expect_true(any(rename_rows$file == "R/new.R"))
+  # added and deleted must be integer/numeric (not NA for a text rename)
+  expect_true(is.integer(rename_rows$added) || is.numeric(rename_rows$added))
+})

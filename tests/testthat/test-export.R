@@ -274,3 +274,234 @@ test_that("metrics_fingerprint handles an empty summary_df", {
   expect_type(fp, "character")
   expect_equal(nchar(fp), 64L)
 })
+
+# ---------------------------------------------------------------------------
+# open_or_init_db
+# ---------------------------------------------------------------------------
+
+test_that("open_or_init_db creates DB with fixed-schema tables and failures table", {
+  tmp <- tempfile(fileext = ".db")
+  on.exit(unlink(tmp), add = TRUE)
+
+  con <- open_or_init_db(tmp)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  tables <- DBI::dbListTables(con)
+  expect_true("cran_code_churn"       %in% tables)
+  expect_true("cran_api_history"      %in% tables)
+  expect_true("cran_metrics_failures" %in% tables)
+  # cran_code_summary is created lazily by upsert_shard
+  expect_false("cran_code_summary" %in% tables)
+
+  # indexes on churn
+  idx <- DBI::dbGetQuery(con,
+    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='cran_code_churn'")$name
+  expect_gte(length(idx), 2L)
+})
+
+test_that("open_or_init_db on existing DB is idempotent and returns a valid connection", {
+  tmp <- tempfile(fileext = ".db")
+  on.exit(unlink(tmp), add = TRUE)
+
+  con1 <- open_or_init_db(tmp)
+  DBI::dbDisconnect(con1)
+
+  con2 <- open_or_init_db(tmp)
+  on.exit(DBI::dbDisconnect(con2), add = TRUE)
+
+  expect_true(DBI::dbIsValid(con2))
+  tables <- DBI::dbListTables(con2)
+  expect_true("cran_metrics_failures" %in% tables)
+})
+
+# ---------------------------------------------------------------------------
+# db_analyzed_state
+# ---------------------------------------------------------------------------
+
+test_that("db_analyzed_state returns empty frame when cran_code_summary absent", {
+  tmp <- tempfile(fileext = ".db")
+  on.exit(unlink(tmp), add = TRUE)
+
+  con <- open_or_init_db(tmp)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  result <- db_analyzed_state(con)
+  expect_equal(nrow(result), 0L)
+  expect_true("package" %in% names(result))
+  expect_true("version" %in% names(result))
+})
+
+test_that("db_analyzed_state returns one row per package with latest version", {
+  tmp <- tempfile(fileext = ".db")
+  on.exit(unlink(tmp), add = TRUE)
+
+  con <- open_or_init_db(tmp)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  # Write a summary with two packages, two versions each.
+  # latest_release_date is set only on the last row per package (as
+  # add_cross_version_metrics does).
+  df <- data.frame(
+    package             = c("pkgA", "pkgA", "pkgB", "pkgB"),
+    version             = c("1.0",  "1.1",  "2.0",  "2.1"),
+    released            = c("2024-01-01", "2024-06-01", "2024-02-01", "2024-07-01"),
+    latest_release_date = c(NA_character_, "2024-06-01",
+                            NA_character_, "2024-07-01"),
+    stringsAsFactors = FALSE
+  )
+  DBI::dbWriteTable(con, "cran_code_summary", df, row.names = FALSE)
+
+  result <- db_analyzed_state(con)
+  result <- result[order(result$package), ]
+  rownames(result) <- NULL
+
+  expect_equal(nrow(result), 2L)
+  expect_equal(result$package, c("pkgA", "pkgB"))
+  expect_equal(result$version, c("1.1", "2.1"))
+})
+
+# ---------------------------------------------------------------------------
+# upsert_shard
+# ---------------------------------------------------------------------------
+
+test_that("upsert_shard inserts rows into a fresh DB", {
+  tmp <- tempfile(fileext = ".db")
+  on.exit(unlink(tmp), add = TRUE)
+
+  con <- open_or_init_db(tmp)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  upsert_shard(con, .make_summary(), .make_churn(), .make_api())
+
+  expect_equal(
+    DBI::dbGetQuery(con, "SELECT COUNT(*) AS n FROM cran_code_summary")$n, 3L)
+  expect_equal(
+    DBI::dbGetQuery(con, "SELECT COUNT(*) AS n FROM cran_code_churn")$n, 3L)
+  expect_equal(
+    DBI::dbGetQuery(con, "SELECT COUNT(*) AS n FROM cran_api_history")$n, 3L)
+})
+
+test_that("upsert_shard delete-then-insert: re-analyzing a package leaves no duplicate rows", {
+  tmp <- tempfile(fileext = ".db")
+  on.exit(unlink(tmp), add = TRUE)
+
+  con <- open_or_init_db(tmp)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  # First upsert: pkgA at versions 1.0 and 1.1, pkgB at 2.0.
+  upsert_shard(con, .make_summary(), .make_churn(), .make_api())
+
+  # Re-analyze pkgA only (same rows -- simulates re-analysis returning same data).
+  pkgA_summary <- .make_summary()[.make_summary()$package == "pkgA", ]
+  pkgA_churn   <- .make_churn()[.make_churn()$package   == "pkgA", ]
+  pkgA_api     <- .make_api()[.make_api()$package       == "pkgA", ]
+  upsert_shard(con, pkgA_summary, pkgA_churn, pkgA_api)
+
+  # Total row counts must be the same as after the first upsert.
+  expect_equal(
+    DBI::dbGetQuery(con, "SELECT COUNT(*) AS n FROM cran_code_summary")$n, 3L)
+  expect_equal(
+    DBI::dbGetQuery(con, "SELECT COUNT(*) AS n FROM cran_code_churn")$n, 3L)
+  expect_equal(
+    DBI::dbGetQuery(con, "SELECT COUNT(*) AS n FROM cran_api_history")$n, 3L)
+})
+
+test_that("upsert_shard handles schema growth via ALTER TABLE", {
+  tmp <- tempfile(fileext = ".db")
+  on.exit(unlink(tmp), add = TRUE)
+
+  con <- open_or_init_db(tmp)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  # First upsert: minimal schema with new_metric column.
+  df1 <- data.frame(package = "pkgA", version = "1.0",
+                    new_metric = NA_integer_, stringsAsFactors = FALSE)
+  upsert_shard(con, df1, .empty_churn(), .empty_api())
+
+  cols_after_first <- DBI::dbListFields(con, "cran_code_summary")
+  expect_true("new_metric" %in% cols_after_first)
+
+  # Second upsert: adds a new column not in the existing schema.
+  df2 <- data.frame(package = "pkgB", version = "2.0",
+                    new_metric = 42L, extra_col = "hello",
+                    stringsAsFactors = FALSE)
+  expect_no_error(upsert_shard(con, df2, .empty_churn(), .empty_api()))
+
+  cols_after_second <- DBI::dbListFields(con, "cran_code_summary")
+  expect_true("extra_col" %in% cols_after_second)
+
+  # pkgB has the new column value.
+  row_b <- DBI::dbGetQuery(con,
+    "SELECT extra_col FROM cran_code_summary WHERE package = 'pkgB'")
+  expect_equal(row_b$extra_col, "hello")
+
+  # pkgA's row still present with NA for the new column.
+  row_a <- DBI::dbGetQuery(con,
+    "SELECT extra_col FROM cran_code_summary WHERE package = 'pkgA'")
+  expect_true(is.na(row_a$extra_col))
+})
+
+test_that("upsert_shard coerces logical columns to 0/1 integer", {
+  tmp <- tempfile(fileext = ".db")
+  on.exit(unlink(tmp), add = TRUE)
+
+  con <- open_or_init_db(tmp)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  df <- data.frame(package = "pkgA", version = "1.0",
+                   flag = TRUE, stringsAsFactors = FALSE)
+  upsert_shard(con, df, .empty_churn(), .empty_api())
+
+  row <- DBI::dbGetQuery(con, "SELECT flag FROM cran_code_summary")
+  expect_equal(row$flag, 1L)
+})
+
+# ---------------------------------------------------------------------------
+# db_fingerprint
+# ---------------------------------------------------------------------------
+
+test_that("db_fingerprint returns 64-character SHA-256 hex from DB contents", {
+  tmp <- tempfile(fileext = ".db")
+  on.exit(unlink(tmp), add = TRUE)
+
+  con <- open_or_init_db(tmp)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  upsert_shard(con, .make_summary(), .make_churn(), .make_api())
+
+  fp <- db_fingerprint(con)
+  expect_type(fp, "character")
+  expect_equal(nchar(fp), 64L)
+  expect_true(grepl("^[0-9a-f]{64}$", fp))
+})
+
+test_that("db_fingerprint changes after new packages are upserted", {
+  tmp <- tempfile(fileext = ".db")
+  on.exit(unlink(tmp), add = TRUE)
+
+  con <- open_or_init_db(tmp)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  df1 <- data.frame(package = "pkgA", version = "1.0", stringsAsFactors = FALSE)
+  upsert_shard(con, df1, .empty_churn(), .empty_api())
+  fp1 <- db_fingerprint(con)
+
+  df2 <- data.frame(package = "pkgB", version = "2.0", stringsAsFactors = FALSE)
+  upsert_shard(con, df2, .empty_churn(), .empty_api())
+  fp2 <- db_fingerprint(con)
+
+  expect_false(fp1 == fp2)
+})
+
+test_that("db_fingerprint on empty DB returns a valid SHA-256 hex string", {
+  tmp <- tempfile(fileext = ".db")
+  on.exit(unlink(tmp), add = TRUE)
+
+  con <- open_or_init_db(tmp)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  fp <- db_fingerprint(con)
+  expect_type(fp, "character")
+  expect_equal(nchar(fp), 64L)
+  expect_true(grepl("^[0-9a-f]{64}$", fp))
+})

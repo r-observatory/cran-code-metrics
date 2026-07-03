@@ -22,13 +22,6 @@
   do.call(rbind, padded)
 }
 
-# Drop rows whose 'package' column is in pkgs.
-.drop_packages <- function(df, pkgs) {
-  if (is.null(df) || nrow(df) == 0L || length(pkgs) == 0L) return(df)
-  if (!"package" %in% names(df)) return(df)
-  df[!df$package %in% pkgs, , drop = FALSE]
-}
-
 .empty_summary <- function() {
   data.frame(package = character(0L), version = character(0L),
              stringsAsFactors = FALSE)
@@ -50,6 +43,42 @@
     n_exports       = integer(0L),
     stringsAsFactors = FALSE
   )
+}
+
+# Increment consecutive_failures for a package in cran_metrics_failures.
+.record_failure <- function(con, pkg) {
+  now_str  <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+  existing <- DBI::dbGetQuery(con,
+    "SELECT consecutive_failures FROM cran_metrics_failures WHERE package = ?",
+    params = list(pkg))
+  if (nrow(existing) == 0L) {
+    DBI::dbExecute(con,
+      "INSERT INTO cran_metrics_failures (package, consecutive_failures, last_attempt)
+       VALUES (?, 1, ?)",
+      params = list(pkg, now_str))
+  } else {
+    DBI::dbExecute(con,
+      "UPDATE cran_metrics_failures
+       SET consecutive_failures = consecutive_failures + 1, last_attempt = ?
+       WHERE package = ?",
+      params = list(now_str, pkg))
+  }
+  invisible(NULL)
+}
+
+# Delete a package's failure record (reset after a successful analysis).
+.reset_failure <- function(con, pkg) {
+  DBI::dbExecute(con,
+    "DELETE FROM cran_metrics_failures WHERE package = ?",
+    params = list(pkg))
+  invisible(NULL)
+}
+
+# Return packages with consecutive_failures >= MAX_CLONE_FAILURES.
+.permanent_failures <- function(con) {
+  DBI::dbGetQuery(con,
+    "SELECT package FROM cran_metrics_failures WHERE consecutive_failures >= ?",
+    params = list(MAX_CLONE_FAILURES))$package
 }
 
 # ---------------------------------------------------------------------------
@@ -118,90 +147,51 @@ default_io <- function() {
 
 #' Run one sharded update of the cran-code-metrics pipeline.
 #'
-#' Reads the prior published DB (if present in out_dir) as accumulated state,
-#' determines which packages need analysis (new or updated), processes the next
-#' shard, merges fresh rows with the carry-forward, writes the updated DB, and
-#' emits a manifest.json.
+#' Opens (or creates) the SQLite DB at out_dir/DB_FILENAME, determines which
+#' packages need analysis by querying the DB (not by reading whole tables),
+#' processes the next shard, upserts only the shard's rows in-place (bounded
+#' to O(shard) memory), and emits a manifest.json.
+#'
+#' Clone and analyze failures are tracked per-package. Packages that have
+#' failed >= MAX_CLONE_FAILURES consecutive times are permanently excluded from
+#' the to-do list and counted in the manifest permanent_failures field.
 #'
 #' @param io         IO interface: list with $package_list() and $clone().
 #'   Use default_io() for production; inject a fake for tests.
 #' @param out_dir    Directory to read prior DB from and write outputs to.
 #' @param shard_size Maximum packages to analyze in this run.
 #'   Defaults to SHARD_SIZE from config.R.
-#' @param force_full When TRUE, re-analyze all packages in the universe
-#'   regardless of carry-forward state.
+#' @param force_full When TRUE, wipes all existing metric rows and re-analyzes
+#'   all packages (excluding permanent failures) from scratch.
 #' @return Manifest list (invisibly).
 run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE) {
   if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
   db_path <- file.path(out_dir, DB_FILENAME)
 
-  # ---- 1. Carry-forward: read prior DB if present --------------------------
-  acc_summary <- NULL
-  acc_churn   <- NULL
-  acc_api     <- NULL
-  analyzed    <- character(0L)  # named vector: package -> latest version in DB
+  # ---- 1. Open DB (creates tables if absent) --------------------------------
+  con <- open_or_init_db(db_path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
 
-  if (file.exists(db_path)) {
-    con <- tryCatch(
-      DBI::dbConnect(RSQLite::SQLite(), db_path),
-      error = function(e) {
-        warning(sprintf("Could not open prior DB '%s': %s",
-                        db_path, conditionMessage(e)))
-        NULL
-      }
-    )
-    if (!is.null(con)) {
-      tryCatch({
-        tables <- DBI::dbListTables(con)
-        if ("cran_code_summary" %in% tables) {
-          acc_summary <- DBI::dbReadTable(con, "cran_code_summary")
-        }
-        if ("cran_code_churn" %in% tables) {
-          acc_churn <- DBI::dbReadTable(con, "cran_code_churn")
-        }
-        if ("cran_api_history" %in% tables) {
-          acc_api <- DBI::dbReadTable(con, "cran_api_history")
-        }
-      }, error = function(e) {
-        warning(sprintf("Error reading prior DB tables: %s", conditionMessage(e)))
-      }, finally = {
-        DBI::dbDisconnect(con)
-      })
+  # ---- 2. Analyzed state (O(n_packages) query, not full table read) ---------
+  if (isTRUE(force_full)) {
+    # Wipe all metric rows so everything is treated as unseen.
+    tables <- DBI::dbListTables(con)
+    for (tbl in c("cran_code_summary", "cran_code_churn", "cran_api_history")) {
+      if (tbl %in% tables) DBI::dbExecute(con, sprintf("DELETE FROM %s", tbl))
     }
-  }
-
-  # Build analyzed: package -> latest version already stored.
-  # Primary: add_cross_version_metrics() sets latest_release_date only on the
-  # last-version row per package. Fallback: last version row seen in DB.
-  if (!is.null(acc_summary) && nrow(acc_summary) > 0L &&
-      "package" %in% names(acc_summary) && "version" %in% names(acc_summary)) {
-    if ("latest_release_date" %in% names(acc_summary)) {
-      date_rows <- acc_summary[!is.na(acc_summary$latest_release_date), ,
-                               drop = FALSE]
-    } else {
-      date_rows <- acc_summary[integer(0L), , drop = FALSE]
-    }
-
-    analyzed <- if (nrow(date_rows) > 0L) {
-      setNames(as.character(date_rows$version),
-               as.character(date_rows$package))
+    analyzed <- character(0L)
+  } else {
+    analyzed_df <- db_analyzed_state(con)
+    analyzed <- if (nrow(analyzed_df) > 0L) {
+      setNames(as.character(analyzed_df$version),
+               as.character(analyzed_df$package))
     } else {
       character(0L)
     }
-
-    # Fallback: packages with no non-NA latest_release_date row.
-    missing_pkgs <- setdiff(
-      unique(as.character(acc_summary$package)),
-      names(analyzed)
-    )
-    for (pkg in missing_pkgs) {
-      vers <- acc_summary$version[acc_summary$package == pkg]
-      analyzed[[pkg]] <- as.character(vers[length(vers)])
-    }
   }
 
-  # ---- 2. Universe ---------------------------------------------------------
+  # ---- 3. Universe ----------------------------------------------------------
   universe <- io$package_list()
   if (!is.data.frame(universe) || nrow(universe) == 0L) {
     universe <- data.frame(package = character(0L), latest_version = character(0L),
@@ -209,16 +199,20 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE)
   }
   n_universe <- nrow(universe)
 
-  # ---- 3. To-do: packages that need analysis --------------------------------
+  # ---- 4. Permanent failures: exclude from to-do ----------------------------
+  perm_fail_pkgs <- .permanent_failures(con)
+
+  # ---- 5. To-do: packages that need analysis --------------------------------
   if (isTRUE(force_full)) {
-    todo_pkgs <- sort(as.character(universe$package))
+    todo_pkgs <- sort(as.character(
+      universe$package[!universe$package %in% perm_fail_pkgs]
+    ))
   } else {
     is_todo <- vapply(seq_len(n_universe), function(i) {
       pkg <- as.character(universe$package[i])
+      if (pkg %in% perm_fail_pkgs) return(FALSE)  # permanently excluded
       lv  <- universe$latest_version[i]
-
       if (!pkg %in% names(analyzed)) return(TRUE)   # never analyzed
-
       stored_v <- analyzed[[pkg]]
       # Archived packages (NA latest_version): skip once analyzed.
       if (is.na(lv)) return(FALSE)
@@ -235,7 +229,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE)
     todo_pkgs
   }
 
-  # ---- 4. Analyze the shard ------------------------------------------------
+  # ---- 6. Analyze the shard ------------------------------------------------
   shard_summary_list <- list()
   shard_churn_list   <- list()
   shard_api_list     <- list()
@@ -252,6 +246,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE)
     if (!isTRUE(ok)) {
       unlink(dest, recursive = TRUE, force = TRUE)
       shard_failures <- c(shard_failures, pkg)
+      .record_failure(con, pkg)
       next
     }
 
@@ -270,45 +265,41 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE)
 
     if (is.null(res)) {
       shard_failures <- c(shard_failures, pkg)
+      .record_failure(con, pkg)
     } else {
       shard_summary_list[[pkg]] <- res$summary
       shard_churn_list[[pkg]]   <- res$churn
       shard_api_list[[pkg]]     <- res$api
+      .reset_failure(con, pkg)
     }
   }
 
-  # ---- 5. Merge: drop refreshed packages, row-bind carry-forward + fresh ----
-  fresh_pkgs <- names(shard_summary_list)
+  # ---- 7. Upsert shard into DB in-place (O(shard) memory) ------------------
+  fresh_pkgs    <- names(shard_summary_list)
+  fresh_summary <- .rbind_union_all(shard_summary_list) %||% .empty_summary()
+  fresh_churn   <- .rbind_union_all(shard_churn_list)   %||% .empty_churn()
+  fresh_api     <- .rbind_union_all(shard_api_list)     %||% .empty_api()
 
-  # Remove any prior rows for packages being refreshed this shard.
-  kept_summary <- .drop_packages(acc_summary, fresh_pkgs)
-  kept_churn   <- .drop_packages(acc_churn,   fresh_pkgs)
-  kept_api     <- .drop_packages(acc_api,     fresh_pkgs)
-
-  # Combine the shard's fresh rows (union-column-tolerant).
-  fresh_summary <- .rbind_union_all(shard_summary_list)
-  fresh_churn   <- .rbind_union_all(shard_churn_list)
-  fresh_api     <- .rbind_union_all(shard_api_list)
-
-  # Merge carry-forward with fresh (union columns; fill NA for new schema cols).
-  full_summary <- .rbind_union_all(list(kept_summary, fresh_summary)) %||%
-    .empty_summary()
-  full_churn   <- .rbind_union_all(list(kept_churn,   fresh_churn))   %||%
-    .empty_churn()
-  full_api     <- .rbind_union_all(list(kept_api,     fresh_api))     %||%
-    .empty_api()
-
-  # ---- 6. Export -----------------------------------------------------------
-  export_metrics(db_path, full_summary, full_churn, full_api)
-
-  # ---- 7. Manifest ---------------------------------------------------------
-  n_analyzed_pkgs <- if (nrow(full_summary) > 0L &&
-                         "package" %in% names(full_summary)) {
-    length(unique(full_summary$package))
-  } else {
-    0L
+  if (length(fresh_pkgs) > 0L) {
+    upsert_shard(con, fresh_summary, fresh_churn, fresh_api)
   }
-  new_fp <- metrics_fingerprint(full_summary)
+
+  # ---- 8. Manifest ---------------------------------------------------------
+  # cran_code_summary is created lazily by upsert_shard; may not exist yet if
+  # this is the first run and every package in the shard failed.
+  n_analyzed_pkgs <- {
+    tbls <- DBI::dbListTables(con)
+    if ("cran_code_summary" %in% tbls) {
+      DBI::dbGetQuery(
+        con, "SELECT COUNT(DISTINCT package) AS n FROM cran_code_summary")$n %||% 0L
+    } else {
+      0L
+    }
+  }
+  new_fp <- db_fingerprint(con)
+
+  # Re-query permanent failures after this run (some may have just hit the limit).
+  n_permanent_failures <- length(.permanent_failures(con))
 
   manifest_path <- file.path(out_dir, "manifest.json")
   prior_fp <- tryCatch({
@@ -320,12 +311,11 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE)
     }
   }, error = function(e) NULL)
 
-  # bootstrap_complete: all to-do is covered by this shard AND the DB now
-  # accounts for (universe - failures).
+  # bootstrap_complete: no deferred packages remain AND DB covers the universe
+  # minus permanently-failed packages.
   remaining_after    <- setdiff(todo_pkgs, shard_pkgs)
-  n_failures         <- length(shard_failures)
   bootstrap_complete <- length(remaining_after) == 0L &&
-    n_analyzed_pkgs >= (n_universe - n_failures)
+    n_analyzed_pkgs >= (n_universe - n_permanent_failures)
 
   # changed: something substantive happened OR the content hash shifted.
   changed <- isTRUE(force_full) ||
@@ -333,17 +323,18 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE)
     !identical(prior_fp, new_fp)
 
   manifest <- list(
-    generated_at       = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
-    n_universe         = n_universe,
-    n_analyzed         = n_analyzed_pkgs,
-    n_shard            = length(shard_pkgs),
-    shard_failures     = list(
-      count    = n_failures,
+    generated_at         = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    n_universe           = n_universe,
+    n_analyzed           = n_analyzed_pkgs,
+    n_shard              = length(shard_pkgs),
+    shard_failures       = list(
+      count    = length(shard_failures),
       packages = head(shard_failures, 20L)
     ),
-    bootstrap_complete = bootstrap_complete,
-    fingerprint        = new_fp,
-    changed            = changed
+    permanent_failures   = n_permanent_failures,
+    bootstrap_complete   = bootstrap_complete,
+    fingerprint          = new_fp,
+    changed              = changed
   )
 
   write_manifest(manifest_path, manifest)

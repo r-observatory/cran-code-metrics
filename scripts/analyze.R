@@ -190,7 +190,7 @@ deprecation_signals <- function(ctx) {
 #'   bump_fidelity_ok    logical bump is at least as large as the change implies;
 #'                       NA for the first version
 #'   assessed_at         character Sys.Date() ISO string
-#'   assessed_with       NA_character_ (reserved for a later task)
+#'   assessed_with       character version string: "cran-code-metrics; R <version>"
 #'
 #' Package-level columns placed only on the LATEST version row (NA elsewhere):
 #'   n_versions                          integer

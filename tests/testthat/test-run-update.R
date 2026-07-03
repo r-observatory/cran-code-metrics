@@ -282,3 +282,78 @@ test_that("force_full re-analyzes packages already in DB within shard_size limit
   expect_false(m$bootstrap_complete)
   expect_equal(m$shard_failures$count, 0L)
 })
+
+# ---------------------------------------------------------------------------
+# Test 5: package reaching MAX_CLONE_FAILURES is excluded and counted
+# ---------------------------------------------------------------------------
+
+test_that("package hitting MAX_CLONE_FAILURES is excluded from todo and counted in permanent_failures", {
+  out_dir <- tempfile()
+  dir.create(out_dir)
+  on.exit(unlink(out_dir, recursive = TRUE, force = TRUE), add = TRUE)
+
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+
+  pkg_df <- data.frame(
+    package        = c("pkgFail", "pkgOk"),
+    latest_version = c("1.0",     "1.0"),
+    stringsAsFactors = FALSE
+  )
+  io_mixed <- .fake_io(pkg_df, fail_clones = "pkgFail")
+
+  # Run MAX_CLONE_FAILURES times; pkgFail accumulates consecutive_failures.
+  for (i in seq_len(MAX_CLONE_FAILURES)) {
+    run_update(io_mixed, out_dir, shard_size = 10L)
+  }
+
+  # At this point pkgFail has exactly MAX_CLONE_FAILURES consecutive failures.
+  # Next run should exclude pkgFail from the to-do list entirely.
+  m_final <- run_update(io_mixed, out_dir, shard_size = 10L)
+
+  expect_equal(m_final$permanent_failures, 1L)
+  # pkgFail excluded; pkgOk already analyzed, so nothing to do this run.
+  expect_equal(m_final$n_shard, 0L)
+  expect_equal(m_final$shard_failures$count, 0L)
+})
+
+# ---------------------------------------------------------------------------
+# Test 6: transient failure followed by success resets the failure counter
+# ---------------------------------------------------------------------------
+
+test_that("transient failure that later succeeds resets the failure counter", {
+  out_dir <- tempfile()
+  dir.create(out_dir)
+  on.exit(unlink(out_dir, recursive = TRUE, force = TRUE), add = TRUE)
+
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+
+  pkg_df <- data.frame(package = "pkgFlaky", latest_version = "1.0",
+                       stringsAsFactors = FALSE)
+
+  # Run 1: clone fails -> consecutive_failures = 1.
+  io_fail <- .fake_io(pkg_df, fail_clones = "pkgFlaky")
+  run_update(io_fail, out_dir, shard_size = 10L)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out_dir, DB_FILENAME))
+  cf1 <- DBI::dbGetQuery(con,
+    "SELECT consecutive_failures FROM cran_metrics_failures WHERE package = 'pkgFlaky'")
+  DBI::dbDisconnect(con)
+  expect_equal(cf1$consecutive_failures, 1L)
+
+  # Run 2: clone succeeds -> failure record deleted, package appears in DB.
+  io_ok <- .fake_io(pkg_df)
+  m2 <- run_update(io_ok, out_dir, shard_size = 10L)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out_dir, DB_FILENAME))
+  cf2 <- DBI::dbGetQuery(con,
+    "SELECT consecutive_failures FROM cran_metrics_failures WHERE package = 'pkgFlaky'")
+  pkgs_db <- DBI::dbGetQuery(
+    con, "SELECT DISTINCT package FROM cran_code_summary")$package
+  DBI::dbDisconnect(con)
+
+  expect_equal(nrow(cf2), 0L)               # failure row deleted on success
+  expect_true("pkgFlaky" %in% pkgs_db)      # package now in DB
+  expect_equal(m2$permanent_failures, 0L)   # no permanent failures
+})

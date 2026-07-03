@@ -22,7 +22,7 @@ clone_package <- function(pkg, dest, base = CRAN_GIT_BASE, token = NULL) {
   }
   rc <- suppressWarnings(
     system2("git", c("clone", "--quiet", url, dest),
-            stdout = FALSE, stderr = FALSE)
+            stdout = FALSE, stderr = FALSE, timeout = GIT_TIMEOUT)
   )
   identical(rc, 0L)
 }
@@ -69,9 +69,10 @@ list_versions <- function(repo) {
   raw <- suppressWarnings(
     system2("git", c("-C", repo, "for-each-ref",
                      shQuote(paste0("--format=", fmt)), "refs/tags"),
-            stdout = TRUE, stderr = FALSE)
+            stdout = TRUE, stderr = FALSE, timeout = GIT_TIMEOUT)
   )
   if (length(raw) == 0L || identical(raw, character(0L))) return(empty)
+  if (!is.null(attr(raw, "status")) && attr(raw, "status") != 0L) return(empty)
 
   rows <- lapply(raw, function(line) {
     p <- strsplit(line, "\t", fixed = TRUE)[[1L]]
@@ -144,12 +145,20 @@ list_versions <- function(repo) {
 #'   Returns character(0) when the archive or extraction fails.
 extract_version <- function(repo, ref, dest) {
   if (!dir.exists(dest)) dir.create(dest, recursive = TRUE)
-  cmd <- paste0(
-    "git -C ", shQuote(repo), " archive ", shQuote(ref),
-    " | tar -x -C ", shQuote(dest)
+  # Write the archive to a temp file so each stage gets its own timeout.
+  archive_file <- tempfile("git_archive_", fileext = ".tar")
+  on.exit(unlink(archive_file), add = TRUE)
+  rc1 <- suppressWarnings(
+    system2("git", c("-C", repo, "archive", ref),
+            stdout = archive_file, stderr = FALSE, timeout = GIT_TIMEOUT)
   )
-  rc <- system(cmd, intern = FALSE, ignore.stdout = TRUE, ignore.stderr = TRUE)
-  if (!identical(rc, 0L)) return(character(0L))
+  if (!identical(rc1, 0L)) return(character(0L))
+  rc2 <- suppressWarnings(
+    system2("tar", c("-x", "-C", dest),
+            stdin = archive_file, stdout = FALSE, stderr = FALSE,
+            timeout = GIT_TIMEOUT)
+  )
+  if (!identical(rc2, 0L)) return(character(0L))
   list.files(dest, recursive = TRUE, all.files = TRUE,
              include.dirs = FALSE, no.. = TRUE)
 }
@@ -210,7 +219,7 @@ package_churn <- function(repo) {
             c("-C", repo, "log", "--numstat",
               "--format=__C__%H%x09%ai%x09%s",
               "--diff-filter=ACMRD"),
-            stdout = TRUE, stderr = FALSE)
+            stdout = TRUE, stderr = FALSE, timeout = GIT_TIMEOUT)
   )
   if (length(raw) == 0L) return(empty)
 
@@ -278,8 +287,9 @@ read_at <- function(repo, ref, path) {
   spec <- paste0(ref, ":", path)
   out  <- suppressWarnings(
     system2("git", c("-C", repo, "show", spec),
-            stdout = TRUE, stderr = FALSE)
+            stdout = TRUE, stderr = FALSE, timeout = GIT_TIMEOUT)
   )
   if (length(out) == 0L || identical(out, character(0L))) return("")
+  if (!is.null(attr(out, "status")) && attr(out, "status") != 0L) return("")
   paste(out, collapse = "\n")
 }

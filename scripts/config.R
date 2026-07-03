@@ -8,6 +8,10 @@ SHARD_SIZE         <- 400L
 MAX_CLONE_FAILURES <- 5L
 WORK_DIR           <- "work"
 
+# Per-git-subprocess timeout in seconds. A hard cap so a pathological repo
+# cannot stall a parallel shard. Overridable via GIT_TIMEOUT env var.
+GIT_TIMEOUT <- as.integer(Sys.getenv("GIT_TIMEOUT", unset = "300"))
+
 # Number of parallel workers for the per-package clone+analyze step.
 # Default: all logical cores (overridable via ANALYSIS_CORES env var).
 ANALYSIS_CORES <- {

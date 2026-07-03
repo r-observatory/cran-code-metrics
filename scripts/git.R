@@ -115,11 +115,19 @@ list_versions <- function(repo) {
     }
   }
 
+  v <- versions[keep]; t <- tags[keep]; d <- dates[keep]; c <- commits[keep]
+
+  # De-duplicate by version string too: some packages tag the same version on
+  # more than one commit (e.g. a plain "1.0" and a legacy "R-1.0"). Keep the
+  # latest-dated occurrence so each version maps to exactly one commit (rows are
+  # ordered by date ascending, so fromLast keeps the newest).
+  vkeep <- !duplicated(v, fromLast = TRUE)
+
   data.frame(
-    version = versions[keep],
-    ref     = tags[keep],
-    date    = dates[keep],
-    commit  = commits[keep],
+    version = v[vkeep],
+    ref     = t[vkeep],
+    date    = d[vkeep],
+    commit  = c[vkeep],
     stringsAsFactors = FALSE
   )
 }

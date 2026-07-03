@@ -258,6 +258,15 @@ upsert_shard <- function(con, summary_df, churn_df, api_df) {
   pkgs <- unique(as.character(summary_df$package))
   if (length(pkgs) == 0L) return(invisible(NULL))
 
+  # Defensive dedup: cran_code_summary has a UNIQUE(package, version) index, so a
+  # single package that somehow yields two rows for one version would otherwise
+  # abort the whole shard. Keep the last occurrence per (package, version).
+  dup_key <- paste(summary_df$package, summary_df$version, sep = "\x1f")
+  if (anyDuplicated(dup_key)) {
+    keep_row  <- !duplicated(dup_key, fromLast = TRUE)
+    summary_df <- summary_df[keep_row, , drop = FALSE]
+  }
+
   DBI::dbWithTransaction(con, {
     # -- Delete prior rows for these packages from all three tables ----------
     .delete_by_package(con, "cran_code_summary", pkgs)

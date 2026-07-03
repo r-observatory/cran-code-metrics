@@ -101,3 +101,225 @@ metrics_fingerprint <- function(summary_df) {
   }
   digest::digest(paste(keys, collapse = ","), algo = "sha256", serialize = FALSE)
 }
+
+# ---------------------------------------------------------------------------
+# In-place DB helpers (used by run_update for O(shard) memory writes)
+# ---------------------------------------------------------------------------
+
+# Delete rows for a set of packages from one table, chunking IN lists to <= 900.
+# Silently no-ops if the table does not exist or pkgs is empty.
+.delete_by_package <- function(con, table, pkgs) {
+  tables <- DBI::dbListTables(con)
+  if (!table %in% tables || length(pkgs) == 0L) return(invisible(NULL))
+  chunk_size <- 900L
+  for (i in seq(1L, length(pkgs), by = chunk_size)) {
+    chunk <- pkgs[i:min(i + chunk_size - 1L, length(pkgs))]
+    ph    <- paste(rep("?", length(chunk)), collapse = ", ")
+    DBI::dbExecute(
+      con,
+      sprintf("DELETE FROM %s WHERE package IN (%s)", table, ph),
+      params = as.list(chunk)
+    )
+  }
+  invisible(NULL)
+}
+
+#' Open (or create) the pipeline SQLite database.
+#'
+#' If the file does not yet exist it is created. The three non-summary tables
+#' (cran_code_churn, cran_api_history, cran_metrics_failures) are created with
+#' fixed schemas and indexes on first open. cran_code_summary is created lazily
+#' by upsert_shard the first time data is written (its schema is dynamic).
+#'
+#' @param path File path for the SQLite database.
+#' @return An open DBI connection. The caller is responsible for calling
+#'   DBI::dbDisconnect() when done.
+open_or_init_db <- function(path) {
+  con    <- DBI::dbConnect(RSQLite::SQLite(), path)
+  tables <- DBI::dbListTables(con)
+
+  if (!"cran_code_churn" %in% tables) {
+    DBI::dbExecute(con, "
+      CREATE TABLE cran_code_churn (
+        package TEXT,
+        version TEXT,
+        file    TEXT,
+        added   INTEGER,
+        deleted INTEGER
+      )")
+    DBI::dbExecute(con,
+      "CREATE INDEX idx_churn_pkg_ver ON cran_code_churn(package, version)")
+    DBI::dbExecute(con,
+      "CREATE INDEX idx_churn_pkg ON cran_code_churn(package)")
+  }
+
+  if (!"cran_api_history" %in% tables) {
+    DBI::dbExecute(con, "
+      CREATE TABLE cran_api_history (
+        package         TEXT,
+        version         TEXT,
+        exports_added   TEXT,
+        exports_removed TEXT,
+        n_exports       INTEGER
+      )")
+    DBI::dbExecute(con,
+      "CREATE INDEX idx_api_pkg_ver ON cran_api_history(package, version)")
+  }
+
+  if (!"cran_metrics_failures" %in% tables) {
+    DBI::dbExecute(con, "
+      CREATE TABLE cran_metrics_failures (
+        package              TEXT PRIMARY KEY,
+        consecutive_failures INTEGER NOT NULL DEFAULT 0,
+        last_attempt         TEXT
+      )")
+  }
+
+  con
+}
+
+#' Query the latest analyzed version per package from the DB.
+#'
+#' Uses latest_release_date (set by add_cross_version_metrics on the newest
+#' version row) as the primary signal. Falls back to a window-function query
+#' over released/rowid for packages that lack that marker.
+#'
+#' Memory cost: O(n_packages), not O(n_rows).
+#'
+#' @param con Open DBI connection to the pipeline SQLite database.
+#' @return data.frame with columns package (chr) and version (chr); one row
+#'   per package. Empty data.frame when cran_code_summary does not exist yet.
+db_analyzed_state <- function(con) {
+  tables <- DBI::dbListTables(con)
+  if (!"cran_code_summary" %in% tables) {
+    return(data.frame(package = character(0L), version = character(0L),
+                      stringsAsFactors = FALSE))
+  }
+
+  cols <- DBI::dbListFields(con, "cran_code_summary")
+
+  if ("latest_release_date" %in% cols) {
+    # Primary: add_cross_version_metrics marks the newest-version row per package.
+    primary <- DBI::dbGetQuery(con,
+      "SELECT package, version
+       FROM cran_code_summary
+       WHERE latest_release_date IS NOT NULL")
+  } else {
+    primary <- data.frame(package = character(0L), version = character(0L),
+                          stringsAsFactors = FALSE)
+  }
+
+  # Fallback: packages with no non-NULL latest_release_date row (e.g. legacy data
+  # or missing column). Use an explicit ORDER so the result does not depend on
+  # SQLite internal row order.
+  order_expr <- if ("released" %in% cols) {
+    "ORDER BY released DESC, rowid DESC"
+  } else {
+    "ORDER BY rowid DESC"
+  }
+  fallback <- DBI::dbGetQuery(con, sprintf("
+    SELECT package, version FROM (
+      SELECT package, version,
+             ROW_NUMBER() OVER (
+               PARTITION BY package
+               %s
+             ) AS rn
+      FROM cran_code_summary
+      WHERE package NOT IN (
+        SELECT DISTINCT package FROM cran_code_summary
+        WHERE latest_release_date IS NOT NULL
+      )
+    ) WHERE rn = 1", order_expr))
+
+  rbind(primary, fallback)
+}
+
+#' Upsert one shard's rows into the pipeline database in-place.
+#'
+#' For each package present in summary_df, deletes all prior rows from the
+#' three metric tables (cran_code_summary, cran_code_churn, cran_api_history),
+#' then appends the fresh rows. Everything runs inside one transaction so the
+#' DB is never left in a partially-written state.
+#'
+#' Schema growth for cran_code_summary: if summary_df contains columns not yet
+#' present in the table, ALTER TABLE ... ADD COLUMN is issued for each before
+#' the append. If the table does not exist yet, it is created from summary_df
+#' (schema-flexible) and indexed.
+#'
+#' Logical columns in all three data.frames are coerced to 0/1 INTEGER.
+#'
+#' @param con        Open DBI connection from open_or_init_db().
+#' @param summary_df data.frame; columns package + version required.
+#' @param churn_df   data.frame; columns package, version, file, added, deleted.
+#' @param api_df     data.frame; columns package, version, exports_added,
+#'   exports_removed, n_exports.
+#' @return invisible(NULL)
+upsert_shard <- function(con, summary_df, churn_df, api_df) {
+  pkgs <- unique(as.character(summary_df$package))
+  if (length(pkgs) == 0L) return(invisible(NULL))
+
+  DBI::dbWithTransaction(con, {
+    # -- Delete prior rows for these packages from all three tables ----------
+    .delete_by_package(con, "cran_code_summary", pkgs)
+    .delete_by_package(con, "cran_code_churn",   pkgs)
+    .delete_by_package(con, "cran_api_history",  pkgs)
+
+    # -- Insert fresh summary rows (with schema-growth handling) -------------
+    summary_write <- .coerce_logicals(summary_df)
+    tables        <- DBI::dbListTables(con)
+
+    if (!"cran_code_summary" %in% tables) {
+      # First-ever write: create the table from the data.frame schema.
+      DBI::dbWriteTable(con, "cran_code_summary", summary_write,
+                        row.names = FALSE, overwrite = FALSE, append = FALSE)
+      DBI::dbExecute(con,
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_summary_pkg_ver
+         ON cran_code_summary(package, version)")
+    } else {
+      # Possibly new columns have appeared since the table was first created.
+      existing_cols <- DBI::dbListFields(con, "cran_code_summary")
+      for (col in setdiff(names(summary_write), existing_cols)) {
+        col_type <- if (is.integer(summary_write[[col]])) "INTEGER"
+                    else if (is.numeric(summary_write[[col]])) "REAL"
+                    else "TEXT"
+        DBI::dbExecute(con,
+          sprintf("ALTER TABLE cran_code_summary ADD COLUMN \"%s\" %s",
+                  col, col_type))
+      }
+      DBI::dbAppendTable(con, "cran_code_summary", summary_write)
+    }
+
+    # -- Insert fresh churn rows ---------------------------------------------
+    churn_write <- .coerce_logicals(churn_df)
+    if (!is.null(churn_write) && nrow(churn_write) > 0L) {
+      DBI::dbAppendTable(con, "cran_code_churn", churn_write)
+    }
+
+    # -- Insert fresh api rows -----------------------------------------------
+    api_write <- .coerce_logicals(api_df)
+    if (!is.null(api_write) && nrow(api_write) > 0L) {
+      DBI::dbAppendTable(con, "cran_api_history", api_write)
+    }
+  })
+
+  invisible(NULL)
+}
+
+#' Compute a SHA-256 fingerprint over the current package:version set in the DB.
+#'
+#' Queries only the two key columns (result bounded to O(n_packages)) and
+#' hashes the sorted "package:version" strings. Semantically equivalent to
+#' metrics_fingerprint() but reads from the live DB rather than a data.frame.
+#'
+#' @param con Open DBI connection to the pipeline SQLite database.
+#' @return 64-character lower-case hex string (SHA-256).
+db_fingerprint <- function(con) {
+  tables <- DBI::dbListTables(con)
+  if (!"cran_code_summary" %in% tables) {
+    return(digest::digest("", algo = "sha256", serialize = FALSE))
+  }
+  df   <- DBI::dbGetQuery(con,
+    "SELECT package, version FROM cran_code_summary ORDER BY package, version")
+  keys <- if (nrow(df) == 0L) character(0L) else paste(df$package, df$version, sep = ":")
+  digest::digest(paste(keys, collapse = ","), algo = "sha256", serialize = FALSE)
+}

@@ -345,6 +345,20 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE)
 # CLI entry point
 # ---------------------------------------------------------------------------
 if (identical(sys.nframe(), 0L)) {
+  # Standalone invocation (Rscript scripts/update.R): source the pipeline in
+  # dependency order. Locate this script's directory so it works from any cwd.
+  .script_dir <- {
+    fa <- grep("^--file=", commandArgs(FALSE), value = TRUE)
+    if (length(fa) >= 1L) dirname(sub("^--file=", "", fa[1L])) else "scripts"
+  }
+  source(file.path(.script_dir, "config.R"))
+  source(file.path(.script_dir, "git.R"))
+  source(file.path(.script_dir, "context.R"))
+  for (.f in sort(list.files(file.path(.script_dir, "metrics"),
+                             pattern = "[.]R$", full.names = TRUE))) source(.f)
+  source(file.path(.script_dir, "analyze.R"))
+  source(file.path(.script_dir, "export.R"))
+
   args <- commandArgs(trailingOnly = TRUE)
 
   # First non-flag argument is out_dir.

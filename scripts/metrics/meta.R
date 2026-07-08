@@ -199,6 +199,7 @@ metrics_meta <- function(ctx) {
   if (!desc_present) {
     n_deps_direct <- NA_integer_
     dep_list      <- NA_character_
+    dep_depends <- dep_imports <- dep_suggests <- dep_linkingto <- dep_enhances <- NA_character_
   } else {
     imports_text <- desc[["Imports"]] %||% ""
     depends_text <- desc[["Depends"]] %||% ""
@@ -209,6 +210,14 @@ metrics_meta <- function(ctx) {
     dep_pkgs      <- .meta_parse_deps(combined)
     n_deps_direct <- length(dep_pkgs)
     dep_list      <- as.character(jsonlite::toJSON(dep_pkgs, auto_unbox = FALSE))
+    # Raw DESCRIPTION dependency fields, preserved verbatim (with version
+    # constraints), one column each; empty fields become NA.
+    .nz <- function(x) { x <- trimws(x %||% ""); if (nzchar(x)) x else NA_character_ }
+    dep_depends   <- .nz(depends_text)
+    dep_imports   <- .nz(imports_text)
+    dep_suggests  <- .nz(desc[["Suggests"]])
+    dep_linkingto <- .nz(desc[["LinkingTo"]])
+    dep_enhances  <- .nz(desc[["Enhances"]])
   }
 
   # ---- maintainer ------------------------------------------------------
@@ -272,6 +281,11 @@ metrics_meta <- function(ctx) {
   list(
     n_deps_direct    = n_deps_direct,
     dep_list         = dep_list,
+    depends          = dep_depends,
+    imports          = dep_imports,
+    suggests         = dep_suggests,
+    linking_to       = dep_linkingto,
+    enhances         = dep_enhances,
     maintainer       = maintainer,
     maintainer_email = maintainer_email,
     n_authors        = n_authors,

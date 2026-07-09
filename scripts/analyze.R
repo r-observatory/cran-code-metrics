@@ -635,9 +635,11 @@ analyze_package <- function(repo_dir, package) {
         .empty_edges_df()
       }
 
-      # Datasets are kept for every version (not latest-only), so the content
-      # fingerprint can reveal when a dataset's data changed between releases.
-      datasets_row <- if (!is.null(detail_ds) && nrow(detail_ds) > 0L) {
+      # Datasets are stored for the latest version only, like the function and
+      # call-edge detail: a full per-version record (with the column profile and
+      # row sketch) for every release makes the table far too large for the
+      # release-asset size cap. version is still stamped so the row is dated.
+      datasets_row <- if (is_latest && !is.null(detail_ds) && nrow(detail_ds) > 0L) {
         cbind(package = package, version = v, detail_ds, stringsAsFactors = FALSE)
       } else {
         .empty_datasets_df()

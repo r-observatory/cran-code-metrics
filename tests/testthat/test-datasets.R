@@ -111,6 +111,42 @@ test_that(".write_datasets_normalized collapses a dataset name colliding within 
   expect_equal(DBI::dbGetQuery(con, "SELECT internal FROM cran_datasets")$internal, 0L)
 })
 
+test_that(".write_datasets_normalized migrates away from the legacy flat table", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+
+  # Legacy flat schema (pre-normalization): one row per dataset per version, no
+  # current_version column. A database that still holds it must be migrated, not
+  # appended to, or the identity write fails with "no column named current_version".
+  DBI::dbExecute(con, "CREATE TABLE cran_datasets
+    (package TEXT, version TEXT, name TEXT, file TEXT, internal INTEGER,
+     columns TEXT, row_sketch TEXT)")
+  DBI::dbExecute(con, "INSERT INTO cran_datasets (package, name, version)
+                       VALUES ('old', 'd', '0.9')")
+  # Summary carries the datasets_scanned marker set under the old design. In a
+  # real shard upsert_shard has already written the current package's summary
+  # (marker set) before the dataset write, so pre-set p as scanned here too.
+  DBI::dbExecute(con, "CREATE TABLE cran_code_summary
+    (package TEXT, version TEXT, datasets_scanned INTEGER)")
+  DBI::dbExecute(con, "INSERT INTO cran_code_summary VALUES ('old','0.9',1), ('p','1.0',1)")
+
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_ds_row("p", "1.0", TRUE, "C1"), "p"))
+
+  # Flat table replaced by the normalized identity + link tables.
+  expect_true("current_version" %in% DBI::dbListFields(con, "cran_datasets"))
+  expect_true(all(c("cran_dataset_versions", "cran_dataset_contents") %in% DBI::dbListTables(con)))
+  expect_equal(
+    DBI::dbGetQuery(con, "SELECT current_version FROM cran_datasets WHERE package='p'")$current_version,
+    "1.0")
+  # A package scanned only under the old design is un-marked so it re-scans.
+  expect_true(is.na(
+    DBI::dbGetQuery(con, "SELECT datasets_scanned FROM cran_code_summary WHERE package='old'")$datasets_scanned))
+  # The current shard's freshly written marker is preserved.
+  expect_equal(
+    DBI::dbGetQuery(con, "SELECT datasets_scanned FROM cran_code_summary WHERE package='p'")$datasets_scanned,
+    1L)
+})
+
 test_that("re-analysis is idempotent and content dedups across packages", {
   con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
   on.exit(DBI::dbDisconnect(con))

@@ -213,11 +213,14 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                        recollect = FALSE) {
   if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
-  db_path <- file.path(out_dir, DB_FILENAME)
+  db_path      <- file.path(out_dir, DB_FILENAME)
+  data_db_path <- file.path(out_dir, DATA_DB_FILENAME)
 
-  # ---- 1. Open DB (creates tables if absent) --------------------------------
+  # ---- 1. Open both DBs (creates tables if absent) --------------------------
   con <- open_or_init_db(db_path)
   on.exit(DBI::dbDisconnect(con), add = TRUE)
+  data_con <- open_or_init_data_db(data_db_path)
+  on.exit(DBI::dbDisconnect(data_con), add = TRUE)
 
   # ---- 2. Analyzed state (O(n_packages) query, not full table read) ---------
   if (isTRUE(force_full)) {
@@ -417,7 +420,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
 
   if (length(fresh_pkgs) > 0L) {
     upsert_shard(con, fresh_summary, fresh_churn, fresh_api,
-                 fresh_functions, fresh_edges, fresh_datasets)
+                 fresh_functions, fresh_edges)
+    upsert_datasets(data_con, fresh_datasets, fresh_pkgs)
   }
 
   # ---- 8. Manifest ---------------------------------------------------------

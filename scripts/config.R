@@ -4,6 +4,7 @@
 CRAN_GIT_BASE <- "https://github.com/cran"
 PUBLISH_REPO  <- "r-observatory/cran-code-metrics"
 DB_FILENAME   <- "cran-code-metrics.db"
+DATA_DB_FILENAME <- "cran-data-metrics.db"
 SHARD_SIZE         <- 400L
 MAX_CLONE_FAILURES <- 5L
 WORK_DIR           <- "work"

@@ -594,7 +594,8 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
   } else 0L
   n_versions <- count_tbl(ver_table)
 
-  # Fingerprint over the sorted concatenation of fp_cols keys. Code-series
+  # Fingerprint over the concatenation of fp_cols keys, ordered by the SQL
+  # tuple (not by sorting the already-concatenated strings). Code-series
   # keys join fields with ":" (matching db_fingerprint()); data-series keys
   # join fields with "\x1f" per the manifest schema.
   fp_sep <- if (identical(series, "code")) ":" else "\x1f"
@@ -603,14 +604,19 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
       digest::digest("", algo = "sha256", serialize = FALSE)
     } else {
       cols <- paste(sprintf('"%s"', fp_cols), collapse = ", ")
-      df <- DBI::dbGetQuery(con, sprintf('SELECT %s FROM "%s"', cols, fp_table))
+      df <- DBI::dbGetQuery(con,
+        sprintf('SELECT %s FROM "%s" ORDER BY %s', cols, fp_table, cols))
       keys <- if (nrow(df) == 0L) character(0L) else
         apply(df, 1L, function(r) paste(r, collapse = fp_sep))
-      # method = "radix" sorts by raw byte order (C locale), matching
-      # SQLite's default BINARY collation used by db_fingerprint()'s
-      # ORDER BY. The platform/locale-dependent default sort() can
-      # disagree with SQL ordering on mixed-case keys.
-      digest::digest(paste(sort(keys, method = "radix"), collapse = ","),
+      # Rows are ordered by SQLite's ORDER BY (BINARY collation, i.e. byte
+      # order) *before* concatenation, exactly matching db_fingerprint()'s
+      # "ORDER BY package, version". Sorting the already-concatenated
+      # "package:version" strings in R instead is NOT equivalent: whenever
+      # one key is a prefix of another followed by a character below ':'
+      # (0x3a) -- e.g. package "Rcpp" vs "Rcpp11" -- tuple order and
+      # concatenated-string order disagree, so the two fingerprints would
+      # diverge for real CRAN data.
+      digest::digest(paste(keys, collapse = ","),
                      algo = "sha256", serialize = FALSE)
     }
   }

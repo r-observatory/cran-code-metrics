@@ -78,6 +78,34 @@ test_that("code-series fingerprint matches db_fingerprint() for identical data",
   expect_identical(m$fingerprint, db_fingerprint(con))
 })
 
+test_that("code-series fingerprint matches db_fingerprint() when a package name is a prefix of another", {
+  db <- withr::local_tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), db); on.exit(DBI::dbDisconnect(con))
+  # "Rcpp" is a prefix of "Rcpp11", followed by a digit (0x31), which sorts
+  # below ':' (0x3a). Sorting the already-concatenated "package:version"
+  # strings therefore puts "Rcpp11:2.0" before "Rcpp:1.0", while the correct
+  # tuple order (matching db_fingerprint()'s SQL ORDER BY) puts "Rcpp" first.
+  # Rows are inserted out of sorted order on purpose to catch any reliance on
+  # insertion order.
+  DBI::dbWriteTable(con, "cran_code_summary", data.frame(
+    package = c("zzz", "Rcpp11", "Rcpp"),
+    version = c("1.0", "2.0", "1.0"),
+    stringsAsFactors = FALSE))
+
+  m <- build_manifest(
+    con, series = "code", repo = "r", db_filename = "x.db", db_bytes = 1L,
+    tables = "cran_code_summary", fp_table = "cran_code_summary",
+    fp_cols = c("package", "version"), pkg_table = "cran_code_summary",
+    ver_table = "cran_code_summary", stat_table = "cran_code_summary",
+    stat_cols = character(0),
+    bootstrap = list(n_analyzed = 3L, n_universe = NULL, n_remaining = NULL,
+                     bootstrap_complete = FALSE))
+
+  expect_true(grepl("^[0-9a-f]{64}$", m$fingerprint))
+  expect_identical(nchar(m$fingerprint), 64L)
+  expect_identical(m$fingerprint, db_fingerprint(con))
+})
+
 test_that("db_bytes survives values >= 2^31 without integer overflow", {
   db <- withr::local_tempfile(fileext = ".db")
   con <- DBI::dbConnect(RSQLite::SQLite(), db); on.exit(DBI::dbDisconnect(con))

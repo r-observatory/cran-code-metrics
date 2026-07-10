@@ -594,7 +594,10 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
   } else 0L
   n_versions <- count_tbl(ver_table)
 
-  # Fingerprint over the sorted concatenation of fp_cols keys.
+  # Fingerprint over the sorted concatenation of fp_cols keys. Code-series
+  # keys join fields with ":" (matching db_fingerprint()); data-series keys
+  # join fields with "\x1f" per the manifest schema.
+  fp_sep <- if (identical(series, "code")) ":" else "\x1f"
   fingerprint <- {
     if (!fp_table %in% present) {
       digest::digest("", algo = "sha256", serialize = FALSE)
@@ -602,21 +605,32 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
       cols <- paste(sprintf('"%s"', fp_cols), collapse = ", ")
       df <- DBI::dbGetQuery(con, sprintf('SELECT %s FROM "%s"', cols, fp_table))
       keys <- if (nrow(df) == 0L) character(0L) else
-        apply(df, 1L, function(r) paste(r, collapse = "\x1f"))
-      digest::digest(paste(sort(keys), collapse = ","),
+        apply(df, 1L, function(r) paste(r, collapse = fp_sep))
+      # method = "radix" sorts by raw byte order (C locale), matching
+      # SQLite's default BINARY collation used by db_fingerprint()'s
+      # ORDER BY. The platform/locale-dependent default sort() can
+      # disagree with SQL ordering on mixed-case keys.
+      digest::digest(paste(sort(keys, method = "radix"), collapse = ","),
                      algo = "sha256", serialize = FALSE)
     }
   }
 
-  # Stats: mean/median per existing numeric column, else NULL.
+  # Stats: mean/median per column that exists AND is numeric, else NULL.
+  # A non-numeric column (e.g. character) must never be coerced into a
+  # fabricated statistic.
   stat_fields <- list()
   stat_cols_present <- if (stat_table %in% present) DBI::dbListFields(con, stat_table) else character(0L)
   for (col in stat_cols) {
     if (col %in% stat_cols_present) {
       v <- DBI::dbGetQuery(con, sprintf('SELECT "%s" AS v FROM "%s"', col, stat_table))$v
-      v <- suppressWarnings(as.numeric(v)); v <- v[!is.na(v)]
-      stat_fields[[paste0(col, "_mean")]]   <- if (length(v)) mean(v) else NULL
-      stat_fields[[paste0(col, "_median")]] <- if (length(v)) stats::median(v) else NULL
+      if (is.numeric(v)) {
+        v <- v[!is.na(v)]
+        stat_fields[[paste0(col, "_mean")]]   <- if (length(v)) mean(v) else NULL
+        stat_fields[[paste0(col, "_median")]] <- if (length(v)) stats::median(v) else NULL
+      } else {
+        stat_fields[[paste0(col, "_mean")]]   <- NULL
+        stat_fields[[paste0(col, "_median")]] <- NULL
+      }
     } else {
       stat_fields[[paste0(col, "_mean")]]   <- NULL
       stat_fields[[paste0(col, "_median")]] <- NULL
@@ -629,7 +643,7 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
     repo           = repo,
     db_filename    = db_filename,
     generated_at   = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
-    db_bytes       = as.integer(db_bytes),
+    db_bytes       = round(as.numeric(db_bytes)),
     fingerprint    = fingerprint,
     n_packages     = n_packages,
     n_versions     = n_versions,

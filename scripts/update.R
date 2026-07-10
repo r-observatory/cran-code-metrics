@@ -189,10 +189,11 @@ default_io <- function() {
 
 #' Run one sharded update of the cran-code-metrics pipeline.
 #'
-#' Opens (or creates) the SQLite DB at out_dir/DB_FILENAME, determines which
-#' packages need analysis by querying the DB (not by reading whole tables),
-#' processes the next shard, upserts only the shard's rows in-place (bounded
-#' to O(shard) memory), and emits a manifest.json.
+#' Opens (or creates) the code DB at out_dir/DB_FILENAME and the dataset DB at
+#' out_dir/DATA_DB_FILENAME, determines which packages need analysis by querying
+#' the DB (not by reading whole tables), processes the next shard, upserts only
+#' the shard's rows in-place (bounded to O(shard) memory) with dataset rows
+#' written before the code summary, and emits a manifest.json.
 #'
 #' Clone and analyze failures are tracked per-package. Packages that have
 #' failed >= MAX_CLONE_FAILURES consecutive times are permanently excluded from
@@ -419,9 +420,14 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   fresh_datasets  <- .rbind_union_all(shard_datasets_list)  %||% .empty_datasets_df()
 
   if (length(fresh_pkgs) > 0L) {
+    # Write dataset rows before the code summary stamps datasets_scanned = TRUE,
+    # so a scanned code row always implies its dataset rows were written. The
+    # dataset write is delete-then-insert (idempotent), so if the code write
+    # fails afterwards the package stays on the to-do list and the next run
+    # redoes both cleanly, rather than being marked done with datasets missing.
+    upsert_datasets(data_con, fresh_datasets, fresh_pkgs)
     upsert_shard(con, fresh_summary, fresh_churn, fresh_api,
                  fresh_functions, fresh_edges)
-    upsert_datasets(data_con, fresh_datasets, fresh_pkgs)
   }
 
   # ---- 8. Manifest ---------------------------------------------------------

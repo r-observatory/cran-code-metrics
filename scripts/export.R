@@ -137,12 +137,6 @@ metrics_fingerprint <- function(summary_df) {
   if (!table %in% tables) {
     DBI::dbWriteTable(con, table, df, row.names = FALSE,
                       overwrite = FALSE, append = FALSE)
-    DBI::dbExecute(con, sprintf(
-      "CREATE INDEX IF NOT EXISTS idx_%s_pkg_ver ON %s(package, version)",
-      table, table))
-    DBI::dbExecute(con, sprintf(
-      "CREATE INDEX IF NOT EXISTS idx_%s_pkg ON %s(package)",
-      table, table))
   } else {
     existing_cols <- DBI::dbListFields(con, table)
     for (col in setdiff(names(df), existing_cols)) {
@@ -154,6 +148,12 @@ metrics_fingerprint <- function(summary_df) {
     }
     if (nrow(df) > 0L) DBI::dbAppendTable(con, table, df)
   }
+  DBI::dbExecute(con, sprintf(
+    "CREATE INDEX IF NOT EXISTS idx_%s_pkg_ver ON %s(package, version)",
+    table, table))
+  DBI::dbExecute(con, sprintf(
+    "CREATE INDEX IF NOT EXISTS idx_%s_pkg ON %s(package)",
+    table, table))
   invisible(NULL)
 }
 
@@ -178,7 +178,6 @@ metrics_fingerprint <- function(summary_df) {
       content_id INTEGER NOT NULL, format TEXT, compression TEXT, confidence TEXT,
       is_current INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (package, name, version))")
-    DBI::dbExecute(con, "CREATE INDEX idx_cran_dsv_content ON cran_dataset_versions(content_id)")
   }
   if (!"cran_dataset_contents" %in% tables) {
     DBI::dbExecute(con, "CREATE TABLE cran_dataset_contents (
@@ -186,12 +185,13 @@ metrics_fingerprint <- function(summary_df) {
       content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
       class TEXT, kind TEXT, nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
       UNIQUE (content_fp, schema_fp, fp_algo_version))")
-    DBI::dbExecute(con, "CREATE INDEX idx_cran_dsc_schema ON cran_dataset_contents(schema_fp)")
   }
   if (!"cran_dataset_sketches" %in% tables) {
     DBI::dbExecute(con, "CREATE TABLE cran_dataset_sketches (
       content_id INTEGER PRIMARY KEY, row_sketch TEXT)")
   }
+  DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_cran_dsv_content ON cran_dataset_versions(content_id)")
+  DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_cran_dsc_schema ON cran_dataset_contents(schema_fp)")
   invisible(NULL)
 }
 
@@ -353,10 +353,6 @@ open_or_init_db <- function(path) {
         added   INTEGER,
         deleted INTEGER
       )")
-    DBI::dbExecute(con,
-      "CREATE INDEX idx_churn_pkg_ver ON cran_code_churn(package, version)")
-    DBI::dbExecute(con,
-      "CREATE INDEX idx_churn_pkg ON cran_code_churn(package)")
   }
 
   if (!"cran_api_history" %in% tables) {
@@ -368,8 +364,6 @@ open_or_init_db <- function(path) {
         exports_removed TEXT,
         n_exports       INTEGER
       )")
-    DBI::dbExecute(con,
-      "CREATE INDEX idx_api_pkg_ver ON cran_api_history(package, version)")
   }
 
   if (!"cran_metrics_failures" %in% tables) {
@@ -380,6 +374,13 @@ open_or_init_db <- function(path) {
         last_attempt         TEXT
       )")
   }
+
+  DBI::dbExecute(con,
+    "CREATE INDEX IF NOT EXISTS idx_churn_pkg_ver ON cran_code_churn(package, version)")
+  DBI::dbExecute(con,
+    "CREATE INDEX IF NOT EXISTS idx_churn_pkg ON cran_code_churn(package)")
+  DBI::dbExecute(con,
+    "CREATE INDEX IF NOT EXISTS idx_api_pkg_ver ON cran_api_history(package, version)")
 
   con
 }
@@ -500,9 +501,6 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
       # First-ever write: create the table from the data.frame schema.
       DBI::dbWriteTable(con, "cran_code_summary", summary_write,
                         row.names = FALSE, overwrite = FALSE, append = FALSE)
-      DBI::dbExecute(con,
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_summary_pkg_ver
-         ON cran_code_summary(package, version)")
     } else {
       # Possibly new columns have appeared since the table was first created.
       existing_cols <- DBI::dbListFields(con, "cran_code_summary")
@@ -516,6 +514,9 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
       }
       DBI::dbAppendTable(con, "cran_code_summary", summary_write)
     }
+    DBI::dbExecute(con,
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_summary_pkg_ver
+       ON cran_code_summary(package, version)")
 
     # -- Insert fresh churn rows ---------------------------------------------
     churn_write <- .coerce_logicals(churn_df)

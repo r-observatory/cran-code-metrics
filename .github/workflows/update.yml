@@ -64,8 +64,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           mkdir -p out
-          latest_tag() { gh release list --json tagName -q '.[].tagName' | grep "^$1-" | sort -r | head -1; }
+          latest_tag() { gh release list --limit 1000 --json tagName -q '.[].tagName' | { grep "^$1-" || true; } | sort -r | head -1; }
 
           CODE_TAG=$(latest_tag code)
           DATA_TAG=$(latest_tag data)
@@ -91,7 +92,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NOTES_TITLE_PREFIX: CRAN
         run: |
-          set -uo pipefail
+          set -euo pipefail
           BUDGET="${{ inputs.time_budget_seconds || '18000' }}"
           FORCE=""; [ "${{ inputs.force_full }}" = "true" ] && FORCE="--bootstrap"
           RECOLLECT=""; [ "${{ inputs.recollect }}" = "true" ] && RECOLLECT="--recollect"
@@ -107,13 +108,14 @@ jobs:
               return 1
             fi
             cp "out/$3-manifest.json" out/manifest.json
+            local latest_flag="--latest=false"; [ "$3" = "code" ] && latest_flag="--latest"
             if gh release view "$1" >/dev/null 2>&1; then
               # Today's release already exists (an earlier shard this run): clobber ONLY today.
               gh release upload "$1" "out/$2" out/manifest.json --clobber
               gh release edit "$1" --notes-file "out/$4"
             else
               gh release create "$1" "out/$2" out/manifest.json \
-                --title "CRAN ${3^} Metrics - ${TODAY}" --notes-file "out/$4" --latest
+                --title "CRAN ${3^} Metrics - ${TODAY}" --notes-file "out/$4" "$latest_flag"
             fi
           }
 
@@ -147,9 +149,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KEEP: "30"
         run: |
+          set -euo pipefail
           for series in code data; do
-            gh release list --json tagName -q '.[].tagName' | grep "^${series}-" \
-              | KEEP="$KEEP" Rscript scripts/prune.R \
+            gh release list --limit 1000 --json tagName -q '.[].tagName' \
+              | { grep "^${series}-" || true; } \
+              | Rscript scripts/prune.R \
               | while read -r tag; do
                   [ -n "$tag" ] || continue
                   echo "pruning $tag"

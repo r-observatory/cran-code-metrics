@@ -16,15 +16,22 @@ the ordered version series.
 
 ## Output
 
-`cran-code-metrics.db` (published on the rolling `current` release):
+`cran-code-metrics.db` (published as a dated `code-YYYY-MM-DD` release; a
+release is immutable once a later day's release exists, and old releases are
+pruned on a retention schedule):
 
 - `cran_code_summary` - one row per package version, with the metric columns and
   a per-version release date.
 - `cran_code_churn` - added and deleted lines per file per version.
 - `cran_api_history` - exported-symbol additions and removals per version.
 
-A `manifest.json` accompanies the database with a `changed` flag and a
-`bootstrap_complete` flag.
+`cran-data-metrics.db` is published the same way, as a dated `data-YYYY-MM-DD`
+release, and holds the dataset-focused tables.
+
+Each dated release carries its own `manifest.json` asset (copied from
+`code-manifest.json` or `data-manifest.json`). A separate `run-status.json`,
+written alongside but not published, carries the `changed` and
+`bootstrap_complete` flags that drive the shard loop.
 
 ## Running
 
@@ -34,12 +41,12 @@ Rscript scripts/update.R out/     # analyze the next shard of packages, carry-fo
 Rscript scripts/update.R out/ --bootstrap   # re-analyze everything from scratch
 ```
 
-The update reads the prior database from `out/`, analyzes a shard of packages
-that are new or have a new release, and writes an updated database plus manifest.
-The bootstrap fills the full catalog over several runs: each shard is published
-so progress survives a restart, and the workflow keeps starting shards until the
-catalog is complete or a time budget is reached. Set `GITHUB_TOKEN` so git
-fetches are authenticated.
+The update reads the prior databases from `out/`, analyzes a shard of packages
+that are new or have a new release, and writes the updated code and dataset
+databases plus their manifests. The bootstrap fills the full catalog over
+several runs: each shard is published so progress survives a restart, and the
+workflow keeps starting shards until the catalog is complete or a time budget
+is reached. Set `GITHUB_TOKEN` so git fetches are authenticated.
 
 ## Notes
 

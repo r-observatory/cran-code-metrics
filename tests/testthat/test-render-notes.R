@@ -85,7 +85,7 @@ test_that("render_notes renders the headline, per-package table, catalog and foo
   expect_true(any(grepl(
     "^1 package new to the catalog, 1 updated\\. Now tracking 1,500 packages across 5,000 versions\\.",
     code_md)))
-  expect_true(any(grepl("Bootstrap 50% complete \\(1,000 remaining\\)\\.", code_md)))
+  expect_true(any(grepl("Bootstrap 50% processed \\(1,000 remaining\\)\\.", code_md)))
 
   # Table: data.table is tagged updated (no "(new)"); ggplot2 is tagged new.
   expect_true(any(grepl("^\\| data\\.table \\| 1\\.15\\.0 \\| 18,240 \\| 342 \\| 128 \\| 2 \\| 3 \\|$", code_md)))

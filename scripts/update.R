@@ -561,7 +561,10 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
 # provable no-op.
 
 # Polite default User-Agent so CRAN can attribute (and throttle) the traffic.
-HARVEST_USER_AGENT <- sprintf(
+# A function, not a top-level constant: PUBLISH_REPO is defined in config.R, which
+# update.R only sources inside its CLI entrypoint, so resolving it must be deferred
+# to call time rather than evaluated when this file is sourced.
+harvest_user_agent <- function() sprintf(
   "cran-code-metrics harvest (%s; %s)", PUBLISH_REPO, R.version.string)
 
 #' Download one archived package's last tarball from the CRAN cloud mirror.
@@ -702,7 +705,7 @@ HARVEST_USER_AGENT <- sprintf(
 #' @return invisible(list(todo, ok, skipped, failed)).
 harvest_descriptions <- function(con, packages = NULL,
                                  mirror = "https://cloud.r-project.org",
-                                 user_agent = HARVEST_USER_AGENT,
+                                 user_agent = harvest_user_agent(),
                                  sleep = 0.5, tries = 3L, limit = NULL,
                                  download_fn = .download_archived_tarball) {
   .ensure_archived_meta_table(con)

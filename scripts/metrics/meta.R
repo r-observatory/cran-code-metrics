@@ -191,9 +191,14 @@
 #'   n_authors        integer   person() count from Authors@R; falls back to
 #'                              comma/and-separated name count from Author field
 #'   authors          character JSON array of {given, family, roles} objects
+#'   title            character DESCRIPTION Title field, NA when empty/absent
+#'   description      character DESCRIPTION Description field, NA when empty/absent
 metrics_meta <- function(ctx) {
   desc         <- ctx$desc
   desc_present <- ctx$exists("DESCRIPTION")
+
+  # Trim a DESCRIPTION field to a scalar; empty (or absent) becomes NA.
+  .nz <- function(x) { x <- trimws(x %||% ""); if (nzchar(x)) x else NA_character_ }
 
   # ---- direct dependencies ---------------------------------------------
   if (!desc_present) {
@@ -212,7 +217,6 @@ metrics_meta <- function(ctx) {
     dep_list      <- as.character(jsonlite::toJSON(dep_pkgs, auto_unbox = FALSE))
     # Raw DESCRIPTION dependency fields, preserved verbatim (with version
     # constraints), one column each; empty fields become NA.
-    .nz <- function(x) { x <- trimws(x %||% ""); if (nzchar(x)) x else NA_character_ }
     dep_depends   <- .nz(depends_text)
     dep_imports   <- .nz(imports_text)
     dep_suggests  <- .nz(desc[["Suggests"]])
@@ -278,6 +282,12 @@ metrics_meta <- function(ctx) {
     }
   }
 
+  # ---- title / description ---------------------------------------------
+  # Forward-filled straight from the DESCRIPTION; .nz() maps empty/absent to NA
+  # (so an absent DESCRIPTION yields NA for both, matching the fields above).
+  title       <- .nz(desc[["Title"]])
+  description <- .nz(desc[["Description"]])
+
   list(
     n_deps_direct    = n_deps_direct,
     dep_list         = dep_list,
@@ -289,6 +299,8 @@ metrics_meta <- function(ctx) {
     maintainer       = maintainer,
     maintainer_email = maintainer_email,
     n_authors        = n_authors,
-    authors          = authors
+    authors          = authors,
+    title            = title,
+    description      = description
   )
 }

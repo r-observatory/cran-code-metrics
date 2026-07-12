@@ -708,6 +708,225 @@ db_fingerprint <- function(con) {
 }
 
 # ---------------------------------------------------------------------------
+# cran_archived_meta: narrow, point-lookup identity table for ARCHIVED packages
+# ---------------------------------------------------------------------------
+# The viewer's archived-package detail page reads a single row from this table by
+# `WHERE package = ?`. It must NEVER join the ~200-column cran_code_summary at
+# query time, so the identity fields are projected here into a WITHOUT ROWID
+# table keyed on package (a clustered point-lookup, no secondary indexes).
+
+# Target column -> source column in cran_code_summary. `title`/`description`
+# arrive once a package is scanned by the current pipeline; older rows lack them
+# and are topped up by the harvest path. Every source may be absent from a given
+# DB's dynamic schema, so presence is checked before it is read.
+.ARCHIVED_META_SOURCES <- c(
+  title            = "title",
+  description      = "description",
+  authors          = "authors",
+  maintainer       = "maintainer",
+  maintainer_email = "maintainer_email",
+  license          = "license",
+  url              = "url",
+  depends          = "depends",
+  imports          = "imports",
+  suggests         = "suggests",
+  linkingto        = "linking_to",
+  enhances         = "enhances"
+)
+
+# Full column order for INSERTs into cran_archived_meta.
+.ARCHIVED_META_COLS <- c(
+  "package", "last_version", "title", "description", "authors", "maintainer",
+  "maintainer_email", "license", "url", "depends", "imports", "suggests",
+  "linkingto", "enhances", "desc_sha", "source_scanned_at"
+)
+
+#' Create the narrow archived-metadata table if it does not exist.
+#'
+#' WITHOUT ROWID with PRIMARY KEY (package): the viewer's point-lookup lands on
+#' the clustered key with no rowid indirection and no secondary index to consult.
+.ensure_archived_meta_table <- function(con) {
+  if ("cran_archived_meta" %in% DBI::dbListTables(con)) return(invisible(NULL))
+  DBI::dbExecute(con, "
+    CREATE TABLE cran_archived_meta (
+      package           TEXT NOT NULL,
+      last_version      TEXT,
+      title             TEXT,
+      description       TEXT,
+      authors           TEXT,
+      maintainer        TEXT,
+      maintainer_email  TEXT,
+      license           TEXT,
+      url               TEXT,
+      depends           TEXT,
+      imports           TEXT,
+      suggests          TEXT,
+      linkingto         TEXT,
+      enhances          TEXT,
+      desc_sha          TEXT,
+      source_scanned_at TEXT,
+      PRIMARY KEY (package)
+    ) WITHOUT ROWID")
+  invisible(NULL)
+}
+
+#' Reduce a multi-version slice to one row per package: the LAST version.
+#'
+#' "Last" is the maximum by numeric_version() ordering (NOT string max, so
+#' 1.10 > 1.2). Versions that do not parse are deprioritised and only chosen
+#' when a package has no parseable version; ties are broken by the raw version
+#' string so the pick is deterministic. Every column of the winning row is kept.
+#'
+#' @param rows data.frame with at least columns `package` and `version`.
+#' @return data.frame, one row per distinct package in `rows`.
+.pick_last_version_rows <- function(rows) {
+  if (nrow(rows) == 0L) return(rows)
+  parts <- split(seq_len(nrow(rows)), rows$package)
+  keep  <- vapply(parts, function(idx) {
+    vs <- as.character(rows$version[idx])
+    nv <- numeric_version(vs, strict = FALSE)
+    o  <- order(nv, vs)              # ascending; unparseable (NA) sort last
+    ok <- !is.na(nv[o])
+    if (any(ok)) idx[o[ok][sum(ok)]] # last parseable in ascending order = max
+    else         idx[o[length(o)]]   # all unparseable: last by string order
+  }, integer(1L))
+  rows[keep, , drop = FALSE]
+}
+
+# Run the parameterized UPSERT for a fully-built cran_archived_meta frame.
+# `on_conflict` is the SET body appended to `ON CONFLICT(package) DO UPDATE SET`.
+.write_archived_meta <- function(con, df, on_conflict) {
+  if (is.null(df) || nrow(df) == 0L) return(invisible(NULL))
+  df <- df[, .ARCHIVED_META_COLS, drop = FALSE]
+  ph <- paste(rep("?", length(.ARCHIVED_META_COLS)), collapse = ", ")
+  sql <- sprintf(
+    "INSERT INTO cran_archived_meta (%s) VALUES (%s)\nON CONFLICT(package) DO UPDATE SET\n%s",
+    paste(.ARCHIVED_META_COLS, collapse = ", "), ph, on_conflict)
+  # unname(): the ? placeholders are positional, so params must not be named.
+  DBI::dbExecute(con, sql, params = unname(lapply(df, as.character)))
+  invisible(NULL)
+}
+
+#' Project each archived package's LAST-version row from cran_code_summary into
+#' the narrow cran_archived_meta table. Pure re-shaping of data already in the
+#' DB: no tarball download, no re-scan.
+#'
+#' The UPSERT is non-destructive. It refreshes the projected fields from the wide
+#' table but never overwrites a non-NULL value with NULL (COALESCE), so titles or
+#' descriptions previously filled by the harvest path survive a re-projection.
+#' When the wide table now carries a title (a package re-scanned by the current
+#' pipeline), that title wins and desc_sha is cleared (the row is projection-
+#' sourced again, no longer harvest-validated).
+#'
+#' @param con           Open DBI connection to the pipeline database.
+#' @param archived_pkgs Character vector of archived package names (those the
+#'   universe marks with latest_version = NA).
+#' @param scanned_at    Run timestamp stored in source_scanned_at.
+#' @return invisible(NULL)
+project_archived_meta <- function(con, archived_pkgs,
+                                  scanned_at = format(Sys.time(),
+                                    "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")) {
+  .ensure_archived_meta_table(con)
+  archived_pkgs <- unique(as.character(archived_pkgs))
+  archived_pkgs <- archived_pkgs[!is.na(archived_pkgs) & nzchar(archived_pkgs)]
+  if (!"cran_code_summary" %in% DBI::dbListTables(con) ||
+      length(archived_pkgs) == 0L) {
+    return(invisible(NULL))
+  }
+
+  existing_cols <- DBI::dbListFields(con, "cran_code_summary")
+  src_present   <- .ARCHIVED_META_SOURCES[.ARCHIVED_META_SOURCES %in% existing_cols]
+  sel_cols      <- unique(c("package", "version", unname(src_present)))
+  select        <- paste(sprintf('"%s"', sel_cols), collapse = ", ")
+
+  rows <- .fetch_by_package(con, "cran_code_summary", archived_pkgs, select = select)
+  if (nrow(rows) == 0L) return(invisible(NULL))
+  last <- .pick_last_version_rows(rows)
+  n    <- nrow(last)
+
+  src <- function(target) {
+    s <- .ARCHIVED_META_SOURCES[[target]]
+    if (s %in% names(last)) as.character(last[[s]]) else rep(NA_character_, n)
+  }
+  meta <- data.frame(
+    package           = as.character(last$package),
+    last_version      = as.character(last$version),
+    title             = src("title"),
+    description       = src("description"),
+    authors           = src("authors"),
+    maintainer        = src("maintainer"),
+    maintainer_email  = src("maintainer_email"),
+    license           = src("license"),
+    url               = src("url"),
+    depends           = src("depends"),
+    imports           = src("imports"),
+    suggests          = src("suggests"),
+    linkingto         = src("linkingto"),
+    enhances          = src("enhances"),
+    desc_sha          = NA_character_,   # set only by the harvest path
+    source_scanned_at = rep(as.character(scanned_at), n),
+    stringsAsFactors  = FALSE
+  )
+
+  # COALESCE(excluded, existing) never downgrades a stored value to NULL, so a
+  # prior harvest is preserved; title carries desc_sha's reset with it.
+  on_conflict <- paste(
+    "  last_version      = excluded.last_version,",
+    "  authors           = COALESCE(excluded.authors, cran_archived_meta.authors),",
+    "  maintainer        = COALESCE(excluded.maintainer, cran_archived_meta.maintainer),",
+    "  maintainer_email  = COALESCE(excluded.maintainer_email, cran_archived_meta.maintainer_email),",
+    "  license           = COALESCE(excluded.license, cran_archived_meta.license),",
+    "  url               = COALESCE(excluded.url, cran_archived_meta.url),",
+    "  depends           = COALESCE(excluded.depends, cran_archived_meta.depends),",
+    "  imports           = COALESCE(excluded.imports, cran_archived_meta.imports),",
+    "  suggests          = COALESCE(excluded.suggests, cran_archived_meta.suggests),",
+    "  linkingto         = COALESCE(excluded.linkingto, cran_archived_meta.linkingto),",
+    "  enhances          = COALESCE(excluded.enhances, cran_archived_meta.enhances),",
+    "  title             = COALESCE(excluded.title, cran_archived_meta.title),",
+    "  description       = COALESCE(excluded.description, cran_archived_meta.description),",
+    "  desc_sha          = CASE WHEN excluded.title IS NOT NULL THEN NULL",
+    "                           ELSE cran_archived_meta.desc_sha END,",
+    "  source_scanned_at = excluded.source_scanned_at",
+    sep = "\n")
+
+  DBI::dbWithTransaction(con, .write_archived_meta(con, meta, on_conflict))
+  invisible(NULL)
+}
+
+#' UPSERT one harvested row into cran_archived_meta.
+#'
+#' The harvest path is authoritative for title/description/desc_sha (it read them
+#' straight from the package's own DESCRIPTION); the remaining projected fields
+#' are topped up only where the harvest produced a value (COALESCE), so a field
+#' the DESCRIPTION omits keeps whatever the projection supplied.
+#'
+#' @param con     Open DBI connection.
+#' @param row_df  One-row data.frame carrying all .ARCHIVED_META_COLS.
+#' @return invisible(NULL)
+upsert_archived_meta_row <- function(con, row_df) {
+  .ensure_archived_meta_table(con)
+  on_conflict <- paste(
+    "  last_version      = excluded.last_version,",
+    "  title             = excluded.title,",
+    "  description       = excluded.description,",
+    "  authors           = COALESCE(excluded.authors, cran_archived_meta.authors),",
+    "  maintainer        = COALESCE(excluded.maintainer, cran_archived_meta.maintainer),",
+    "  maintainer_email  = COALESCE(excluded.maintainer_email, cran_archived_meta.maintainer_email),",
+    "  license           = COALESCE(excluded.license, cran_archived_meta.license),",
+    "  url               = COALESCE(excluded.url, cran_archived_meta.url),",
+    "  depends           = COALESCE(excluded.depends, cran_archived_meta.depends),",
+    "  imports           = COALESCE(excluded.imports, cran_archived_meta.imports),",
+    "  suggests          = COALESCE(excluded.suggests, cran_archived_meta.suggests),",
+    "  linkingto         = COALESCE(excluded.linkingto, cran_archived_meta.linkingto),",
+    "  enhances          = COALESCE(excluded.enhances, cran_archived_meta.enhances),",
+    "  desc_sha          = excluded.desc_sha,",
+    "  source_scanned_at = excluded.source_scanned_at",
+    sep = "\n")
+  .write_archived_meta(con, row_df, on_conflict)
+  invisible(NULL)
+}
+
+# ---------------------------------------------------------------------------
 # Rich release notes (headline + per-package metrics table + catalog summary)
 # ---------------------------------------------------------------------------
 

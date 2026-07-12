@@ -16,6 +16,10 @@ on:
       time_budget_seconds:
         description: "Stop starting new shards after this many seconds (default 18000 = 5h)."
         default: "18000"
+      harvest_descriptions:
+        description: "Backfill archived-package title/description from their tarball DESCRIPTIONs (heavy, one-time; idempotent/resumable)."
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -109,6 +113,27 @@ jobs:
           NOTES_TITLE_PREFIX: CRAN
         run: |
           set -euo pipefail
+          TODAY="$(date -u +%Y-%m-%d)"
+          METRICS_TAG="metrics-${TODAY}"
+
+          # Harvest mode: backfill archived title/description from tarball
+          # DESCRIPTIONs. It only mutates cran_archived_meta's title/description
+          # (the code metrics + data DB + manifests are untouched), so we clobber
+          # just the code-DB asset in today's release. Idempotent (title-IS-NULL
+          # selection) and resumable, so a re-run continues where it left off.
+          if [ "${{ inputs.harvest_descriptions }}" = "true" ]; then
+            echo "=== harvest-descriptions (elapsed ${SECONDS}s) ==="
+            Rscript scripts/update.R out/ --harvest-descriptions
+            if gh release view "$METRICS_TAG" >/dev/null 2>&1; then
+              gh release upload "$METRICS_TAG" out/cran-code-metrics.db --clobber
+              echo "clobbered cran-code-metrics.db in ${METRICS_TAG}"
+            else
+              echo "::error::no ${METRICS_TAG} release to update; run the normal update first."
+              exit 1
+            fi
+            exit 0
+          fi
+
           BUDGET="${{ inputs.time_budget_seconds || '18000' }}"
           FORCE=""; [ "${{ inputs.force_full }}" = "true" ] && FORCE="--bootstrap"
           RECOLLECT=""; [ "${{ inputs.recollect }}" = "true" ] && RECOLLECT="--recollect"

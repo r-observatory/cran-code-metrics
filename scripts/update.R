@@ -432,6 +432,14 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                  fresh_functions, fresh_edges)
   }
 
+  # ---- 7b. Project archived-package metadata into the narrow lookup table ----
+  # Re-shape each archived package's last-version identity fields into the
+  # WITHOUT ROWID cran_archived_meta table the viewer point-looks-up. Runs every
+  # shard so the table stays complete as the bootstrap accumulates archived
+  # packages; it only re-reads data already in the DB (no download, no re-scan).
+  archived_pkgs <- universe$package[is.na(universe$latest_version)]
+  project_archived_meta(con, archived_pkgs)
+
   # ---- 8. Manifest ---------------------------------------------------------
   # cran_code_summary is created lazily by upsert_shard; may not exist yet if
   # this is the first run and every package in the shard failed.
@@ -541,6 +549,281 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
 }
 
 # ---------------------------------------------------------------------------
+# --harvest-descriptions: backfill title/description for archived packages
+# ---------------------------------------------------------------------------
+# A heavy, out-of-band pass (~8,600 archived packages) that fills the identity
+# fields cran_archived_meta could not project because the stored rows predate
+# the pipeline emitting Title/Description. For each archived package whose
+# projected row still lacks a title it downloads ONLY that package's last
+# archived tarball, extracts ONLY its DESCRIPTION, and upserts the derived
+# fields. Idempotent and resumable: a filled row is never re-fetched, and a
+# forced re-fetch whose DESCRIPTION is byte-identical (matching desc_sha) is a
+# provable no-op.
+
+# Polite default User-Agent so CRAN can attribute (and throttle) the traffic.
+HARVEST_USER_AGENT <- sprintf(
+  "cran-code-metrics harvest (%s; %s)", PUBLISH_REPO, R.version.string)
+
+#' Download one archived package's last tarball from the CRAN cloud mirror.
+#'
+#' Retries with linear backoff; honours the caller's options(timeout=...) via
+#' download.file. Returns TRUE only when a non-empty file lands at destfile.
+#'
+#' @param package  Package name.
+#' @param version  Last archived version string.
+#' @param destfile Path to write the tarball to.
+#' @param mirror   Base mirror URL (default the cloud CDN).
+#' @param tries    Maximum download attempts.
+#' @param sleep    Base backoff seconds (multiplied by the attempt number).
+#' @return logical TRUE on success.
+.download_archived_tarball <- function(package, version, destfile,
+                                       mirror = "https://cloud.r-project.org",
+                                       tries = 3L, sleep = 1) {
+  url <- sprintf("%s/src/contrib/Archive/%s/%s_%s.tar.gz",
+                 mirror, package, package, version)
+  for (attempt in seq_len(tries)) {
+    ok <- tryCatch({
+      suppressWarnings(
+        utils::download.file(url, destfile, mode = "wb", quiet = TRUE))
+      file.exists(destfile) && file.info(destfile)$size > 0
+    }, error = function(e) FALSE)
+    if (isTRUE(ok)) return(TRUE)
+    if (attempt < tries) Sys.sleep(sleep * attempt)  # linear backoff
+  }
+  FALSE
+}
+
+#' Derive the cran_archived_meta identity fields from an already-parsed
+#' DESCRIPTION (a named list, as read.dcf/parse_dcf produce).
+#'
+#' Reuses metrics_meta() for title/description/authors/maintainer/deps by wrapping
+#' the DESCRIPTION in a minimal context; license and url are read straight off the
+#' field (metrics_meta does not carry them).
+#'
+#' @param desc Named list of DESCRIPTION fields.
+#' @return Named list of the projected fields (no package/version/desc_sha).
+.archived_fields_from_desc <- function(desc) {
+  ctx <- list(desc = desc, exists = function(p) identical(p, "DESCRIPTION"))
+  m   <- metrics_meta(ctx)
+  .nz <- function(x) { x <- trimws(x %||% ""); if (nzchar(x)) x else NA_character_ }
+  list(
+    title            = m$title,
+    description      = m$description,
+    authors          = m$authors,
+    maintainer       = m$maintainer,
+    maintainer_email = m$maintainer_email,
+    license          = .nz(desc[["License"]]),
+    url              = .nz(desc[["URL"]]),
+    depends          = m$depends,
+    imports          = m$imports,
+    suggests         = m$suggests,
+    linkingto        = m$linking_to,
+    enhances         = m$enhances
+  )
+}
+
+#' Extract ONLY the DESCRIPTION from a package tarball and derive its identity
+#' fields plus the sha256 of the DESCRIPTION bytes.
+#'
+#' Reads the member `<package>/DESCRIPTION`; if that exact path is absent (top-dir
+#' casing differs from the package name) it falls back to the first `*/DESCRIPTION`
+#' the archive lists. The declared `Encoding:` is honoured when re-parsing.
+#'
+#' @param tarfile Path to the downloaded .tar.gz.
+#' @param package Package name (expected top-level directory).
+#' @return Named list of fields plus $desc_sha, or NULL when no DESCRIPTION
+#'   could be extracted or parsed.
+.harvest_parse_description <- function(tarfile, package) {
+  ex <- tempfile("ccm_harv_")
+  dir.create(ex, recursive = TRUE)
+  on.exit(unlink(ex, recursive = TRUE, force = TRUE), add = TRUE)
+
+  # A member absent from the archive makes the external tar emit a warning and a
+  # non-zero code; that is an expected, handled miss (we fall back / return
+  # NULL), so suppress the warning rather than let it surface as a failure.
+  .untar_member <- function(member) {
+    suppressWarnings(tryCatch(
+      utils::untar(tarfile, files = member, exdir = ex),
+      error = function(e) NULL))
+    file.path(ex, member)
+  }
+
+  member <- paste0(package, "/DESCRIPTION")
+  dpath  <- .untar_member(member)
+
+  if (!file.exists(dpath)) {
+    # Fallback: the top directory may be cased differently than the package.
+    lst  <- suppressWarnings(tryCatch(utils::untar(tarfile, list = TRUE),
+                                      error = function(e) character(0L)))
+    cand <- lst[grepl("^[^/]+/DESCRIPTION$", lst)]
+    if (length(cand) == 0L) return(NULL)
+    dpath <- .untar_member(cand[[1L]])
+    if (!file.exists(dpath)) return(NULL)
+  }
+
+  bytes    <- readBin(dpath, "raw", n = file.info(dpath)$size)
+  desc_sha <- digest::digest(bytes, algo = "sha256", serialize = FALSE)
+
+  enc <- tryCatch({
+    m <- read.dcf(dpath, fields = "Encoding")
+    e <- if ("Encoding" %in% colnames(m)) m[1L, "Encoding"] else NA_character_
+    if (is.na(e)) "" else e
+  }, error = function(e) "")
+
+  fcon <- file(dpath, encoding = if (nzchar(enc)) enc else "")
+  dcf  <- tryCatch(read.dcf(fcon), error = function(e) NULL)
+  close(fcon)
+  if (is.null(dcf) || nrow(dcf) == 0L) return(NULL)
+
+  desc   <- stats::setNames(as.list(dcf[1L, ]), colnames(dcf))
+  fields <- .archived_fields_from_desc(desc)
+  fields$desc_sha <- desc_sha
+  fields
+}
+
+#' Backfill title/description (and top up missing projected fields) for archived
+#' packages whose cran_archived_meta row lacks a title.
+#'
+#' One tarball per package, DESCRIPTION-only. Each package is isolated in a
+#' tryCatch so a missing tarball or malformed DESCRIPTION logs a warning and the
+#' batch continues. Politeness: a descriptive User-Agent, a Sys.sleep between
+#' packages, and retry-with-backoff inside the downloader.
+#'
+#' @param con         Open DBI connection to the pipeline database.
+#' @param packages    Restrict to these packages (default: every row missing a
+#'   title). Non-NULL is mainly for tests / targeted re-runs.
+#' @param mirror      Base mirror URL.
+#' @param user_agent  HTTPUserAgent set for the duration of the batch.
+#' @param sleep       Seconds to sleep between packages (be polite).
+#' @param tries       Max download attempts per package.
+#' @param limit       Optional cap on packages processed this call (resumable).
+#' @param download_fn Injectable downloader (package, version, destfile, mirror,
+#'   tries, sleep) -> logical; defaults to the real cloud-mirror download.
+#' @return invisible(list(todo, ok, skipped, failed)).
+harvest_descriptions <- function(con, packages = NULL,
+                                 mirror = "https://cloud.r-project.org",
+                                 user_agent = HARVEST_USER_AGENT,
+                                 sleep = 0.5, tries = 3L, limit = NULL,
+                                 download_fn = .download_archived_tarball) {
+  .ensure_archived_meta_table(con)
+
+  todo <- if (is.null(packages)) {
+    DBI::dbGetQuery(con,
+      "SELECT package, last_version FROM cran_archived_meta
+       WHERE title IS NULL AND last_version IS NOT NULL
+       ORDER BY package")
+  } else {
+    pk <- unique(as.character(packages))
+    if (length(pk) == 0L) {
+      data.frame(package = character(0L), last_version = character(0L),
+                 stringsAsFactors = FALSE)
+    } else {
+      ph <- paste(rep("?", length(pk)), collapse = ", ")
+      DBI::dbGetQuery(con, sprintf(
+        "SELECT package, last_version FROM cran_archived_meta
+         WHERE package IN (%s) AND last_version IS NOT NULL
+         ORDER BY package", ph), params = as.list(pk))
+    }
+  }
+  if (!is.null(limit) && nrow(todo) > limit) todo <- todo[seq_len(limit), , drop = FALSE]
+
+  old_ua <- getOption("HTTPUserAgent")
+  options(HTTPUserAgent = user_agent)
+  on.exit(options(HTTPUserAgent = old_ua), add = TRUE)
+
+  n_ok <- 0L; n_skip <- 0L; n_fail <- 0L
+  for (i in seq_len(nrow(todo))) {
+    pkg <- todo$package[i]
+    ver <- todo$last_version[i]
+    res <- tryCatch(
+      .harvest_one(con, pkg, ver, mirror, tries, sleep, download_fn),
+      error = function(e) {
+        warning(sprintf("harvest failed for '%s' (%s): %s",
+                        pkg, ver, conditionMessage(e)))
+        "fail"
+      })
+    if      (identical(res, "ok"))   n_ok   <- n_ok   + 1L
+    else if (identical(res, "skip")) n_skip <- n_skip + 1L
+    else                             n_fail <- n_fail + 1L
+    if (sleep > 0) Sys.sleep(sleep)   # be polite between packages
+  }
+
+  invisible(list(todo = nrow(todo), ok = n_ok, skipped = n_skip, failed = n_fail))
+}
+
+# Harvest a single package: download -> DESCRIPTION-only parse -> idempotency
+# gate -> upsert. Returns "ok", "skip" (byte-identical to a filled row), or
+# "fail". Never throws for an expected miss; the caller's tryCatch is a backstop.
+.harvest_one <- function(con, package, version, mirror, tries, sleep, download_fn) {
+  tf <- tempfile(fileext = ".tar.gz")
+  on.exit(unlink(tf, force = TRUE), add = TRUE)
+  if (!isTRUE(download_fn(package, version, tf, mirror, tries, sleep))) {
+    return("fail")
+  }
+  fields <- .harvest_parse_description(tf, package)
+  if (is.null(fields) || is.na(fields$title)) return("fail")
+
+  # Idempotency: a row already filled from a byte-identical DESCRIPTION needs no
+  # write. Combined with the title-IS-NULL selection, a re-run is a no-op.
+  existing <- DBI::dbGetQuery(con,
+    "SELECT title, desc_sha FROM cran_archived_meta WHERE package = ?",
+    params = list(package))
+  if (nrow(existing) == 1L && !is.na(existing$title) &&
+      identical(existing$desc_sha, fields$desc_sha)) {
+    return("skip")
+  }
+
+  row <- data.frame(
+    package           = package,
+    last_version      = version,
+    title             = fields$title,
+    description       = fields$description,
+    authors           = fields$authors,
+    maintainer        = fields$maintainer,
+    maintainer_email  = fields$maintainer_email,
+    license           = fields$license,
+    url               = fields$url,
+    depends           = fields$depends,
+    imports           = fields$imports,
+    suggests          = fields$suggests,
+    linkingto         = fields$linkingto,
+    enhances          = fields$enhances,
+    desc_sha          = fields$desc_sha,
+    source_scanned_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    stringsAsFactors  = FALSE
+  )
+  upsert_archived_meta_row(con, row)
+  "ok"
+}
+
+#' CLI wrapper for the harvest pass: open the DB, refresh the archived-meta
+#' projection (so every archived package has a last_version to fetch), then
+#' backfill the rows still missing a title.
+#'
+#' @param io      IO interface providing $package_list() (for the archived set).
+#' @param out_dir Directory holding the pipeline DB.
+#' @param ...     Passed through to harvest_descriptions().
+#' @return invisible(harvest_descriptions() result).
+run_harvest <- function(io, out_dir, ...) {
+  db_path <- file.path(out_dir, DB_FILENAME)
+  con <- open_or_init_db(db_path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  universe <- io$package_list()
+  archived <- if (is.data.frame(universe) && nrow(universe) > 0L) {
+    universe$package[is.na(universe$latest_version)]
+  } else {
+    character(0L)
+  }
+  project_archived_meta(con, archived)
+  res <- harvest_descriptions(con, ...)
+  cat(sprintf("harvest: %d/%d ok, %d skipped, %d failed\n",
+              res$ok, res$todo, res$skipped, res$failed), file = stdout())
+  flush(stdout())
+  invisible(res)
+}
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 if (identical(sys.nframe(), 0L)) {
@@ -567,7 +850,7 @@ if (identical(sys.nframe(), 0L)) {
     positional[1L]
   } else {
     stop(
-      "Usage: Rscript scripts/update.R <out_dir> [--shard=N] [--bootstrap]",
+      "Usage: Rscript scripts/update.R <out_dir> [--shard=N] [--bootstrap] [--recollect] [--harvest-descriptions]",
       call. = FALSE
     )
   }
@@ -575,6 +858,7 @@ if (identical(sys.nframe(), 0L)) {
   shard_override <- SHARD_SIZE
   force_full     <- FALSE
   recollect      <- FALSE
+  harvest        <- FALSE
 
   for (arg in args[startsWith(args, "--")]) {
     if (startsWith(arg, "--shard=")) {
@@ -586,11 +870,19 @@ if (identical(sys.nframe(), 0L)) {
       force_full <- TRUE
     } else if (identical(arg, "--recollect")) {
       recollect <- TRUE
+    } else if (identical(arg, "--harvest-descriptions")) {
+      harvest <- TRUE
     }
   }
 
   io <- default_io()
-  run_update(io, out_dir, shard_size = shard_override, force_full = force_full,
-             recollect = recollect)
+  if (isTRUE(harvest)) {
+    # Out-of-band backlog pass: does not analyze a shard, only backfills the
+    # archived-metadata table's title/description from per-package DESCRIPTIONs.
+    run_harvest(io, out_dir)
+  } else {
+    run_update(io, out_dir, shard_size = shard_override, force_full = force_full,
+               recollect = recollect)
+  }
   message("Done.")
 }

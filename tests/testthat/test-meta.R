@@ -197,5 +197,49 @@ test_that("metrics_meta: returns named list with all expected metrics", {
   m   <- metrics_meta(ctx)
 
   expect_true(all(c("n_deps_direct", "dep_list", "maintainer",
-                    "maintainer_email", "n_authors", "authors") %in% names(m)))
+                    "maintainer_email", "n_authors", "authors",
+                    "title", "description") %in% names(m)))
+})
+
+# ===========================================================================
+# title + description
+# ===========================================================================
+
+test_that("metrics_meta: title and description are taken from the DESCRIPTION", {
+  ctx <- make_meta_ctx(paste0(
+    "Package: p\nVersion: 1.0\n",
+    "Title: A Concise Title\n",
+    "Description: A longer description of what\n",
+    "  the package does, across two lines.\n"
+  ))
+  m <- metrics_meta(ctx)
+
+  expect_equal(m$title, "A Concise Title")
+  # Continuation lines are folded (parse_dcf joins them with a newline).
+  expect_true(grepl("across two lines", m$description, fixed = TRUE))
+})
+
+test_that("metrics_meta: title and description are NA when the fields are absent", {
+  ctx <- make_meta_ctx("Package: p\nVersion: 1.0\n")
+  m   <- metrics_meta(ctx)
+
+  expect_true(is.na(m$title))
+  expect_true(is.na(m$description))
+})
+
+test_that("metrics_meta: title and description are NA when DESCRIPTION is absent", {
+  ctx <- build_context("p", "1.0", "1.0", "2024-01-01",
+                       character(0L), function(p) "")
+  m <- metrics_meta(ctx)
+
+  expect_true(is.na(m$title))
+  expect_true(is.na(m$description))
+})
+
+test_that("metrics_meta: an empty Title field becomes NA (not empty string)", {
+  ctx <- make_meta_ctx("Package: p\nVersion: 1.0\nTitle:\nDescription:\n")
+  m   <- metrics_meta(ctx)
+
+  expect_true(is.na(m$title))
+  expect_true(is.na(m$description))
 })

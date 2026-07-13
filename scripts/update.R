@@ -440,6 +440,12 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   archived_pkgs <- universe$package[is.na(universe$latest_version)]
   project_archived_meta(con, archived_pkgs)
 
+  # Rebuild the author/package span table from the same already-stored rows, so
+  # the viewer can say when an author actually joined a package instead of
+  # quoting the package's first release. Also a pure projection: no download,
+  # no re-scan.
+  project_author_spans(con)
+
   # ---- 8. Manifest ---------------------------------------------------------
   # cran_code_summary is created lazily by upsert_shard; may not exist yet if
   # this is the first run and every package in the shard failed.

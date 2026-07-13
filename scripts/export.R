@@ -1,6 +1,7 @@
 # scripts/export.R: SQLite export, manifest, and fingerprint helpers.
 #
-# Load order: config.R -> export.R
+# Load order: config.R -> analyze.R -> export.R
+# (analyze.R supplies the author-identity parser the span projection reuses.)
 # Does NOT auto-source dependencies; caller controls load order.
 
 #' Coerce logical columns in a data.frame to 0/1 INTEGER.
@@ -923,6 +924,231 @@ upsert_archived_meta_row <- function(con, row_df) {
     "  source_scanned_at = excluded.source_scanned_at",
     sep = "\n")
   .write_archived_meta(con, row_df, on_conflict)
+  invisible(NULL)
+}
+
+# ---------------------------------------------------------------------------
+# cran_author_package_span: when each author joined (and left) each package
+# ---------------------------------------------------------------------------
+# cran_code_summary knows only when a PACKAGE first appeared, so an author added
+# to a 2010 package in 2024 looked like they had been on CRAN since 2010. This
+# table records, per (author, package), the first and last package-version that
+# actually lists them. It is a projection over rows already in the DB: no
+# download, no re-scan, no re-analysis.
+#
+# Author page:  SELECT MIN(first_seen) ... WHERE author_key = ?  (PK prefix)
+# Package page: SELECT ...              WHERE package = ?        (idx_caps_package)
+
+# Column order for INSERTs into cran_author_package_span.
+.AUTHOR_SPAN_COLS <- c(
+  "author_key", "package", "given", "family", "first_version", "first_seen",
+  "last_version", "last_seen", "n_versions"
+)
+
+# Zero-row frame with the exact span column types.
+.empty_author_spans <- function() {
+  data.frame(
+    author_key    = character(0L),
+    package       = character(0L),
+    given         = character(0L),
+    family        = character(0L),
+    first_version = character(0L),
+    first_seen    = character(0L),
+    last_version  = character(0L),
+    last_seen     = character(0L),
+    n_versions    = integer(0L),
+    stringsAsFactors = FALSE
+  )
+}
+
+#' Drop and recreate the span table (and its package index) from scratch.
+#'
+#' The projection is a full rebuild every run, so the table is dropped rather
+#' than upserted: the result depends only on cran_code_summary, which makes it
+#' deterministic and idempotent, and drops authors whose rows have gone away.
+#' WITHOUT ROWID + PRIMARY KEY (author_key, package) makes the author page's
+#' MIN(first_seen) lookup a clustered scan of one key prefix; idx_caps_package
+#' serves the package page's reverse lookup.
+.rebuild_author_span_table <- function(con) {
+  DBI::dbExecute(con, "DROP TABLE IF EXISTS cran_author_package_span")
+  DBI::dbExecute(con, "
+    CREATE TABLE cran_author_package_span (
+      author_key    TEXT NOT NULL,
+      package       TEXT NOT NULL,
+      given         TEXT,
+      family        TEXT,
+      first_version TEXT,
+      first_seen    TEXT,
+      last_version  TEXT,
+      last_seen     TEXT,
+      n_versions    INTEGER,
+      PRIMARY KEY (author_key, package)
+    ) WITHOUT ROWID")
+  DBI::dbExecute(con,
+    "CREATE INDEX idx_caps_package ON cran_author_package_span(package)")
+  invisible(NULL)
+}
+
+#' Build a lexicographically-sortable key out of a version string.
+#'
+#' numeric_version() gets the ordering right (1.10 > 1.9), but ordering the whole
+#' table by it costs seconds, because order() has to xtfrm the underlying list.
+#' Zero-padding every numeric component to 10 digits gives a plain string whose
+#' C-locale (radix) order is the same, for a fraction of the cost:
+#'   "1.9"  -> "0000000001.0000000009"
+#'   "1.10" -> "0000000001.0000000010"
+#' "-" and "." are the same separator to numeric_version(), so they are folded
+#' together first. Vectorised; NA in, NA out (which order() then sorts last).
+#'
+#' @param v Character vector of version strings.
+#' @return Character vector of sort keys (comparable only against each other).
+.version_sort_key <- function(v) {
+  x <- gsub("-", ".", v, fixed = TRUE)
+  x <- gsub("([0-9]+)", "000000000\\1", x)   # 9 leading zeros on every digit run
+  gsub("0*([0-9]{10})", "\\1", x)            # keep the last 10 digits of each run
+}
+
+#' Reduce a package-version slice to one span row per (author_key, package).
+#'
+#' Rows are ordered within each package by `released` ascending, tie-broken by
+#' version number (so 1.10 follows 1.9) and then the raw version string; a
+#' missing date sorts last, keeping the order total and deterministic. Every
+#' version's `authors` JSON is then read in one vectorised pass
+#' (.xv_author_pairs) and each author identity's first and last appearance is
+#' picked out by position.
+#'
+#' @param rows data.frame with columns package, version and (optionally)
+#'   released, authors. May carry rows for many packages, but every row of a
+#'   package must be present or its span will be wrong: callers chunk by package.
+#' @return data.frame with .AUTHOR_SPAN_COLS; zero rows when no author is found.
+.author_spans_from_rows <- function(rows) {
+  if (is.null(rows) || nrow(rows) == 0L ||
+      !all(c("package", "version") %in% names(rows))) {
+    return(.empty_author_spans())
+  }
+  n   <- nrow(rows)
+  pkg <- as.character(rows$package)
+  ver <- as.character(rows$version)
+  rel <- if ("released" %in% names(rows)) as.character(rows$released) else rep(NA_character_, n)
+  aut <- if ("authors"  %in% names(rows)) as.character(rows$authors)  else rep(NA_character_, n)
+
+  o   <- order(pkg, rel, .version_sort_key(ver), ver, method = "radix")
+  pkg <- pkg[o]; ver <- ver[o]; rel <- rel[o]; aut <- aut[o]
+
+  pairs <- .xv_author_pairs(aut)
+  # A nameless entry (no given AND no family) is not an identity: drop it rather
+  # than collapse every such author of a package onto one blank key.
+  pairs <- pairs[nzchar(trimws(pairs$author_key)), , drop = FALSE]
+  if (nrow(pairs) == 0L) return(.empty_author_spans())
+
+  # `row` indexes the ordered rows and is ascending, so within a group the FIRST
+  # pair seen is the earliest version and the LAST is the most recent one.
+  ri  <- pairs$row
+  key <- paste(pairs$author_key, pkg[ri], sep = "\r")
+
+  # An author listed twice in one DESCRIPTION must not inflate n_versions.
+  keep  <- !duplicated(paste(key, ri, sep = "\r"))
+  pairs <- pairs[keep, , drop = FALSE]
+  ri    <- ri[keep]
+  key   <- key[keep]
+
+  ukeys <- key[!duplicated(key)]
+  idx   <- match(key, ukeys)
+  k     <- length(ukeys)
+  pos   <- seq_along(idx)
+  first <- integer(k); first[rev(idx)] <- rev(pos)   # last write wins -> earliest
+  last  <- integer(k); last[idx]       <- pos        # last write wins -> latest
+  n_ver <- tabulate(idx, nbins = k)
+
+  rf <- ri[first]
+  rl <- ri[last]
+  data.frame(
+    author_key    = pairs$author_key[first],
+    package       = pkg[rf],
+    given         = pairs$given[last],               # display form: most recent
+    family        = pairs$family[last],
+    first_version = ver[rf],
+    first_seen    = rel[rf],
+    last_version  = ver[rl],
+    last_seen     = rel[rl],
+    n_versions    = as.integer(n_ver),
+    stringsAsFactors = FALSE
+  )
+}
+
+#' Project the author spans of every package in the DB into
+#' cran_author_package_span. Pure re-shaping of data already in the DB: no
+#' tarball download, no re-scan.
+#'
+#' Reads only package/version/released/authors -- never the ~200-column wide row
+#' -- and streams that narrow slice out of SQLite `fetch_rows` at a time. The
+#' read is one sequential scan rather than a per-package indexed lookup: on the
+#' full table the random-access form costs ~6x more, and the four columns of
+#' every package-version together weigh only tens of MB. The CPU work is then
+#' done a package batch at a time, so the parse never expands the whole table's
+#' authors at once. A package's rows must all reach the same batch, hence the
+#' sort by package before batching.
+#'
+#' @param con        Open DBI connection to the pipeline database.
+#' @param chunk_size Packages per CPU batch.
+#' @param fetch_rows Rows per SQLite fetch.
+#' @return invisible(NULL)
+project_author_spans <- function(con, chunk_size = 2000L, fetch_rows = 100000L) {
+  cols <- if ("cran_code_summary" %in% DBI::dbListTables(con)) {
+    DBI::dbListFields(con, "cran_code_summary")
+  } else {
+    character(0L)
+  }
+  # An empty (or author-less) source still leaves the viewer a table to query.
+  if (!all(c("package", "version", "authors") %in% cols)) {
+    DBI::dbWithTransaction(con, .rebuild_author_span_table(con))
+    return(invisible(NULL))
+  }
+
+  # `released` is the release date; older schemas called it `date`.
+  date_col <- if ("released" %in% cols) "released" else if ("date" %in% cols) "date" else NA_character_
+  sel      <- c("package", "version", "authors", if (!is.na(date_col)) date_col)
+  select   <- paste(sprintf('"%s"', sel), collapse = ", ")
+
+  # ---- read: one sequential scan of the four narrow columns, in chunks -------
+  rows <- local({
+    rs <- DBI::dbSendQuery(con,
+      sprintf("SELECT %s FROM cran_code_summary", select))
+    on.exit(DBI::dbClearResult(rs), add = TRUE)
+    acc <- list()
+    repeat {
+      chunk <- DBI::dbFetch(rs, n = fetch_rows)
+      if (nrow(chunk) == 0L) break
+      acc[[length(acc) + 1L]] <- chunk
+    }
+    if (length(acc) == 0L) NULL else do.call(rbind, acc)
+  })
+
+  spans <- list()
+  if (!is.null(rows) && nrow(rows) > 0L) {
+    if (!is.na(date_col) && !identical(date_col, "released")) {
+      names(rows)[names(rows) == date_col] <- "released"
+    }
+    rows <- rows[order(rows$package, method = "radix"), , drop = FALSE]
+
+    # Batch on package boundaries: chunk_size packages of complete history each.
+    runs  <- rle(rows$package)$lengths
+    batch <- rep(((seq_along(runs) - 1L) %/% chunk_size) + 1L, runs)
+    for (i in split(seq_len(nrow(rows)), batch)) {
+      part <- .author_spans_from_rows(rows[i, , drop = FALSE])
+      if (nrow(part) > 0L) spans[[length(spans) + 1L]] <- part
+    }
+  }
+  out <- if (length(spans) > 0L) do.call(rbind, spans) else .empty_author_spans()
+  # Insert in primary-key order: sequential appends into the clustered B-tree.
+  out <- out[order(out$author_key, out$package), .AUTHOR_SPAN_COLS, drop = FALSE]
+
+  DBI::dbWithTransaction(con, {
+    .rebuild_author_span_table(con)
+    if (nrow(out) > 0L) {
+      DBI::dbAppendTable(con, "cran_author_package_span", out)
+    }
+  })
   invisible(NULL)
 }
 

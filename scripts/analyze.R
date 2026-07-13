@@ -153,27 +153,188 @@ deprecation_signals <- function(ctx) {
 }
 
 
-# Parse a JSON author array into lowercase "given family" identity strings.
-.xv_author_identities <- function(json_str) {
-  if (is.null(json_str) || length(json_str) == 0L) return(character(0L))
-  if (is.na(json_str)   || !nzchar(json_str))       return(character(0L))
+# ---------------------------------------------------------------------------
+# Author identities
+# ---------------------------------------------------------------------------
+# One parser (JSON -> given/family pairs) and one normalisation (pair -> key)
+# back every author-identity consumer: authors_added_later below and the
+# cran_author_package_span projection in export.R.
+
+# Normalise a given/family pair into the stable cross-version author key:
+# lower(trim(given)) + " " + lower(trim(family)). A missing component (NA, null,
+# absent) contributes an empty string, so a family-only author keys as " family".
+# Vectorised over given/family.
+.xv_author_key <- function(given, family) {
+  g <- tolower(trimws(given));  g[is.na(g)] <- ""
+  f <- tolower(trimws(family)); f[is.na(f)] <- ""
+  paste(g, f)
+}
+
+
+# Coerce a parsed JSON field to a single string; NULL/empty become NA.
+.xv_scalar_chr <- function(x) {
+  if (is.null(x) || length(x) == 0L) return(NA_character_)
+  as.character(x)[[1L]]
+}
+
+
+# Parse ONE JSON author array into a data.frame of display-form given/family
+# pairs (NA where the field is null/absent). Zero rows on NULL/NA/empty input,
+# on a JSON parse error, or on a shape that carries no author objects.
+#
+# Tolerant, but per-row and jsonlite-backed: use .xv_author_pairs() for bulk work.
+.xv_authors_from_json <- function(json_str) {
+  none <- data.frame(given = character(0L), family = character(0L),
+                     stringsAsFactors = FALSE)
+  if (is.null(json_str) || length(json_str) == 0L) return(none)
+  if (is.na(json_str)   || !nzchar(json_str))       return(none)
   parsed <- tryCatch(
     jsonlite::fromJSON(json_str, simplifyDataFrame = TRUE, simplifyVector = TRUE),
     error = function(e) NULL
   )
-  if (is.null(parsed) || length(parsed) == 0L) return(character(0L))
+  if (is.null(parsed) || length(parsed) == 0L) return(none)
+
   if (is.data.frame(parsed)) {
-    g <- ifelse(is.na(parsed$given),  "", tolower(trimws(parsed$given)))
-    f <- ifelse(is.na(parsed$family), "", tolower(trimws(parsed$family)))
-    paste(g, f)
+    n <- nrow(parsed)
+    if (n == 0L) return(none)
+    data.frame(
+      given  = if ("given"  %in% names(parsed)) as.character(parsed$given)
+               else rep(NA_character_, n),
+      family = if ("family" %in% names(parsed)) as.character(parsed$family)
+               else rep(NA_character_, n),
+      stringsAsFactors = FALSE
+    )
   } else if (is.list(parsed)) {
-    vapply(parsed, function(p) {
-      paste(tolower(trimws(p[["given"]]  %||% "")),
-            tolower(trimws(p[["family"]] %||% "")))
-    }, character(1L))
+    data.frame(
+      given  = vapply(parsed, function(p) .xv_scalar_chr(p[["given"]]),  character(1L)),
+      family = vapply(parsed, function(p) .xv_scalar_chr(p[["family"]]), character(1L)),
+      stringsAsFactors = FALSE
+    )
   } else {
-    character(0L)
+    none
   }
+}
+
+
+# Parse a JSON author array into lowercase "given family" identity strings.
+.xv_author_identities <- function(json_str) {
+  a <- .xv_authors_from_json(json_str)
+  if (nrow(a) == 0L) return(character(0L))
+  .xv_author_key(a$given, a$family)
+}
+
+
+# --- Bulk (vectorised) author extraction -----------------------------------
+# The span projection reads the `authors` column of EVERY package-version row
+# (~500k), so a per-row jsonlite::fromJSON() is far too slow. The author arrays
+# are emitted by metrics_meta() via jsonlite::toJSON(), so each object is
+#   {"given":<str|null>,"family":<str|null>,"roles":[...]}
+# with the keys in that order and non-ASCII written as literal UTF-8. One PCRE
+# match per given/family pair therefore reads the whole column in a single
+# vectorised pass; anything the pattern cannot read falls back to
+# .xv_authors_from_json() row by row, so an unexpected shape is parsed, not lost.
+#
+# Values are captured WITH their delimiters (a quoted string, or the bare token
+# null) so the two cases stay distinguishable; \" inside a value is honoured.
+.XV_AUTHOR_VALUE  <- '("(?:[^"\\\\]|\\\\.)*"|null)'
+.XV_AUTHOR_PAIR_RE <- paste0('"given"\\s*:\\s*',  .XV_AUTHOR_VALUE,
+                             '\\s*,\\s*"family"\\s*:\\s*', .XV_AUTHOR_VALUE)
+.XV_GIVEN_RE      <- paste0('^"given"\\s*:\\s*',  .XV_AUTHOR_VALUE, '.*$')
+.XV_FAMILY_RE     <- paste0('^.*"family"\\s*:\\s*', .XV_AUTHOR_VALUE, '$')
+
+
+# Turn captured JSON value tokens ('"Csillery"', '"A\\"B"', 'null') into R
+# strings: null -> NA, quoted -> unquoted and unescaped. Vectorised; the
+# (rare) escaped values are unescaped by jsonlite, so \" and \uXXXX both work.
+.xv_json_token <- function(tok) {
+  out <- rep(NA_character_, length(tok))
+  q   <- tok != "null"
+  if (!any(q)) return(out)
+  body <- substr(tok[q], 2L, nchar(tok[q]) - 1L)
+  esc  <- grepl("\\", body, fixed = TRUE)
+  if (any(esc)) {
+    body[esc] <- vapply(body[esc], function(s) {
+      tryCatch(as.character(jsonlite::fromJSON(paste0('"', s, '"'))),
+               error = function(e) s)
+    }, character(1L), USE.NAMES = FALSE)
+  }
+  out[q] <- body
+  out
+}
+
+
+# Parse a vector of DISTINCT author-array JSON strings.
+#
+# Returns the pairs of every input string concatenated in input order, plus the
+# per-string pair count, so string i owns
+#   flat[(cumsum(counts)[i] - counts[i] + 1L):cumsum(counts)[i]]
+#
+# @return list(counts = integer, given, family, author_key = character)
+.xv_parse_author_arrays <- function(u) {
+  hits   <- regmatches(u, gregexpr(.XV_AUTHOR_PAIR_RE, u, perl = TRUE))
+  counts <- lengths(hits)
+  flat   <- unlist(hits, use.names = FALSE) %||% character(0L)
+  given  <- .xv_json_token(sub(.XV_GIVEN_RE,  "\\1", flat, perl = TRUE))
+  family <- .xv_json_token(sub(.XV_FAMILY_RE, "\\1", flat, perl = TRUE))
+  owner  <- rep(seq_along(u), counts)
+
+  # Strings the fast pattern read nothing from, yet which do mention an author
+  # field (unexpected key order, a nested array, a hand-written row): parse them
+  # properly rather than silently dropping their authors.
+  odd <- which(counts == 0L & grepl('"(given|family)"\\s*:', u, perl = TRUE))
+  if (length(odd) > 0L) {
+    slow  <- lapply(u[odd], .xv_authors_from_json)
+    scnt  <- vapply(slow, nrow, integer(1L))
+    owner <- c(owner, rep(odd, scnt))
+    given <- c(given,  unlist(lapply(slow, `[[`, "given"),  use.names = FALSE))
+    family<- c(family, unlist(lapply(slow, `[[`, "family"), use.names = FALSE))
+    counts[odd] <- scnt
+    o      <- order(owner)        # stable: regroups the appended pairs by owner
+    given  <- given[o]
+    family <- family[o]
+  }
+  list(counts = counts, given = given, family = family,
+       author_key = .xv_author_key(given, family))
+}
+
+
+#' Extract every author of every row of an `authors` JSON column at once.
+#'
+#' @param json_vec Character vector of JSON author arrays (NA/"" allowed).
+#' @return data.frame with one row per (row, author):
+#'   row        integer index into json_vec, ascending
+#'   given      character display form, NA when absent/null
+#'   family     character display form, NA when absent/null
+#'   author_key character .xv_author_key(given, family)
+#'   Zero rows when no input row carries an author.
+.xv_author_pairs <- function(json_vec) {
+  none <- data.frame(row = integer(0L), given = character(0L),
+                     family = character(0L), author_key = character(0L),
+                     stringsAsFactors = FALSE)
+  n <- length(json_vec)
+  if (n == 0L) return(none)
+  x <- as.character(json_vec)
+  x[is.na(x)] <- ""
+
+  # Authorship changes rarely, so a package's versions repeat the very same JSON
+  # blob: parse each DISTINCT blob once and expand the result back over the rows.
+  # (On the full table this is ~5x fewer strings to run the regex over.)
+  u   <- unique(x)
+  idx <- match(x, u)
+  p   <- .xv_parse_author_arrays(u)
+
+  cnt <- p$counts[idx]                          # pairs contributed by each row
+  if (sum(cnt) == 0L) return(none)
+  off <- cumsum(p$counts) - p$counts            # 0-based start of each blob's pairs
+  sel <- rep(off[idx], cnt) + sequence(cnt)     # blob pairs, expanded per row
+
+  data.frame(
+    row        = rep(seq_len(n), cnt),
+    given      = p$given[sel],
+    family     = p$family[sel],
+    author_key = p$author_key[sel],
+    stringsAsFactors = FALSE
+  )
 }
 
 

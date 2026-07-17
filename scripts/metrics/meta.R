@@ -178,6 +178,29 @@
   })
 }
 
+# ---- typed dependency fields -------------------------------------------
+
+#' Extract the five typed dependency fields from a parsed DESCRIPTION, keyed by
+#' the column names the per-version cran_code_summary table stores them under.
+#'
+#' The raw field text is preserved verbatim (version constraints included); an
+#' absent or empty field becomes NA (honest-NA, never an empty string). LinkingTo
+#' maps to the `linkingto` column the viewer reads.
+#'
+#' @param desc Named list of DESCRIPTION fields, as parse_dcf() produces. An
+#'   empty list (absent or unparseable DESCRIPTION) yields NA for every field.
+#' @return Named list: depends, imports, suggests, linkingto, enhances.
+meta_typed_deps <- function(desc) {
+  .nz <- function(x) { x <- trimws(x %||% ""); if (nzchar(x)) x else NA_character_ }
+  list(
+    depends   = .nz(desc[["Depends"]]),
+    imports   = .nz(desc[["Imports"]]),
+    suggests  = .nz(desc[["Suggests"]]),
+    linkingto = .nz(desc[["LinkingTo"]]),
+    enhances  = .nz(desc[["Enhances"]])
+  )
+}
+
 # ---- main metric function ----------------------------------------------
 
 #' Compute metadata metrics for a package version.

@@ -243,3 +243,53 @@ test_that("metrics_meta: an empty Title field becomes NA (not empty string)", {
   expect_true(is.na(m$title))
   expect_true(is.na(m$description))
 })
+
+# ===========================================================================
+# meta_typed_deps: raw typed dependency fields for the per-version summary
+# ===========================================================================
+
+test_that("meta_typed_deps returns the five fields verbatim, LinkingTo -> linkingto", {
+  desc <- parse_dcf(paste0(
+    "Package: p\nVersion: 1.0\n",
+    "Depends: R (>= 4.0), methods\n",
+    "Imports: dplyr (>= 1.0), rlang\n",
+    "Suggests: testthat\n",
+    "LinkingTo: Rcpp\n",
+    "Enhances: sp\n"
+  ))
+  td <- meta_typed_deps(desc)
+
+  expect_identical(names(td),
+                   c("depends", "imports", "suggests", "linkingto", "enhances"))
+  # Raw field text is preserved verbatim (version constraints included).
+  expect_equal(td$depends,   "R (>= 4.0), methods")
+  expect_equal(td$imports,   "dplyr (>= 1.0), rlang")
+  expect_equal(td$suggests,  "testthat")
+  expect_equal(td$linkingto, "Rcpp")
+  expect_equal(td$enhances,  "sp")
+})
+
+test_that("meta_typed_deps: absent field is NA (honest-NA, not empty string)", {
+  desc <- parse_dcf("Package: p\nVersion: 1.0\nImports: stats\n")
+  td   <- meta_typed_deps(desc)
+
+  expect_equal(td$imports, "stats")
+  expect_true(is.na(td$depends))
+  expect_true(is.na(td$suggests))
+  expect_true(is.na(td$linkingto))
+  expect_true(is.na(td$enhances))
+})
+
+test_that("meta_typed_deps: an empty field value is NA (not empty string)", {
+  desc <- parse_dcf("Package: p\nVersion: 1.0\nImports:\nSuggests: testthat\n")
+  td   <- meta_typed_deps(desc)
+
+  expect_true(is.na(td$imports))
+  expect_equal(td$suggests, "testthat")
+})
+
+test_that("meta_typed_deps: an empty DESCRIPTION list yields NA for every field", {
+  td <- meta_typed_deps(list())
+
+  expect_true(all(vapply(td, is.na, logical(1L))))
+})

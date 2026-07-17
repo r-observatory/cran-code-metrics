@@ -754,6 +754,13 @@ analyze_package <- function(repo_dir, package) {
       metrics[["version"]]  <- v
       metrics[["released"]] <- date %||% NA_character_
 
+      # Stamp the raw typed dependency fields per version. The analyzer binary
+      # emits only the flattened dep_list, so these are read straight from this
+      # version's DESCRIPTION; doing it here (rather than in a metric group)
+      # keeps them present under both the binary and the R-fallback paths.
+      typed_deps <- meta_typed_deps(ctx$desc)
+      for (fld in names(typed_deps)) metrics[[fld]] <- typed_deps[[fld]]
+
       # Coerce each metric to a length-1 scalar (guard against bad group output)
       safe_metrics <- lapply(metrics, function(x) {
         if (is.null(x) || length(x) != 1L) NA else x

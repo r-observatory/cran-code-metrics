@@ -121,3 +121,69 @@ test_that("analyze_package produces summary/churn/api data.frames from a local r
   expect_s3_class(result$churn, "data.frame")
   expect_true("package" %in% colnames(result$churn))
 })
+
+test_that("analyze_package persists the five typed dependency columns per version", {
+  # Drive the production (binary) path with a stub analyzer whose summary carries
+  # NO typed dependency fields, exactly like the real rpkg-analyzer. The columns
+  # must therefore come from the per-version DESCRIPTION enrichment, not the R
+  # metric groups, and must survive the round-trip through the SQLite export.
+  skip_on_os("windows")
+
+  repo <- tempfile("ccm_deps_")
+  on.exit(unlink(repo, recursive = TRUE), add = TRUE)
+  dir.create(repo)
+  system2("git", c("init", repo), stdout = FALSE, stderr = FALSE)
+  dir.create(file.path(repo, "R"))
+
+  desc <- paste0(
+    "Package: depspkg\nVersion: %s\n",
+    "Imports: methods, stats\n",
+    "Suggests: testthat\n",
+    "LinkingTo: Rcpp\n")            # no Depends, no Enhances -> honest NA
+
+  commit_version <- function(ver) {
+    writeLines("foo <- function() 1", file.path(repo, "R", "foo.R"))
+    writeLines(sprintf(desc, ver), file.path(repo, "DESCRIPTION"))
+    writeLines("export(foo)\n", file.path(repo, "NAMESPACE"))
+    system2("git", c("-C", repo, "add", "."), stdout = FALSE, stderr = FALSE)
+    system2("git",
+            c("-C", repo, "-c", "user.email=t@t.test", "-c", "user.name=T",
+              "commit", "-m", shQuote(paste("version", ver))),
+            stdout = FALSE, stderr = FALSE)
+    system2("git", c("-C", repo, "tag", ver), stdout = FALSE, stderr = FALSE)
+  }
+  commit_version("1.0")
+  commit_version("1.1")
+
+  # Stub analyzer: ignores its argument, prints a summary with no dep fields.
+  fixture <- file.path(repo, "fixture.ndjson")
+  writeLines('{"rec":"summary","n_files":1}', fixture)
+  stub <- file.path(repo, "stub-analyzer.sh")
+  writeLines(c("#!/bin/sh", sprintf("cat %s", shQuote(fixture))), stub)
+  Sys.chmod(stub, mode = "0755")
+  withr::local_envvar(RPKG_ANALYZER_BIN = stub)
+
+  result <- analyze_package(repo, "depspkg")
+
+  typed <- c("depends", "imports", "suggests", "linkingto", "enhances")
+  expect_true(all(typed %in% colnames(result$summary)))
+
+  # Round-trip through the real SQLite export and read the row back out.
+  db <- tempfile(fileext = ".db")
+  on.exit(unlink(db, force = TRUE), add = TRUE)
+  export_metrics(db, result$summary, result$churn, result$api)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), db)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_true(all(typed %in% DBI::dbListFields(con, "cran_code_summary")))
+
+  row <- DBI::dbGetQuery(con,
+    "SELECT depends, imports, suggests, linkingto, enhances
+     FROM cran_code_summary WHERE version = '1.1'")
+  expect_equal(nrow(row), 1L)
+  expect_equal(row$imports,   "methods, stats")   # verbatim DESCRIPTION text
+  expect_equal(row$suggests,  "testthat")
+  expect_equal(row$linkingto, "Rcpp")             # LinkingTo mapped to linkingto
+  expect_true(is.na(row$depends))                 # absent field -> honest NA
+  expect_true(is.na(row$enhances))
+})

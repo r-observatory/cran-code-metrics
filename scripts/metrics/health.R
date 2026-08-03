@@ -117,7 +117,7 @@ metrics_health <- function(ctx) {
 
   # ---- R/ file inventory --------------------------------------------------
 
-  r_files <- ctx$find("^R/.*\\.R$")
+  r_files <- ctx$find(R_SOURCE_RE)
   r_loc   <- 0L
   for (f in r_files) r_loc <- r_loc + length(ctx$lines(f))
   kloc_r  <- if (r_loc > 0L) r_loc / 1000 else 0

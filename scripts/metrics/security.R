@@ -31,7 +31,7 @@ metrics_security <- function(ctx) {
   #             Sys.setenv with non-literal=2, network in .onLoad/.onAttach=2.
   # ---------------------------------------------------------------------------
   unsafe_pattern_score <- tryCatch({
-    r_files <- ctx$find("^R/.*\\.R$")
+    r_files <- ctx$find(R_SOURCE_RE)
     score <- 0L
     for (f in r_files) {
       content <- ctx$read(f)
@@ -86,7 +86,7 @@ metrics_security <- function(ctx) {
       integer(1L)
     ))
 
-    r_files           <- ctx$find("^R/.*\\.R$")
+    r_files           <- ctx$find(R_SOURCE_RE)
     onload_file_write <- FALSE
     onload_network    <- FALSE
 

@@ -24,7 +24,7 @@ metrics_functions <- function(ctx) {
 
   # ── helpers ─────────────────────────────────────────────────────────────────
 
-  r_files <- ctx$find("^R/.*\\.[Rr]$")
+  r_files <- ctx$find(R_SOURCE_RE)
 
   # Conservative regex for a top-level function definition:
   # identifier (no leading whitespace) followed by <- / <<- / = then function(

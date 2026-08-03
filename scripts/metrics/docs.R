@@ -226,15 +226,22 @@ metrics_docs <- function(ctx) {
   }
 
   # ---- 6. has_readme ---------------------------------------------------------
-  has_readme <- ctx$exists("README.md") || ctx$exists("README.Rmd")
+  # README.qmd counts. It was not here, so a package whose README is written in
+  # Quarto reported no README at all, and every README metric below it was then
+  # computed against nothing. Same omission as the vignette engines, same cause:
+  # a pair of extensions fixed before Quarto existed.
+  #
+  # README_SOURCES is ordered by which file R and GitHub render, so the source
+  # picked below is the one a reader actually sees.
+  readme_path <- README_SOURCES[vapply(README_SOURCES, ctx$exists, logical(1))]
+  readme_path <- if (length(readme_path)) readme_path[[1]] else NULL
+  has_readme  <- !is.null(readme_path)
 
   # ---- 7. readme_prose_length ------------------------------------------------
   # Word count of README after stripping fenced code blocks and badge/image lines.
   # NA when no README is present; 0 when README contains only stripped content.
   readme_prose_length <- {
-    rpath <- if      (ctx$exists("README.md"))  "README.md"
-              else if (ctx$exists("README.Rmd")) "README.Rmd"
-              else NULL
+    rpath <- readme_path
     if (is.null(rpath)) {
       NA_integer_
     } else {

@@ -42,3 +42,16 @@ WORKER_TIMEOUT <- as.integer(Sys.getenv("WORKER_TIMEOUT", unset = "600"))
 # to ship shows up as an unrecognised file rather than as an absence of
 # vignettes. That is how .qmd went unnoticed here for years.
 VIGNETTE_SOURCE_RE <- "^vignettes/.*\\.([Rr](md|nw|html|rst|tex)|qmd|md)$"
+
+# README sources, in the order a reader encounters them: the rendered .md if the
+# package ships one, else the source it was knitted from. README.qmd was missing
+# here, so a Quarto README reported as no README and every README metric was
+# computed against a file that was never found.
+README_SOURCES <- c("README.md", "README.Rmd", "README.qmd", "README.markdown")
+
+# R source files under R/. One definition, because there were four: security and
+# health matched .R only, functions matched .R and .r, and tests matched every
+# file under R/ whatever its extension. A package using the lowercase .r that R
+# has always accepted had its functions counted and was then skipped by every
+# security and health metric, silently, with the row still looking populated.
+R_SOURCE_RE <- "^R/.*\\.[Rr]$"

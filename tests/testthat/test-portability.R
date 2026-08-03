@@ -467,3 +467,32 @@ test_that("vignette_unrecognised is zero when every file is understood", {
                        names(map), function(p) map[[p]] %||% "")
   expect_equal(metrics_portability(ctx)$vignette_unrecognised, 0L)
 })
+
+# ---------------------------------------------------------------------------
+# One definition of an R file, and it includes the lowercase R has always taken
+# ---------------------------------------------------------------------------
+
+test_that("a package written in lowercase .r is seen by every metric group", {
+  # Four patterns disagreed: security and health matched .R only, functions
+  # matched both, tests matched every file under R/. A package using .r had its
+  # functions counted and was then skipped by security and health entirely,
+  # while its row still looked populated.
+  map <- list(
+    "DESCRIPTION" = "Package: p\nVersion: 1.0\n",
+    "R/helpers.r" = "f <- function(x) {\n  eval(parse(text = x))\n}\n",
+    "tests/testthat/test-f.R" = "test_that('f', { expect_true(TRUE) })\n"
+  )
+  ctx <- build_context("p", "1.0", "1.0", "2024-01-01",
+                       names(map), function(p) map[[p]] %||% "")
+  expect_true(length(ctx$find(R_SOURCE_RE)) == 1L)
+
+  # The ratio's denominator now sees the file too, so it is a real ratio rather
+  # than NA from a denominator of zero.
+  m <- metrics_tests(ctx)
+  expect_false(is.na(m$test_to_code_ratio))
+})
+
+test_that("R_SOURCE_RE takes .R and .r and nothing else under R/", {
+  files <- c("R/a.R", "R/b.r", "R/sysdata.rda", "R/notes.md", "man/a.Rd", "README.Rmd")
+  expect_setequal(grep(R_SOURCE_RE, files, value = TRUE), c("R/a.R", "R/b.r"))
+})

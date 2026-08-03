@@ -132,7 +132,11 @@ metrics_tests <- function(ctx) {
 
   # ---- test_to_code_ratio ----------------------------------------------------
 
-  r_files   <- ctx$find("^R/")
+  # R source, not every file under R/. sysdata.rda lives there and is binary, so
+  # counting its "lines" put noise in the denominator of a ratio that is meant to
+  # compare test code against package code. This also makes the fourth of four
+  # definitions of an R file agree with the other three.
+  r_files   <- ctx$find(R_SOURCE_RE)
   loc_r     <- loc_for(r_files)
   loc_tests <- loc_for(test_files)
 

@@ -40,17 +40,78 @@
   v
 }
 
-#' Who the vignette says wrote it.
+#' The raw lines of a YAML front-matter key, including any block that follows.
 #'
-#' Stated on roughly half of the .Rmd vignettes on GitHub, so absence is the
-#' common case and means the vignette does not say, NOT that the package
-#' maintainer wrote it. Sweave sources use \author{} instead.
-.vignette_author <- function(txt) {
-  a <- .yaml_scalar(txt, "author")
-  if (!is.na(a)) return(a)
+#' Returns character(0) when the key is absent, which is what lets a caller tell
+#' "the vignette says nothing" from "the vignette says something in a shape this
+#' does not parse". Those were the same answer until roughly a fifth of the
+#' authored vignettes on GitHub turned out to use a block.
+.yaml_block <- function(txt, key) {
+  if (is.null(txt) || !nzchar(txt)) return(character(0))
+  lines <- strsplit(txt, "\n", fixed = TRUE)[[1]]
+  if (!length(lines) || !grepl("^---\\s*$", lines[1])) return(character(0))
+  close_at <- which(grepl("^---\\s*$", lines[-1]))[1]
+  if (is.na(close_at)) return(character(0))
+  head_lines <- lines[2:close_at]
+  at <- grep(sprintf("^%s\\s*:", key), head_lines)[1]
+  if (is.na(at)) return(character(0))
+  out <- head_lines[at]
+  # Continuation lines are the indented ones that follow, up to the next
+  # top-level key.
+  j <- at + 1L
+  while (j <= length(head_lines) && grepl("^\\s+\\S", head_lines[j])) {
+    out <- c(out, head_lines[j]); j <- j + 1L
+  }
+  out
+}
+
+#' Everyone the vignette says wrote it.
+#'
+#' Four shapes, because YAML offers three and Sweave adds one, and all four
+#' occur: a scalar, a flow sequence, a block of plain items, and a block of
+#' mappings with name: keys. A scalar-only reader returned NA for the last two,
+#' which put roughly a fifth of the authored vignettes on GitHub into the same
+#' bucket as the vignettes that name nobody.
+#'
+#' Returns character(0) when the vignette states no author at all.
+.vignette_authors <- function(txt) {
+  blk <- .yaml_block(txt, "author")
+  if (length(blk)) {
+    first <- trimws(sub("^author\\s*:\\s*", "", blk[1]))
+    # Flow sequence on one line: author: [Ada, Bob]
+    if (grepl("^\\[.*\\]$", first)) {
+      items <- strsplit(gsub("^\\[|\\]$", "", first), ",", fixed = FALSE)[[1]]
+      return(.clean_names(items))
+    }
+    if (nzchar(first)) return(.clean_names(first))   # plain scalar
+    rest <- blk[-1]
+    if (length(rest)) {
+      # A block of mappings carries name: keys; a block of plain items does not.
+      named <- grep("^\\s*-?\\s*name\\s*:", rest, value = TRUE)
+      if (length(named)) return(.clean_names(sub("^\\s*-?\\s*name\\s*:\\s*", "", named)))
+      items <- grep("^\\s*-\\s*\\S", rest, value = TRUE)
+      if (length(items)) return(.clean_names(sub("^\\s*-\\s*", "", items)))
+    }
+    # Stated, but in a shape this does not read. NOT the same as unstated, and
+    # the caller records the difference.
+    return(NA_character_)
+  }
+  # Sweave: \author{Ada \and Bob} or \author{Ada, Bob}
   m <- regmatches(txt, regexec("\\\\author\\{([^}]*)\\}", txt %||% ""))[[1]]
-  if (length(m) == 2 && nzchar(trimws(m[2]))) return(trimws(m[2]))
-  NA_character_
+  if (length(m) == 2 && nzchar(trimws(m[2]))) {
+    parts <- strsplit(m[2], "\\\\and|,", perl = TRUE)[[1]]
+    return(.clean_names(parts))
+  }
+  character(0)
+}
+
+#' Trim, unquote, drop LaTeX markup and empties.
+.clean_names <- function(x) {
+  x <- gsub("\\\\[a-zA-Z]+\\{|\\}", "", x)      # \texttt{...} and friends
+  x <- gsub('^["\']|["\']$', "", trimws(x))
+  x <- trimws(x)
+  x <- x[nzchar(x)]
+  unique(x)
 }
 
 #' The source format, from the extension.
@@ -130,6 +191,7 @@ metrics_vignettes <- function(ctx) {
   rows <- lapply(files, function(f) {
     txt <- tryCatch(ctx$read(f), error = function(e) "")
     txt <- txt %||% ""
+    auth <- .vignette_authors(txt)
     engine <- .vignette_engine_declared(txt)
     lines  <- if (nzchar(txt)) length(strsplit(txt, "\n", fixed = TRUE)[[1]]) else 0L
     data.frame(
@@ -139,7 +201,17 @@ metrics_vignettes <- function(ctx) {
       engine = engine,
       output = .vignette_output(f, txt, engine),
       title  = .vignette_title(txt),
-      author = .vignette_author(txt),
+      # Comma-joined, the way markers and evidence tiers already are here, plus
+      # a count so "written by four people" is answerable without splitting.
+      author = if (length(auth) == 0L || (length(auth) == 1L && is.na(auth[1]))) NA_character_
+               else paste(auth, collapse = ", "),
+      n_authors = if (length(auth) == 0L || (length(auth) == 1L && is.na(auth[1]))) NA_integer_
+                  else length(auth),
+      # Whether the vignette said anything at all about authorship. Without
+      # this, a vignette naming nobody and a vignette naming people in a shape
+      # this cannot read are the same row, which is the state that hid how
+      # common the block form is.
+      author_stated = as.integer(length(auth) > 0L),
       builder = builder,
       # Shipped finished rather than built at check time. R.rsp::asis takes a
       # document that is already a PDF or HTML file and installs it as the
@@ -160,7 +232,8 @@ metrics_vignettes <- function(ctx) {
 .empty_vignettes_df <- function() {
   data.frame(file = character(), name = character(), format = character(),
              engine = character(), output = character(), title = character(),
-             author = character(), builder = character(), prebuilt = integer(),
+             author = character(), n_authors = integer(), author_stated = integer(),
+             builder = character(), prebuilt = integer(),
              precomputed = integer(), lines = integer(), has_code = integer(),
              stringsAsFactors = FALSE)
 }

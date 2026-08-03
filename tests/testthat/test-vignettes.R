@@ -159,12 +159,58 @@ test_that("the author is read where stated and NA where not", {
   expect_true(is.na(silent$author))
 })
 
-test_that("an author written as a list yields NA, not half a name", {
-  # author:\n  - name: X\n  - name: Y is common and is not a scalar. Returning
-  # the empty remainder of the line would publish a blank as if it were a name.
+test_that("every shape a vignette states its authors in is read", {
+  # Four shapes occur and all four are common enough to matter. A scalar-only
+  # reader put the block forms into the same bucket as the vignettes that name
+  # nobody: 2,956 of the 14,672 authored .Rmd vignettes on GitHub use the
+  # name-mapping block, and 2,840 .Rnw vignettes use \\and.
+  shapes <- list(
+    scalar   = "---\ntitle: A\nauthor: Jane Roe\n---\n",
+    flow     = "---\ntitle: A\nauthor: [Ada Lovelace, Bob Stone]\n---\n",
+    block    = "---\ntitle: A\nauthor:\n  - Ada Lovelace\n  - Bob Stone\n---\n",
+    mappings = "---\ntitle: A\nauthor:\n  - name: Ada Lovelace\n    affiliation: X\n  - name: Bob Stone\n---\n")
+  for (nm in names(shapes)) {
+    v <- metrics_vignettes(mk(list("DESCRIPTION" = "Package: p\nVersion: 1.0\n",
+                                   "vignettes/a.Rmd" = shapes[[nm]])))
+    expect_equal(v$author_stated, 1L, info = nm)
+    if (nm == "scalar") {
+      expect_equal(v$author, "Jane Roe"); expect_equal(v$n_authors, 1L)
+    } else {
+      expect_equal(v$author, "Ada Lovelace, Bob Stone", info = nm)
+      expect_equal(v$n_authors, 2L, info = nm)
+    }
+  }
+})
+
+test_that("a Sweave vignette splits its authors on and, and on commas", {
+  a <- metrics_vignettes(mk(list("DESCRIPTION" = "Package: p\nVersion: 1.0\n",
+    "vignettes/a.Rnw" = "\\author{Ada Lovelace \\and Bob Stone}\n")))
+  expect_equal(a$n_authors, 2L)
+  expect_equal(a$author, "Ada Lovelace, Bob Stone")
+})
+
+test_that("naming nobody is not the same row as naming people unreadably", {
+  # The conflation this replaced. Both used to be author = NA, so a shape the
+  # parser did not read vanished into the population that states no author, and
+  # nothing counted how large that was.
+  silent <- metrics_vignettes(mk(list("DESCRIPTION" = "Package: p\nVersion: 1.0\n",
+    "vignettes/a.Rmd" = "---\ntitle: A\n---\n")))
+  expect_equal(silent$author_stated, 0L)
+  expect_true(is.na(silent$author))
+  expect_true(is.na(silent$n_authors))
+
+  # An author block carrying neither plain items nor name: keys is stated but
+  # unread, and says so.
+  odd <- metrics_vignettes(mk(list("DESCRIPTION" = "Package: p\nVersion: 1.0\n",
+    "vignettes/b.Rmd" = "---\ntitle: B\nauthor:\n  given: Ada\n  family: Lovelace\n---\n")))
+  expect_equal(odd$author_stated, 1L)
+  expect_true(is.na(odd$author))
+})
+
+test_that("a repeated name is listed once", {
   v <- metrics_vignettes(mk(list("DESCRIPTION" = "Package: p\nVersion: 1.0\n",
-    "vignettes/a.Rmd" = "---\ntitle: A\nauthor:\n  - name: Ada\n  - name: Bob\n---\n")))
-  expect_true(is.na(v$author))
+    "vignettes/a.Rmd" = "---\ntitle: A\nauthor:\n  - name: Ada\n  - name: Ada\n---\n")))
+  expect_equal(v$n_authors, 1L)
 })
 
 test_that("the count and the boolean come from the same rows", {

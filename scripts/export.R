@@ -70,7 +70,8 @@ export_metrics <- function(path, summary_df, churn_df, api_df, vignettes_df = NU
     package TEXT NOT NULL, version TEXT NOT NULL, file TEXT NOT NULL,
     is_current INTEGER NOT NULL DEFAULT 0,
     name TEXT, format TEXT, engine TEXT, output TEXT,
-    title TEXT, author TEXT, builder TEXT,
+    title TEXT, author TEXT, n_authors INTEGER, author_stated INTEGER,
+    builder TEXT,
     prebuilt INTEGER, precomputed INTEGER,
     lines INTEGER, has_code INTEGER,
     PRIMARY KEY (package, version, file))")

@@ -95,7 +95,22 @@
 # Test 1: sharded bootstrap -- three runs exhaust a 5-package universe
 # ---------------------------------------------------------------------------
 
+
+#' Skip when the analyzer binary is absent.
+#'
+#' These two tests assert that a shard ADVANCES between runs. Advancing depends
+#' on the per-package detail sentinel being written, and only the analyzer
+#' binary writes it, so without the binary the same shard is selected forever
+#' and the assertions fail with count mismatches that say nothing about the
+#' cause. Only a linux-x86_64 build is published, so this skips on macOS rather
+#' than reporting twelve mysterious failures to anyone developing there.
+skip_without_analyzer <- function() {
+  if (!nzchar(rpkg_analyzer_bin()))
+    testthat::skip("needs rpkg-analyzer: without it the backfill pool never drains")
+}
+
 test_that("sharded bootstrap: three runs cover universe of 5, fourth is no-op", {
+  skip_without_analyzer()
   out_dir <- tempfile()
   dir.create(out_dir)
   on.exit(unlink(out_dir, recursive = TRUE, force = TRUE), add = TRUE)
@@ -289,6 +304,7 @@ test_that("force_full re-analyzes packages already in DB within shard_size limit
 # ---------------------------------------------------------------------------
 
 test_that("package hitting MAX_CLONE_FAILURES is excluded from todo and counted in permanent_failures", {
+  skip_without_analyzer()
   out_dir <- tempfile()
   dir.create(out_dir)
   on.exit(unlink(out_dir, recursive = TRUE, force = TRUE), add = TRUE)

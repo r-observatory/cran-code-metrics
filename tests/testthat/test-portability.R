@@ -406,3 +406,64 @@ test_that("metrics_portability: empty file list returns NA-safe defaults", {
   expect_false(m$has_vignettes)
   expect_true(is.na(m$vignette_dynamic))
 })
+
+# ---------------------------------------------------------------------------
+# has_vignettes: every engine R registers, not only the two that predate Quarto
+# ---------------------------------------------------------------------------
+
+test_that("has_vignettes: a package whose vignettes are all .qmd has vignettes", {
+  # coatless-rpkg/livelink ships five .qmd vignettes in its tarball and reported
+  # none, because the pattern matched only .Rmd and .Rnw. Quarto has been a
+  # registered vignette engine for years.
+  map <- list(
+    "DESCRIPTION" = "Package: p\nVersion: 1.0\nVignetteBuilder: quarto\n",
+    "vignettes/getting-started.qmd" = "---\ntitle: Start\n---\n\n```{r}\n1+1\n```\n",
+    "vignettes/teaching.qmd"        = "---\ntitle: Teaching\n---\n"
+  )
+  ctx <- build_context("p", "1.0", "1.0", "2024-01-01",
+                       names(map), function(p) map[[p]] %||% "")
+  m <- metrics_portability(ctx)
+  expect_true(m$has_vignettes)
+})
+
+test_that("has_vignettes: the other registered engines count too", {
+  for (f in c("vignettes/a.Rhtml", "vignettes/b.md", "vignettes/c.Rtex",
+              "vignettes/d.rmd", "vignettes/e.Rrst")) {
+    map <- setNames(list("Package: p\nVersion: 1.0\n", "x"), c("DESCRIPTION", f))
+    ctx <- build_context("p", "1.0", "1.0", "2024-01-01",
+                         names(map), function(p) map[[p]] %||% "")
+    expect_true(metrics_portability(ctx)$has_vignettes, info = f)
+  }
+})
+
+test_that("has_vignettes: a README at the root is not a vignette", {
+  map <- list("DESCRIPTION" = "Package: p\nVersion: 1.0\n",
+              "README.Rmd"  = "# hi\n")
+  ctx <- build_context("p", "1.0", "1.0", "2024-01-01",
+                       names(map), function(p) map[[p]] %||% "")
+  expect_false(metrics_portability(ctx)$has_vignettes)
+})
+
+test_that("a file in vignettes/ that no engine claims is counted, not ignored", {
+  # The guard against this bug recurring. When the next engine ships, its files
+  # land here as unrecognised rather than as an absence of vignettes.
+  map <- list(
+    "DESCRIPTION"                  = "Package: p\nVersion: 1.0\n",
+    "vignettes/intro.Rmd"          = "# x\n",
+    "vignettes/precompiled.Rmd.orig" = "# src\n",
+    "vignettes/future.wxyz"        = "# an engine we do not know\n"
+  )
+  ctx <- build_context("p", "1.0", "1.0", "2024-01-01",
+                       names(map), function(p) map[[p]] %||% "")
+  m <- metrics_portability(ctx)
+  expect_true(m$has_vignettes)
+  expect_equal(m$vignette_unrecognised, 2L)
+})
+
+test_that("vignette_unrecognised is zero when every file is understood", {
+  map <- list("DESCRIPTION" = "Package: p\nVersion: 1.0\n",
+              "vignettes/a.qmd" = "x", "vignettes/b.Rmd" = "y")
+  ctx <- build_context("p", "1.0", "1.0", "2024-01-01",
+                       names(map), function(p) map[[p]] %||% "")
+  expect_equal(metrics_portability(ctx)$vignette_unrecognised, 0L)
+})

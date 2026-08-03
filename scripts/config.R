@@ -31,3 +31,14 @@ WORKER_TIMEOUT <- as.integer(Sys.getenv("WORKER_TIMEOUT", unset = "600"))
 `%||%` <- function(a, b) {
   if (is.null(a) || length(a) == 0L || (length(a) == 1L && is.na(a))) b else a
 }
+
+# Vignette source files, by the extensions R's registered vignette engines
+# build: Sweave (.Rnw, .Rtex), knitr (.Rmd, .Rhtml, .Rrst, .Rtex), Quarto
+# (.qmd) and litedown (.md). Case-insensitive on the leading R because both
+# spellings occur in the wild.
+#
+# Enumerated because R itself enumerates, but kept in one place and paired with
+# a count of the files in vignettes/ that no pattern claims, so the next engine
+# to ship shows up as an unrecognised file rather than as an absence of
+# vignettes. That is how .qmd went unnoticed here for years.
+VIGNETTE_SOURCE_RE <- "^vignettes/.*\\.([Rr](md|nw|html|rst|tex)|qmd|md)$"

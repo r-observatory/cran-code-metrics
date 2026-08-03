@@ -15,7 +15,10 @@
 #'   nonportable_compiler_flags_json character JSON array of the flag strings found
 #'   min_r_version                   character minimum R version from Depends (x.y.z or x.y);
 #'                                             NA when not specified
-#'   has_vignettes                   logical   TRUE when vignettes/ contains a .Rmd or .Rnw
+#'   has_vignettes                   logical   TRUE when vignettes/ holds a file any
+#'                                             registered vignette engine builds
+#'   vignette_unrecognised           integer   files in vignettes/ no engine pattern
+#'                                             claims: artifact, or an engine we miss
 #'   vignette_dynamic                logical   TRUE when vignette sources are not trivially all
 #'                                             eval=FALSE; NA when no vignettes
 metrics_portability <- function(ctx) {
@@ -109,8 +112,21 @@ metrics_portability <- function(ctx) {
   # -------------------------------------------------------------------------
   # has_vignettes
   # -------------------------------------------------------------------------
-  vig_files     <- ctx$find("^vignettes/.*\\.[Rr](md|nw)$")
+  # Every extension R's registered vignette engines build, not only the two
+  # that existed when this was written. Quarto (.qmd) has been a vignette engine
+  # for years and matched nothing here, so a package whose vignettes are all
+  # .qmd reported none while shipping five of them.
+  #
+  # VIGNETTE_SOURCE_RE is in config.R so the pattern has one definition.
+  vig_files     <- ctx$find(VIGNETTE_SOURCE_RE)
   has_vignettes <- length(vig_files) > 0L
+
+  # Files sit in vignettes/ that no engine pattern claims. That is either a
+  # build artifact or an engine this list has not caught up with, and the second
+  # is how .qmd went unnoticed. Recorded rather than resolved here: a count a
+  # reader can see beats a silent FALSE.
+  vig_all         <- ctx$find("^vignettes/[^/]+$")
+  vignette_unrecognised <- length(setdiff(vig_all, vig_files))
 
   # -------------------------------------------------------------------------
   # vignette_dynamic
@@ -164,6 +180,7 @@ metrics_portability <- function(ctx) {
     nonportable_compiler_flags_json = nonportable_compiler_flags_json,
     min_r_version                   = min_r_version,
     has_vignettes                   = has_vignettes,
+    vignette_unrecognised           = vignette_unrecognised,
     vignette_dynamic                = vignette_dynamic
   )
 }

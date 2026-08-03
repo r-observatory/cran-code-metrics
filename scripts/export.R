@@ -69,7 +69,9 @@ export_metrics <- function(path, summary_df, churn_df, api_df, vignettes_df = NU
   DBI::dbExecute(con, "CREATE TABLE IF NOT EXISTS cran_vignettes (
     package TEXT NOT NULL, version TEXT NOT NULL, file TEXT NOT NULL,
     is_current INTEGER NOT NULL DEFAULT 0,
-    name TEXT, engine TEXT, title TEXT, builder TEXT,
+    name TEXT, format TEXT, engine TEXT, output TEXT,
+    title TEXT, author TEXT, builder TEXT,
+    prebuilt INTEGER, precomputed INTEGER,
     lines INTEGER, has_code INTEGER,
     PRIMARY KEY (package, version, file))")
   if (!is.null(vignettes_df) && nrow(vignettes_df) > 0L) {

@@ -29,7 +29,7 @@ test_that("a Sweave vignette carrying only the classic marker is titled", {
     "DESCRIPTION" = "Package: p\nVersion: 1.0\n",
     "vignettes/theory.Rnw" = "%\\VignetteIndexEntry{The theory behind p}\n")))
   expect_equal(v$title, "The theory behind p")
-  expect_equal(v$engine, "sweave")
+  expect_equal(v$format, "sweave")
 })
 
 test_that("a vignette with no declared title says so rather than guessing one", {
@@ -41,13 +41,13 @@ test_that("a vignette with no declared title says so rather than guessing one", 
   expect_equal(v$name, "untitled")
 })
 
-test_that("the engine names the source, and every registered one is covered", {
+test_that("the source format is read from the extension, for every engine", {
   for (p in list(c("a.Rmd","rmarkdown"), c("b.qmd","quarto"), c("c.Rnw","sweave"),
                  c("d.Rtex","sweave"), c("e.Rhtml","html"), c("f.md","markdown"))) {
     v <- metrics_vignettes(mk(setNames(
       list("Package: p\nVersion: 1.0\n", "x"),
       c("DESCRIPTION", paste0("vignettes/", p[1])))))
-    expect_equal(v$engine, p[2], info = p[1])
+    expect_equal(v$format, p[2], info = p[1])
   }
 })
 
@@ -86,4 +86,99 @@ test_that("rows are ordered, so a diff between versions is readable", {
     "DESCRIPTION" = "Package: p\nVersion: 1.0\n",
     "vignettes/zebra.Rmd" = "x", "vignettes/apple.Rmd" = "y")))
   expect_equal(v$name, c("apple", "zebra"))
+})
+
+# ---------------------------------------------------------------------------
+# What it renders to, whether it was built ahead of time, and who wrote it
+# ---------------------------------------------------------------------------
+
+test_that("the declared engine names the output the extension cannot", {
+  # livelink's real header. Saying only "the extension does not say" understated
+  # this: the source usually does say, in the engine declaration.
+  v <- metrics_vignettes(mk(list(
+    "DESCRIPTION" = "Package: p\nVersion: 1.0\n",
+    "vignettes/a.qmd" = paste0("---\ntitle: A\nvignette: >\n",
+                               "  %\\VignetteEngine{quarto::html}\n---\n"))))
+  expect_equal(v$engine, "quarto::html")
+  expect_equal(v$output, "html")
+})
+
+test_that("a pre-built document is marked as shipped rather than built", {
+  # jsonlite's real json-mapping.pdf.asis. R.rsp::asis installs a finished PDF
+  # as the vignette: nothing in it runs, and its source is a few marker lines.
+  v <- metrics_vignettes(mk(list(
+    "DESCRIPTION" = "Package: p\nVersion: 1.0\nVignetteBuilder: R.rsp\n",
+    "vignettes/json-mapping.pdf.asis" = paste0(
+      "%\\VignetteIndexEntry{A mapping between JSON data and R objects}\n",
+      "%\\VignetteEngine{R.rsp::asis}\n"))))
+  expect_equal(nrow(v), 1L)
+  expect_equal(v$prebuilt, 1L)
+  expect_equal(v$output, "pdf")          # from the .pdf.asis filename
+  expect_equal(v$format, "asis")
+  expect_equal(v$title, "A mapping between JSON data and R objects")
+})
+
+test_that("the precompute pattern is recognised by its .orig neighbour", {
+  # An .Rmd generated from an .Rmd.orig ran its expensive code before
+  # submission rather than on CRAN's machines. Different artifact, same
+  # extension, so only the neighbour distinguishes them.
+  v <- metrics_vignettes(mk(list(
+    "DESCRIPTION" = "Package: p\nVersion: 1.0\n",
+    "vignettes/slow.Rmd" = "---\ntitle: Slow\n---\n",
+    "vignettes/slow.Rmd.orig" = "the real source\n",
+    "vignettes/fast.Rmd" = "---\ntitle: Fast\n---\n")))
+  expect_equal(v$precomputed[v$name == "slow"], 1L)
+  expect_equal(v$precomputed[v$name == "fast"], 0L)
+})
+
+test_that("Sweave renders to PDF by construction even with nothing declared", {
+  v <- metrics_vignettes(mk(list("DESCRIPTION" = "Package: p\nVersion: 1.0\n",
+                                 "vignettes/old.Rnw" = "\\documentclass{article}\n")))
+  expect_equal(v$output, "pdf")
+})
+
+test_that("an output nothing states is NA rather than a guess", {
+  # An .Rmd with no engine, no output: and no format: could render to either.
+  v <- metrics_vignettes(mk(list("DESCRIPTION" = "Package: p\nVersion: 1.0\n",
+                                 "vignettes/a.Rmd" = "just prose, no header\n")))
+  expect_true(is.na(v$output))
+})
+
+test_that("the author is read where stated and NA where not", {
+  # Stated on roughly half the .Rmd vignettes on GitHub, so absence is the
+  # common case and means the vignette does not say, not that the maintainer
+  # wrote it.
+  yaml <- metrics_vignettes(mk(list("DESCRIPTION" = "Package: p\nVersion: 1.0\n",
+    "vignettes/a.Rmd" = "---\ntitle: A\nauthor: Jane Roe\n---\n")))
+  sweave <- metrics_vignettes(mk(list("DESCRIPTION" = "Package: p\nVersion: 1.0\n",
+    "vignettes/b.Rnw" = "\\author{John Doe}\n")))
+  silent <- metrics_vignettes(mk(list("DESCRIPTION" = "Package: p\nVersion: 1.0\n",
+    "vignettes/c.Rmd" = "---\ntitle: C\n---\n")))
+  expect_equal(yaml$author, "Jane Roe")
+  expect_equal(sweave$author, "John Doe")
+  expect_true(is.na(silent$author))
+})
+
+test_that("an author written as a list yields NA, not half a name", {
+  # author:\n  - name: X\n  - name: Y is common and is not a scalar. Returning
+  # the empty remainder of the line would publish a blank as if it were a name.
+  v <- metrics_vignettes(mk(list("DESCRIPTION" = "Package: p\nVersion: 1.0\n",
+    "vignettes/a.Rmd" = "---\ntitle: A\nauthor:\n  - name: Ada\n  - name: Bob\n---\n")))
+  expect_true(is.na(v$author))
+})
+
+test_that("the count and the boolean come from the same rows", {
+  # Computing them from two patterns is how the .qmd gap survived: one place was
+  # fixed and the other was not.
+  ctx <- mk(list("DESCRIPTION" = "Package: p\nVersion: 1.0\n",
+                 "vignettes/a.qmd" = "---\ntitle: A\n---\n",
+                 "vignettes/b.Rnw" = "\\documentclass{article}\n"))
+  m <- metrics_portability(ctx)
+  expect_equal(m$n_vignettes, 2L)
+  expect_true(m$has_vignettes)
+  expect_equal(m$n_vignettes, nrow(metrics_vignettes(ctx)))
+
+  none <- mk(list("DESCRIPTION" = "Package: p\nVersion: 1.0\n"))
+  expect_equal(metrics_portability(none)$n_vignettes, 0L)
+  expect_false(metrics_portability(none)$has_vignettes)
 })

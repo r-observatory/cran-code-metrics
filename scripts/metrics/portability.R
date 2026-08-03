@@ -15,8 +15,10 @@
 #'   nonportable_compiler_flags_json character JSON array of the flag strings found
 #'   min_r_version                   character minimum R version from Depends (x.y.z or x.y);
 #'                                             NA when not specified
-#'   has_vignettes                   logical   TRUE when vignettes/ holds a file any
-#'                                             registered vignette engine builds
+#'   has_vignettes                   logical   TRUE when the package ships any
+#'                                             vignette, derived from n_vignettes
+#'   n_vignettes                     integer   how many it ships, counted from the
+#'                                             same rows cran_vignettes stores
 #'   vignette_unrecognised           integer   files in vignettes/ no engine pattern
 #'                                             claims: artifact, or an engine we miss
 #'   vignette_dynamic                logical   TRUE when vignette sources are not trivially all
@@ -118,8 +120,14 @@ metrics_portability <- function(ctx) {
   # .qmd reported none while shipping five of them.
   #
   # VIGNETTE_SOURCE_RE is in config.R so the pattern has one definition.
+  # Counted from the same rows cran_vignettes stores, so the boolean and the
+  # table cannot disagree about whether a package ships vignettes. Computing it
+  # twice from two patterns is how the .qmd gap survived: one place was fixed
+  # and the other was not.
+  vig_rows      <- tryCatch(metrics_vignettes(ctx), error = function(e) NULL)
+  n_vignettes   <- if (is.null(vig_rows)) NA_integer_ else nrow(vig_rows)
+  has_vignettes <- if (is.na(n_vignettes)) NA else n_vignettes > 0L
   vig_files     <- ctx$find(VIGNETTE_SOURCE_RE)
-  has_vignettes <- length(vig_files) > 0L
 
   # Files sit in vignettes/ that no engine pattern claims. That is either a
   # build artifact or an engine this list has not caught up with, and the second
@@ -180,6 +188,7 @@ metrics_portability <- function(ctx) {
     nonportable_compiler_flags_json = nonportable_compiler_flags_json,
     min_r_version                   = min_r_version,
     has_vignettes                   = has_vignettes,
+    n_vignettes                     = n_vignettes,
     vignette_unrecognised           = vignette_unrecognised,
     vignette_dynamic                = vignette_dynamic
   )

@@ -520,3 +520,65 @@ test_that("record/read changed packages unions and dedupes", {
 test_that("read_changed_packages returns empty when absent", {
   expect_identical(read_changed_packages(tempfile()), character(0L))
 })
+
+# ---------------------------------------------------------------------------
+# Metric coverage: what each metric actually reports, recorded every run
+# ---------------------------------------------------------------------------
+
+test_that("coverage separates never-computed from computed-and-false", {
+  df <- data.frame(package = c("a", "b", "c"), version = "1",
+                   flag_never = NA, flag_none = FALSE, flag_some = c(TRUE, FALSE, TRUE),
+                   n_things = c(1L, 2L, 3L), stringsAsFactors = FALSE)
+  cov <- metric_coverage(df)
+  by <- stats::setNames(split(cov, cov$metric), unique(cov$metric))
+
+  expect_equal(by$flag_never$measured, 0L)      # nobody computed it
+  expect_equal(by$flag_none$measured, 3L)       # computed for everyone
+  expect_equal(by$flag_none$positive, 0L)       # and true for none
+  expect_equal(by$flag_some$positive, 2L)
+  expect_equal(by$n_things$kind, "value")
+  expect_true(is.na(by$n_things$positive))      # a count has no positives
+  expect_false("package" %in% cov$metric)       # identifiers are not metrics
+})
+
+test_that("a metric that stopped running, and a flag true for nobody, both alert", {
+  df <- data.frame(package = c("a", "b"), version = "1",
+                   gone = NA, empty = FALSE, fine = c(TRUE, FALSE),
+                   stringsAsFactors = FALSE)
+  a <- metric_coverage_alerts(metric_coverage(df))
+  expect_true(any(grepl("^gone: not computed", a)))
+  expect_true(any(grepl("^empty: measured on 2 packages and true for none", a)))
+  expect_false(any(grepl("^fine:", a)))
+})
+
+test_that("an abrupt collapse against the previous run alerts", {
+  prev <- metric_coverage(data.frame(package = sprintf("p%d", 1:1000), version = "1",
+                                     m = TRUE, stringsAsFactors = FALSE))
+  now  <- metric_coverage(data.frame(package = sprintf("p%d", 1:1000), version = "1",
+                                     m = c(rep(TRUE, 100), rep(FALSE, 900)),
+                                     stringsAsFactors = FALSE))
+  expect_true(any(grepl("^m: true for 100 packages, was 1000", metric_coverage_alerts(now, prev))))
+})
+
+test_that("slow erosion in a subset does NOT alert, which is the known limit", {
+  # Measured, not assumed. The has_vignettes bug that motivated this looked
+  # exactly like this: a growing format the pattern did not match, eroding the
+  # rate a few packages at a time while the majority reported correctly. Any
+  # threshold loose enough to stay quiet on a normal week is loose enough to
+  # miss it, so catching that shape needs an independent second measurement
+  # rather than a tighter threshold here.
+  prev <- metric_coverage(data.frame(package = sprintf("p%d", 1:1000), version = "1",
+                                     m = c(rep(TRUE, 400), rep(FALSE, 600)),
+                                     stringsAsFactors = FALSE))
+  now  <- metric_coverage(data.frame(package = sprintf("p%d", 1:1000), version = "1",
+                                     m = c(rep(TRUE, 380), rep(FALSE, 620)),
+                                     stringsAsFactors = FALSE))
+  expect_equal(metric_coverage_alerts(now, prev), character(0))
+})
+
+test_that("a first run checks what it can and skips the comparison", {
+  df <- data.frame(package = "a", version = "1", m = TRUE, stringsAsFactors = FALSE)
+  expect_equal(metric_coverage_alerts(metric_coverage(df), prior = NULL), character(0))
+  expect_equal(metric_coverage_alerts(metric_coverage(df[0, ]), prior = NULL),
+               "no metrics reported at all")
+})

@@ -60,6 +60,14 @@ export_metrics <- function(path, summary_df, churn_df, api_df) {
   DBI::dbExecute(con,
     "CREATE UNIQUE INDEX idx_summary_pkg_ver ON cran_code_summary(package, version)")
 
+  # Per-metric coverage for this run, so the next one can compare against it and
+  # so a reader can see what each metric actually reports before trusting a rate.
+  cov <- metric_coverage(write_summary)
+  DBI::dbExecute(con, "CREATE TABLE metric_coverage (
+    metric TEXT NOT NULL, n_rows INTEGER, measured INTEGER, positive INTEGER,
+    kind TEXT, PRIMARY KEY (metric))")
+  if (nrow(cov) > 0) DBI::dbWriteTable(con, "metric_coverage", cov, append = TRUE)
+
   # ---- cran_code_churn -------------------------------------------------------
   DBI::dbWriteTable(con, "cran_code_churn", .coerce_logicals(churn_df), row.names = FALSE)
   DBI::dbExecute(con,
@@ -1500,4 +1508,100 @@ build_release_notes <- function(code_manifest, data_manifest, changed_pkgs,
                       short_fp)
 
   c(headline, "", table_section, "", catalog_section, "", footer)
+}
+
+# ---- metric coverage -------------------------------------------------------
+#
+# What fraction of the corpus each metric actually reports, recorded every run.
+#
+# What this catches, stated plainly, because it is narrower than it looks:
+#
+#   - a metric that is not computed for anybody, which means it stopped running
+#   - a flag that is true for nobody in the whole corpus, which means it is
+#     looking for something that is not there
+#   - either of those appearing abruptly against the previous run
+#
+# What it does NOT catch, and this was measured rather than assumed: the
+# has_vignettes bug that motivated it. That pattern matched .Rmd and .Rnw and
+# never .qmd, so Quarto-only packages reported no vignettes while the .Rmd
+# majority reported fine. Replaying it here, a run losing twenty packages to a
+# growing format raises nothing, and it should not: a twenty-package move is
+# indistinguishable from the ecosystem changing. Slow erosion in a subset is
+# invisible to any threshold loose enough to be quiet on a normal week.
+#
+# Catching that shape needs a second, independent measurement of the same fact
+# to disagree with the first. Both now exist for vignettes, one from the CRAN
+# tarball and one from the repository tree, and comparing them is the follow-up
+# this does not do.
+
+#' Per-metric coverage over a summary frame.
+#'
+#' For each column: how many rows carry a value at all (`measured`), and for a
+#' logical metric how many are TRUE (`positive`). A metric with a `measured` of
+#' zero was never computed; one whose `positive` is zero across the whole corpus
+#' is either genuinely unused or looking for the wrong thing, and the count
+#' alone cannot tell those apart. That is the point: it says look here.
+metric_coverage <- function(summary_df) {
+  if (is.null(summary_df) || nrow(summary_df) == 0) {
+    return(data.frame(metric = character(), n_rows = integer(), measured = integer(),
+                      positive = integer(), kind = character(),
+                      stringsAsFactors = FALSE))
+  }
+  skip <- c("package", "version", "released", "ref")
+  cols <- setdiff(names(summary_df), skip)
+  n <- nrow(summary_df)
+  rows <- lapply(cols, function(cn) {
+    v <- summary_df[[cn]]
+    measured <- sum(!is.na(v))
+    is_flag <- is.logical(v) || (is.numeric(v) && all(v[!is.na(v)] %in% c(0, 1)))
+    positive <- if (is_flag) sum(v[!is.na(v)] == 1 | v[!is.na(v)] == TRUE) else NA_integer_
+    data.frame(metric = cn, n_rows = n, measured = as.integer(measured),
+               positive = as.integer(positive),
+               kind = if (is_flag) "flag" else "value", stringsAsFactors = FALSE)
+  })
+  # A frame carrying nothing but identifiers has no metrics to report, which is
+  # a valid state (the bootstrap writes one) and not an error.
+  if (!length(rows)) return(metric_coverage(NULL))
+  out <- do.call(rbind, rows)
+  rownames(out) <- NULL
+  out
+}
+
+#' Metrics worth a second look, given this run's coverage and the last one's.
+#'
+#' Two questions, because the failures looked different. A metric that reports
+#' nothing at all was never computed. A flag that is TRUE nowhere across tens of
+#' thousands of packages is looking for something that is not there, which is
+#' what a stale extension list looks like from the outside. A metric that fell
+#' sharply against the previous run changed meaning without anyone saying so.
+#'
+#' `prior` may be NULL on a first run, in which case only the absolute checks
+#' apply and the drop check is skipped rather than treated as a pass.
+metric_coverage_alerts <- function(cov, prior = NULL, drop_tol = 0.5) {
+  out <- character(0)
+  if (is.null(cov) || nrow(cov) == 0) return("no metrics reported at all")
+
+  never <- cov[cov$measured == 0L, , drop = FALSE]
+  for (i in seq_len(nrow(never)))
+    out <- c(out, sprintf("%s: not computed for any of %d packages",
+                          never$metric[i], never$n_rows[i]))
+
+  flags <- cov[cov$kind == "flag" & cov$measured > 0L &
+               !is.na(cov$positive) & cov$positive == 0L, , drop = FALSE]
+  for (i in seq_len(nrow(flags)))
+    out <- c(out, sprintf("%s: measured on %d packages and true for none",
+                          flags$metric[i], flags$measured[i]))
+
+  if (!is.null(prior) && nrow(prior) > 0) {
+    m <- merge(cov, prior, by = "metric", suffixes = c("", "_prev"))
+    for (i in seq_len(nrow(m))) {
+      a <- m$measured_prev[i]; b <- m$measured[i]
+      if (!is.na(a) && a > 100L && b < a * drop_tol)
+        out <- c(out, sprintf("%s: measured on %d packages, was %d", m$metric[i], b, a))
+      pa <- m$positive_prev[i]; pb <- m$positive[i]
+      if (!is.na(pa) && !is.na(pb) && pa > 100L && pb < pa * drop_tol)
+        out <- c(out, sprintf("%s: true for %d packages, was %d", m$metric[i], pb, pa))
+    }
+  }
+  out
 }

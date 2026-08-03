@@ -339,6 +339,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   shard_functions_list <- list()
   shard_edges_list     <- list()
   shard_datasets_list  <- list()
+  shard_vignettes_list <- list()
   shard_failures       <- character(0L)
 
   if (!dir.exists(WORK_DIR)) dir.create(WORK_DIR, recursive = TRUE)
@@ -397,7 +398,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     .done(TRUE, "ok", nrow(res$summary))
     list(package = pkg, ok = TRUE,
          summary = res$summary, churn = res$churn, api = res$api,
-         functions = res$functions, edges = res$edges, datasets = res$datasets)
+         functions = res$functions, edges = res$edges, datasets = res$datasets,
+         vignettes = res$vignettes)
   }
 
   results <- parallel::mclapply(shard_pkgs, .pkg_worker,
@@ -420,6 +422,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       shard_functions_list[[pkg]] <- r$functions
       shard_edges_list[[pkg]]     <- r$edges
       shard_datasets_list[[pkg]]  <- r$datasets
+      shard_vignettes_list[[pkg]] <- r$vignettes
       .reset_failure(con, pkg)
     }
   }
@@ -432,6 +435,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   fresh_functions <- .rbind_union_all(shard_functions_list) %||% .empty_functions_df()
   fresh_edges     <- .rbind_union_all(shard_edges_list)     %||% .empty_edges_df()
   fresh_datasets  <- .rbind_union_all(shard_datasets_list)  %||% .empty_datasets_df()
+  fresh_vignettes <- .rbind_union_all(shard_vignettes_list) %||% .empty_vignettes_rows()
 
   if (length(fresh_pkgs) > 0L) {
     # Write dataset rows before the code summary stamps datasets_scanned = TRUE,
@@ -441,7 +445,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # redoes both cleanly, rather than being marked done with datasets missing.
     upsert_datasets(data_con, fresh_datasets, fresh_pkgs)
     upsert_shard(con, fresh_summary, fresh_churn, fresh_api,
-                 fresh_functions, fresh_edges)
+                 fresh_functions, fresh_edges, fresh_vignettes)
   }
 
   # ---- 7b. Project archived-package metadata into the narrow lookup table ----

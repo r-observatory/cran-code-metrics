@@ -658,6 +658,7 @@ analyze_package <- function(repo_dir, package) {
   functions_rows     <- vector("list", nrow(versions_df))
   edges_rows         <- vector("list", nrow(versions_df))
   datasets_rows      <- vector("list", nrow(versions_df))
+  vignettes_rows     <- vector("list", nrow(versions_df))
   prev_exports       <- NULL
   deprecation_series <- vector("list", nrow(versions_df))
   # Time-gated per-version heartbeat. A single package with thousands of versions
@@ -833,9 +834,20 @@ analyze_package <- function(repo_dir, package) {
         .empty_datasets_df()
       }
 
+      # One row per vignette this version ships, read from the same extracted
+      # source everything else here comes from. is_current marks the latest so a
+      # reader can ask what the package ships now without a subquery.
+      vg <- tryCatch(metrics_vignettes(ctx), error = function(e) .empty_vignettes_df())
+      vignettes_row <- if (nrow(vg) > 0L) {
+        cbind(package = package, version = v, is_current = as.integer(is_latest),
+              vg, stringsAsFactors = FALSE)
+      } else {
+        .empty_vignettes_rows()
+      }
+
       list(safe_metrics = safe_metrics, api_row = api_row, prev_exports = curr_exports,
            dep_sig = dep_sig, functions_row = functions_row, edges_row = edges_row,
-           datasets_row = datasets_row)
+           datasets_row = datasets_row, vignettes_row = vignettes_row)
     })
 
     summary_rows[[i]]       <- iter$safe_metrics
@@ -843,6 +855,7 @@ analyze_package <- function(repo_dir, package) {
     functions_rows[[i]]     <- iter$functions_row
     edges_rows[[i]]         <- iter$edges_row
     datasets_rows[[i]]      <- iter$datasets_row
+    vignettes_rows[[i]]     <- iter$vignettes_row
     prev_exports            <- iter$prev_exports
     deprecation_series[[i]] <- iter$dep_sig
   }
@@ -911,6 +924,12 @@ analyze_package <- function(repo_dir, package) {
     .empty_datasets_df()
   }
 
+  vignettes_df <- if (length(vignettes_rows) > 0L) {
+    do.call(rbind, vignettes_rows)
+  } else {
+    .empty_vignettes_rows()
+  }
+
   summary_df <- add_cross_version_metrics(summary_df, api_df, deprecation_series)
 
   list(
@@ -919,6 +938,7 @@ analyze_package <- function(repo_dir, package) {
     api       = api_df,
     functions = functions_df,
     edges     = edges_df,
-    datasets  = datasets_df
+    datasets  = datasets_df,
+    vignettes = vignettes_df
   )
 }

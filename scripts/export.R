@@ -42,7 +42,7 @@
 #' @param api_df     data.frame with columns package, version, exports_added,
 #'   exports_removed (JSON array strings), n_exports (integer), and optionally
 #'   cold_removals.
-export_metrics <- function(path, summary_df, churn_df, api_df) {
+export_metrics <- function(path, summary_df, churn_df, api_df, vignettes_df = NULL) {
   if (file.exists(path)) unlink(path)
   con <- DBI::dbConnect(RSQLite::SQLite(), path)
   on.exit(DBI::dbDisconnect(con), add = TRUE)
@@ -62,6 +62,22 @@ export_metrics <- function(path, summary_df, churn_df, api_df) {
 
   # Per-metric coverage for this run, so the next one can compare against it and
   # so a reader can see what each metric actually reports before trusting a rate.
+  # ---- cran_vignettes --------------------------------------------------------
+  # One row per vignette per version. The summary says how many; this says which
+  # ones, what they are written in, and what they are called in the index, which
+  # is the string a reader actually browses and lives nowhere else.
+  DBI::dbExecute(con, "CREATE TABLE IF NOT EXISTS cran_vignettes (
+    package TEXT NOT NULL, version TEXT NOT NULL, file TEXT NOT NULL,
+    is_current INTEGER NOT NULL DEFAULT 0,
+    name TEXT, engine TEXT, title TEXT, builder TEXT,
+    lines INTEGER, has_code INTEGER,
+    PRIMARY KEY (package, version, file))")
+  if (!is.null(vignettes_df) && nrow(vignettes_df) > 0L) {
+    DBI::dbWriteTable(con, "cran_vignettes", vignettes_df, append = TRUE)
+  }
+  DBI::dbExecute(con,
+    "CREATE INDEX IF NOT EXISTS idx_vignettes_pkg ON cran_vignettes(package, is_current)")
+
   cov <- metric_coverage(write_summary)
   DBI::dbExecute(con, "CREATE TABLE metric_coverage (
     metric TEXT NOT NULL, n_rows INTEGER, measured INTEGER, positive INTEGER,
@@ -479,7 +495,8 @@ db_analyzed_state <- function(con) {
 #'   stale rows survive a re-analysis.
 #' @return invisible(NULL)
 upsert_shard <- function(con, summary_df, churn_df, api_df,
-                         functions_df = NULL, edges_df = NULL) {
+                         functions_df = NULL, edges_df = NULL,
+                         vignettes_df = NULL) {
   pkgs <- unique(as.character(summary_df$package))
   if (length(pkgs) == 0L) return(invisible(NULL))
 
@@ -501,6 +518,10 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     .delete_by_package(con, "cran_api_history",  pkgs)
     if (!is.null(functions_df)) .delete_by_package(con, "cran_functions",  pkgs)
     if (!is.null(edges_df))     .delete_by_package(con, "cran_call_edges", pkgs)
+    # Per package, not per version, for the same reason as the other detail
+    # tables: a package moving to a new latest version must not leave the
+    # previous version's vignette rows behind as though it still shipped them.
+    if (!is.null(vignettes_df))  .delete_by_package(con, "cran_vignettes", pkgs)
 
     # -- Insert fresh summary rows (with schema-growth handling) -------------
     summary_write <- .coerce_logicals(summary_df)
@@ -542,6 +563,7 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     # -- Insert fresh per-function / per-call-edge detail --------------------
     .append_detail_table(con, "cran_functions",  functions_df)
     .append_detail_table(con, "cran_call_edges", edges_df)
+    .append_detail_table(con, "cran_vignettes",  vignettes_df)
   })
 
   invisible(NULL)

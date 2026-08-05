@@ -2,7 +2,15 @@ name: Update CRAN Code Metrics
 
 on:
   schedule:
-    - cron: "0 4 * * *"
+    # Three times a day rather than once. A version released after the run is
+    # invisible on the site until the next one, and the site merges once a day,
+    # so a mid-afternoon release waited a full extra day: writexl 2.0.0 landed at
+    # 13:50 UTC, hours after that day's only run. Runs are incremental and this
+    # repo is public, so the added cost is not billed: a typical run analyses one
+    # changed package in 0s and the wall clock is almost entirely moving the
+    # database. The last run is before the merge's earliest hour, so the day's
+    # releases are picked up the same day.
+    - cron: "0 4,10,16 * * *"
   workflow_dispatch:
     inputs:
       force_full:

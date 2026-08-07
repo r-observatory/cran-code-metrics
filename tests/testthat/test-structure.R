@@ -108,3 +108,34 @@ test_that("metrics_structure handles empty file list (NA-safe)", {
   expect_false(m$has_src)
   expect_equal(m$compiled_share, 0)
 })
+
+test_that("metrics_structure: inst/CITATION is detected as a shipped citation", {
+  # utils::citation() reads inst/CITATION from the installed package, so what
+  # matters is whether the tarball shipped one. That is what this file list is:
+  # the contents of a released version, not a repository at HEAD.
+  mk <- function(files) {
+    fm <- setNames(as.list(rep("x\n", length(files))), files)
+    build_context("mypkg", "1.0", "1.0", "2024-01-01", files,
+                  function(p) fm[[p]] %||% "")
+  }
+
+  with_it <- metrics_structure(mk(c("DESCRIPTION", "R/foo.R", "inst/CITATION")))
+  expect_true(with_it$has_citation)
+
+  without <- metrics_structure(mk(c("DESCRIPTION", "R/foo.R")))
+  expect_false(without$has_citation)
+
+  # A CITATION.cff at the root is the CFF standard, read by repository hosts.
+  # It is not the file citation() reads and must not be mistaken for it.
+  cff <- metrics_structure(mk(c("DESCRIPTION", "CITATION.cff")))
+  expect_false(cff$has_citation)
+
+  # Nor is a CITATION anywhere else in the tree the installed one.
+  expect_false(metrics_structure(mk(c("CITATION")))$has_citation)
+  expect_false(metrics_structure(mk(c("man/CITATION")))$has_citation)
+  expect_false(metrics_structure(mk(c("inst/extdata/CITATION")))$has_citation)
+
+  # Shipping both is normal and each is reported on its own terms.
+  both <- metrics_structure(mk(c("inst/CITATION", "CITATION.cff")))
+  expect_true(both$has_citation)
+})

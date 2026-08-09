@@ -305,7 +305,15 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     dataset_backfill <- .recollect_todo(con, universe$package, perm_fail_pkgs,
                                         sentinel = "datasets_scanned",
                                         latest_only = TRUE)
-    todo_pkgs <- sort(unique(c(changed, backfill, detail_backfill, dataset_backfill)))
+    # And drain any package whose latest-version row predates citation reading
+    # (citation_scanned IS NULL), so a package analysed before citations existed
+    # gets re-read once. Latest-row-scoped, so it converges instead of
+    # re-selecting the whole corpus on every run.
+    citation_backfill <- .recollect_todo(con, universe$package, perm_fail_pkgs,
+                                         sentinel = "citation_scanned",
+                                         latest_only = TRUE)
+    todo_pkgs <- sort(unique(c(changed, backfill, detail_backfill, dataset_backfill,
+                               citation_backfill)))
   }
 
   # Take the first shard_size packages from the to-do list (deterministic order).
@@ -322,12 +330,13 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # and exist only on the scheduled path; guard with exists() so --bootstrap and
   # --recollect runs still print (they show 0/0/0).
   t_shard0   <- Sys.time()
-  n_changed  <- if (exists("changed",         inherits = FALSE)) length(changed)         else 0L
-  n_backfill <- if (exists("backfill",        inherits = FALSE)) length(backfill)        else 0L
-  n_detail   <- if (exists("detail_backfill", inherits = FALSE)) length(detail_backfill) else 0L
+  n_changed  <- if (exists("changed",           inherits = FALSE)) length(changed)           else 0L
+  n_backfill <- if (exists("backfill",          inherits = FALSE)) length(backfill)          else 0L
+  n_detail   <- if (exists("detail_backfill",   inherits = FALSE)) length(detail_backfill)   else 0L
+  n_citation <- if (exists("citation_backfill", inherits = FALSE)) length(citation_backfill) else 0L
   cat(sprintf(
-    "shard plan: %d pkgs this shard; to-do pool %d (changed %d / backfill %d / detail %d, overlapping), %d will remain; %d cores, %ds/pkg timeout\n",
-    length(shard_pkgs), length(todo_pkgs), n_changed, n_backfill, n_detail,
+    "shard plan: %d pkgs this shard; to-do pool %d (changed %d / backfill %d / detail %d / citation %d, overlapping), %d will remain; %d cores, %ds/pkg timeout\n",
+    length(shard_pkgs), length(todo_pkgs), n_changed, n_backfill, n_detail, n_citation,
     length(todo_pkgs) - length(shard_pkgs), ANALYSIS_CORES, WORKER_TIMEOUT),
     file = stdout())
   flush(stdout())

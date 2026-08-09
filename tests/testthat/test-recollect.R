@@ -164,3 +164,50 @@ test_that("todo union of changed + n_fns_r backfill + detail backfill has no dup
   expect_equal(todo, c("a", "b", "c"))
   expect_false(anyDuplicated(todo) > 0L)
 })
+
+# ---------------------------------------------------------------------------
+# Citation backfill: latest-row-scoped convergence marker (citation_scanned).
+# Rows: list(package, version, latest_release_date, citation_scanned).
+# Mirrors .mk_detail_summary above; a separate builder because the sentinel
+# column differs and the existing one hardcodes its own.
+.mk_citation_summary <- function(rows) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  DBI::dbExecute(con,
+    "CREATE TABLE cran_code_summary
+       (package TEXT, version TEXT, latest_release_date TEXT,
+        citation_scanned INTEGER)")
+  for (r in rows) {
+    DBI::dbExecute(con,
+      "INSERT INTO cran_code_summary
+         (package, version, latest_release_date, citation_scanned)
+       VALUES (?, ?, ?, ?)",
+      params = list(r[[1]], r[[2]], r[[3]], r[[4]]))
+  }
+  con
+}
+
+test_that("a package analysed before citations existed is selected for backfill", {
+  # Latest-row only, like detail_scanned and datasets_scanned: the marker is
+  # written only on the latest row, so checking any row would re-flag every
+  # multi-version package forever and the backfill would never converge.
+  con <- .mk_citation_summary(list(
+    list("old", "1.0", "2020-01-01", NA),   # never scanned  -> todo
+    list("new", "1.0", "2020-01-01", 1L)    # scanned        -> converged
+  ))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  todo <- .recollect_todo(con, c("old", "new"), character(0L),
+                          sentinel = "citation_scanned", latest_only = TRUE)
+  expect_equal(todo, "old")
+})
+
+test_that("an older version's row does not re-flag a scanned package", {
+  con <- .mk_citation_summary(list(
+    list("p", "0.9", NA,           NA),   # older row, no marker, not latest
+    list("p", "1.0", "2020-01-01", 1L)    # latest row, scanned
+  ))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_equal(.recollect_todo(con, "p", character(0L),
+                               sentinel = "citation_scanned",
+                               latest_only = TRUE), character(0L))
+})

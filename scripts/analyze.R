@@ -406,6 +406,7 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
     summary_df$deprecation_infrastructure_maturity <- integer(0L)
     summary_df$detail_scanned       <- logical(0L)
     summary_df$datasets_scanned     <- logical(0L)
+    summary_df$citation_scanned     <- logical(0L)
     return(summary_df)
   }
 
@@ -562,6 +563,11 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
   # detail_scanned so packages scanned before the dataset reader existed (their
   # latest row has detail_scanned set but no dataset rows) still get re-flagged.
   summary_df$datasets_scanned     <- NA
+  # citation_scanned: convergence marker for the citation backfill, distinct
+  # from the other two so packages analysed before citation reading existed
+  # (their latest row has detail_scanned/datasets_scanned set but no citation
+  # pass) still get re-flagged, exactly once.
+  summary_df$citation_scanned     <- NA
 
   summary_df$n_versions[n]           <- n
   summary_df$first_release_date[n]   <- first_date
@@ -575,6 +581,7 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
   # for data-only packages with zero functions, so the backfill converges.
   summary_df$detail_scanned[n]       <- TRUE
   summary_df$datasets_scanned[n]     <- TRUE
+  summary_df$citation_scanned[n]     <- TRUE
 
   summary_df
 }

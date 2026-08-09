@@ -77,9 +77,28 @@ test_that("an empty input frame runs nothing at all", {
   expect_equal(length(got$lines), 0L)
 })
 
-test_that("the sandbox mode is docker when docker is usable, else none", {
-  mode <- citation_sandbox_mode()
-  expect_true(mode %in% c("docker", "none"))
+test_that("the sandbox mode is none when no docker binary is on PATH", {
+  bin_dir <- withr::local_tempdir()
+  withr::local_envvar(PATH = bin_dir)
+  expect_equal(citation_sandbox_mode(), "none")
+})
+
+test_that("the sandbox mode is none when docker is on PATH but the daemon does not respond", {
+  bin_dir <- withr::local_tempdir()
+  fake <- file.path(bin_dir, "docker")
+  writeLines(c("#!/bin/sh", "exit 1"), fake)
+  Sys.chmod(fake, "0755")
+  withr::local_envvar(PATH = paste(bin_dir, Sys.getenv("PATH"), sep = .Platform$path.sep))
+  expect_equal(citation_sandbox_mode(), "none")
+})
+
+test_that("the sandbox mode is docker when docker is on PATH and the daemon responds", {
+  bin_dir <- withr::local_tempdir()
+  fake <- file.path(bin_dir, "docker")
+  writeLines(c("#!/bin/sh", 'echo "27.0.0"', "exit 0"), fake)
+  Sys.chmod(fake, "0755")
+  withr::local_envvar(PATH = paste(bin_dir, Sys.getenv("PATH"), sep = .Platform$path.sep))
+  expect_equal(citation_sandbox_mode(), "docker")
 })
 
 test_that("a missing terminator is reported as a crash, not as an empty result", {
@@ -133,10 +152,17 @@ test_that("an unsandboxed run is refused when the sandbox is required", {
 test_that("staged files are made readable and traversable under a restrictive umask", {
   # dir.create()/file.copy() apply the process umask. Under 077 that leaves
   # the staged directory at 0700: a container uid other than the one that
-  # staged it could not even traverse in. run_citation_reader() must widen
-  # that regardless of what umask built it, or the container-uid read fails
-  # closed as a crash at best and, for the manifest specifically, open into a
-  # wrongly-recorded "ok" at worst (see the next test's sibling finding).
+  # staged it could not even traverse in. .citation_make_stage_readable()
+  # must widen that regardless of what umask built it, or the container-uid
+  # read fails closed as a crash at best and, for the manifest specifically,
+  # open into a wrongly-recorded "ok" at worst (see the next test's sibling
+  # finding).
+  #
+  # Calls .citation_make_stage_readable() directly rather than going through
+  # run_citation_reader(): the latter launches a real `docker run` whenever a
+  # daemon is reachable, which is true on every CI runner, and nothing here
+  # needs a reader to actually execute - only the permission sweep
+  # run_citation_reader() performs before it does.
   old_umask <- Sys.umask("0077")
   on.exit(Sys.umask(old_umask), add = TRUE)
 
@@ -153,7 +179,7 @@ test_that("staged files are made readable and traversable under a restrictive um
   # below would pass whether or not the fix does anything.
   expect_equal(format(file.info(got$dir)$mode), "700")
 
-  run_citation_reader(got, file.path("..", "..", "scripts", "cite_reader.R"))
+  .citation_make_stage_readable(dirname(got$dir))
 
   expect_equal(format(file.info(got$dir)$mode), "755")
   expect_equal(format(file.info(file.path(got$dir, "inst"))$mode), "755")
@@ -273,6 +299,26 @@ test_that("invalid UTF-8 in a field fails the record rather than storing it", {
              sprintf('{"t":"entry","id":"k1","i":1,"bibtype":"Misc","title":"%s","year":"2001","authors":[],"fields":{},"text_version":[],"header":null,"footer":null,"key":null,"bibtex":"@Misc{,}","citation":"T"}', bad),
              '{"t":"end"}')
   got <- parse_citation_records(lines, inp, "ok")
+  expect_equal(got$citations$status, "malformed")
+  expect_equal(nrow(got$entries), 0L)
+  expect_false(anyNA(got$citations$status))
+})
+
+test_that("an escaped lone low surrogate in a field is rejected as malformed", {
+  # Unlike the raw 0xff byte the fixture above uses (which fails to parse as
+  # JSON at all and never reaches .cit_valid()), a lone low surrogate such as
+  # \uDC00 is legal JSON grammar: it survives jsonlite::fromJSON() as an R
+  # string that decodes to bytes ed b0 80, which validUTF8() rejects. This is
+  # the case .cit_valid() exists to catch. Built via paste0() with a
+  # standalone backslash rather than written as a literal "\\uDC00" in the
+  # source, so R's own string parser never gets a chance to interpret it -
+  # what reaches jsonlite is the six literal characters \, u, D, C, 0, 0.
+  inp <- cit_inputs(list(id = "k1", version = "1.0"))
+  bs <- "\\"
+  bad_title <- paste0(bs, "u", "DC00")
+  doc <- '{"t":"doc","id":"k1","status":"ok","n_entries":1,"mheader":null,"mfooter":null,"header_scope":"none","message":null}'
+  ent <- sprintf('{"t":"entry","id":"k1","i":1,"bibtype":"Misc","title":"%s","year":"2001","authors":[],"fields":{},"text_version":[],"header":null,"footer":null,"key":null,"bibtex":"@Misc{,}","citation":"T"}', bad_title)
+  got <- parse_citation_records(c(doc, ent, '{"t":"end"}'), inp, "ok")
   expect_equal(got$citations$status, "malformed")
   expect_equal(nrow(got$entries), 0L)
   expect_false(anyNA(got$citations$status))

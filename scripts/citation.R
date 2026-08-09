@@ -1,5 +1,5 @@
 # scripts/citation.R: reading inst/CITATION out of a released version.
-# Dependency: config.R, context.R must be sourced first.
+# Dependency: config.R must be sourced first (CITATION_IMAGE, CITATION_TIMEOUT).
 
 #' Whether a released version ships the file utils::citation() reads.
 #'
@@ -281,14 +281,13 @@ run_citation_reader <- function(inputs_df, reader_path) {
   if (!length(x)) NA_integer_ else x[[1L]]
 }
 
-# No known input makes this return FALSE. jsonlite::fromJSON() only ever
-# hands back strings it has already validated as UTF-8 - even an escaped
-# lone surrogate such as "\uD800" decodes to a replacement character that
-# validUTF8() accepts - so every string reaching here has already passed.
-# Kept as a direct check on the invariant the rest of this function relies
-# on, in case that stops being true under a different JSON backend or a
-# jsonlite version with looser decoding, not because a reachable case is
-# known today.
+# Reachable, and load-bearing. jsonlite::fromJSON() accepts an escaped lone
+# UTF-16 surrogate as valid JSON grammar, but the two halves decode
+# differently: a lone HIGH surrogate such as "\uD800" decodes to a
+# replacement "?" and passes validUTF8(), while a lone LOW surrogate such as
+# "\uDC00" decodes to the three bytes ed b0 80, which validUTF8() rejects
+# (measured on jsonlite 2.0.0 with R 4.6.1). This function is what catches
+# that second case, so it must not be treated as dead code.
 .cit_valid <- function(x) {
   x <- x[!is.na(x)]
   length(x) == 0L || all(validUTF8(enc2utf8(x)))
@@ -398,10 +397,14 @@ parse_citation_records <- function(lines, inputs_df, outcome, run_message = NA_c
       texts <- c(.cit_chr(doc$mheader), .cit_chr(doc$mfooter),
                  unlist(lapply(mine, cols), use.names = FALSE))
 
-      # JSON forbids invalid UTF-8 bytes in string content, so a corrupted
-      # field never survives as a string for .cit_valid() to inspect: the
-      # whole line fails jsonlite::fromJSON() instead, and that entry
-      # silently disappears from `ents` above rather than erroring here.
+      # Invalid UTF-8 *bytes* embedded raw in the JSON source fail the JSON
+      # grammar itself, so a field corrupted that way never survives as a
+      # string for .cit_valid() to inspect: the whole line fails
+      # jsonlite::fromJSON() instead, and that entry silently disappears from
+      # `ents` above rather than erroring here. An escaped lone UTF-16
+      # surrogate is different: it is legal JSON grammar, so it does survive
+      # to become an R string - that is exactly the case .cit_valid() below
+      # exists to catch (see its own comment for which half of a pair does).
       # What is checked instead is identity, not just count: the entries
       # that did parse must be exactly 1..n_entries, each index present once.
       # A count match alone is not enough - an entry that vanished and a
@@ -455,10 +458,24 @@ parse_citation_records <- function(lines, inputs_df, outcome, run_message = NA_c
               bibtype     = .cit_chr(r$bibtype),
               title       = .cit_chr(r$title),
               year        = .cit_chr(r$year),
-              authors_json = as.character(jsonlite::toJSON(r$authors, auto_unbox = TRUE)),
+              # null = "null": an absent email or ORCID parses from the reader's
+              # JSON as a missing list element, and without this the default
+              # encoding renders that as {} - an empty object, which is truthy
+              # in JavaScript, so a consumer guarding on the field would render
+              # an object rather than treating it as absent.
+              authors_json = as.character(jsonlite::toJSON(r$authors,
+                                                            auto_unbox = TRUE,
+                                                            null = "null")),
               fields_json  = as.character(jsonlite::toJSON(r$fields,  auto_unbox = TRUE)),
-              text_version_json = as.character(jsonlite::toJSON(r$text_version,
-                                                               auto_unbox = FALSE)),
+              # unlist() first: r$text_version is a list of scalars
+              # (simplifyVector = FALSE), and toJSON() on that list directly
+              # wraps each element in its own array - ["a","b"] would come out
+              # as [["a"],["b"]]. as.character(unlist(...)) flattens it to a
+              # plain character vector first, so auto_unbox = FALSE renders one
+              # flat JSON array, matching what the reader actually emitted.
+              text_version_json = as.character(jsonlite::toJSON(
+                                     as.character(unlist(r$text_version)),
+                                     auto_unbox = FALSE)),
               header    = .cit_chr(r$header),
               footer    = .cit_chr(r$footer),
               entry_key = .cit_chr(r$key),

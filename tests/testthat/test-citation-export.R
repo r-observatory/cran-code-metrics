@@ -154,3 +154,31 @@ test_that(".gc_citation_payloads does not collect a payload another package stil
   pays <- sort(DBI::dbGetQuery(con, "SELECT payload_id FROM cran_citation_payloads")$payload_id)
   expect_equal(pays, sort(c("pid_shared", "pid_new")))
 })
+
+test_that(".gc_citation_payloads still reclaims the orphan when another row has a NA payload_id", {
+  # cran_citations.payload_id is NULL on any crashed/timeout/error/malformed/
+  # skipped row - a common shape, not a hypothetical one. SQL's
+  # `x NOT IN (subquery)` evaluates to NULL, not TRUE, for every x once the
+  # subquery's result set contains a NULL, which a WHERE clause then treats
+  # as "don't delete" - so an unguarded query would turn the whole DELETE
+  # into a no-op the moment one such row exists anywhere in the table, not
+  # just fail to collect that one row's own (absent) payload.
+  con <- cit_db()
+  live   <- cit_pay("pid_live")
+  orphan <- cit_pay("pid_orphan")
+  upsert_shard(con, cit_sum("p", "1.0"), .empty_churn(), .empty_api(),
+               citations_df = cit_one("p", "1.0", "pid_live"),
+               payloads_df = live, entries_df = .empty_citation_entries_df())
+  # Written directly rather than through upsert_shard(): a payload with no
+  # citation row pointing at it at all, standing in for one orphaned by a
+  # re-analysis in some earlier run.
+  .upsert_ignore(con, "cran_citation_payloads", orphan, "payload_id")
+  # A crashed citation row: it has no payload of its own, so payload_id is NA.
+  DBI::dbAppendTable(con, "cran_citations",
+                     cit_one("q", "1.0", NA_character_, status = "crashed"))
+
+  .gc_citation_payloads(con)
+
+  pays <- DBI::dbGetQuery(con, "SELECT payload_id FROM cran_citation_payloads")$payload_id
+  expect_equal(pays, "pid_live")
+})

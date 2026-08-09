@@ -649,6 +649,12 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
 #'             latest version only
 #'   $citation_inputs  one row per version shipping inst/CITATION, carrying the
 #'             staging directory the reader will be given
+#'   $citations        one row per staged version's citation read status (see
+#'             parse_citation_records()'s `citations` frame)
+#'   $citation_payloads content-addressed citation payloads this package
+#'             contributed (see parse_citation_records()'s `payloads` frame)
+#'   $citation_entries  per-payload citation entries this package contributed
+#'             (see parse_citation_records()'s `entries` frame)
 #'
 #' Per-function and per-call-edge detail is emitted only by the analyzer binary
 #' and only for the package's latest version (the last row of versions_df, which

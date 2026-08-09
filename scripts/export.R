@@ -522,17 +522,60 @@ db_analyzed_state <- function(con) {
   rbind(primary, fallback)
 }
 
-# Insert rows whose primary key may already be present. Content-addressed tables
-# are shared across packages: the same citation in two packages is one payload,
-# so a second writer must not fail and must not overwrite.
-.upsert_ignore <- function(con, table, df) {
+# Insert rows whose primary key may already be present, tolerating only that.
+# Content-addressed tables are shared across packages: the same citation in
+# two packages is one payload, so a second writer with the same key must not
+# fail and must not overwrite. `INSERT OR IGNORE` looks like it does this but
+# does not: SQLite suppresses every constraint it recovers from that way, not
+# only a duplicate key, so a row with a forged NULL in a NOT NULL column is
+# dropped silently instead of raising, and whatever referenced it (a citation
+# row pointing at the payload_id that never got written) is left pointing at
+# nothing. `ON CONFLICT(pk) DO NOTHING` targets the primary key specifically:
+# a duplicate key is tolerated, any other constraint violation still raises
+# and rolls back the shard, which is the correct outcome for a row that would
+# otherwise reference content that was never actually stored.
+#
+# @param pk Character vector of the conflict target's column name(s) - the
+#   table's primary key.
+.upsert_ignore <- function(con, table, df, pk) {
   if (is.null(df) || nrow(df) == 0L) return(invisible(NULL))
   df   <- .coerce_logicals(df)
   cols <- paste(sprintf("\"%s\"", names(df)), collapse = ", ")
   phs  <- paste(rep("?", length(df)), collapse = ", ")
   DBI::dbExecute(con,
-    sprintf("INSERT OR IGNORE INTO %s (%s) VALUES (%s)", table, cols, phs),
+    sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT(%s) DO NOTHING",
+            table, cols, phs, paste(pk, collapse = ", ")),
     params = unname(as.list(df)))
+  invisible(NULL)
+}
+
+#' Reclaim citation payload/entry rows no longer referenced by any row in
+#' cran_citations (a re-analysed package pointing at new citation content
+#' orphans its previous payload), so the content-addressed citation tables
+#' cannot grow without bound. Mirrors .gc_dataset_contents() for the same
+#' table shape.
+#'
+#' cran_citations.payload_id is nullable (a crashed/timeout/error/malformed/
+#' skipped row has none), and SQL's `x NOT IN (subquery)` is NULL - not TRUE -
+#' for every x whenever the subquery's result set contains a NULL, which a
+#' WHERE clause then treats as "don't delete". Left unfiltered, a single NA
+#' payload_id anywhere in cran_citations would silently turn every future GC
+#' call in this database into a no-op, not just fail to collect one payload;
+#' the `WHERE payload_id IS NOT NULL` on the inner SELECT is load-bearing.
+#'
+#' Entries are deleted before payloads (the reverse order would leave an
+#' entry pointing at a payload GC has already removed).
+.gc_citation_payloads <- function(con) {
+  tables <- DBI::dbListTables(con)
+  if (!"cran_citations" %in% tables) return(invisible(NULL))
+  DBI::dbExecute(con, "
+    DELETE FROM cran_citation_entries
+     WHERE payload_id NOT IN (
+       SELECT payload_id FROM cran_citations WHERE payload_id IS NOT NULL)")
+  DBI::dbExecute(con, "
+    DELETE FROM cran_citation_payloads
+     WHERE payload_id NOT IN (
+       SELECT payload_id FROM cran_citations WHERE payload_id IS NOT NULL)")
   invisible(NULL)
 }
 
@@ -569,10 +612,14 @@ db_analyzed_state <- function(con) {
 #'   package, like the other detail tables.
 #' @param payloads_df Optional data.frame of citation payloads, keyed by
 #'   payload_id and shared across packages (see parse_citation_records()'s
-#'   `payloads` frame). Insert-or-ignore: never deleted by package.
+#'   `payloads` frame). Insert-or-ignore (a duplicate key is tolerated, never
+#'   overwritten): never deleted by package. A row no longer referenced by
+#'   any cran_citations row after this shard's inserts is reclaimed by
+#'   .gc_citation_payloads() before the transaction commits.
 #' @param entries_df Optional data.frame of per-payload citation entries (see
-#'   parse_citation_records()'s `entries` frame). Insert-or-ignore: never
-#'   deleted by package. A payload may legitimately have zero entry rows.
+#'   parse_citation_records()'s `entries` frame). Insert-or-ignore, reclaimed
+#'   the same way as payloads_df. A payload may legitimately have zero entry
+#'   rows.
 #' @return invisible(NULL)
 upsert_shard <- function(con, summary_df, churn_df, api_df,
                          functions_df = NULL, edges_df = NULL,
@@ -653,8 +700,16 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     if (!is.null(citations_df) && nrow(citations_df) > 0L) {
       DBI::dbAppendTable(con, "cran_citations", .coerce_logicals(citations_df))
     }
-    .upsert_ignore(con, "cran_citation_payloads", payloads_df)
-    .upsert_ignore(con, "cran_citation_entries",  entries_df)
+    .upsert_ignore(con, "cran_citation_payloads", payloads_df, "payload_id")
+    .upsert_ignore(con, "cran_citation_entries",  entries_df,
+                  c("payload_id", "entry_index"))
+
+    # Reclaim payload/entry rows a re-analysed package no longer points at.
+    # Must run after the inserts above, never between the delete-by-package
+    # step and them: in that window this package's rows are transiently
+    # absent, and collecting there would delete the very payloads the rows
+    # about to be written are still about to reference.
+    if (!is.null(citations_df)) .gc_citation_payloads(con)
   })
 
   invisible(NULL)

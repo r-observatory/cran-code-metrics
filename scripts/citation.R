@@ -257,8 +257,37 @@ run_citation_reader <- function(inputs_df, reader_path) {
              stringsAsFactors = FALSE)
 }
 
-.cit_chr <- function(x) if (is.null(x)) NA_character_ else as.character(x)[[1L]]
+#' Normalise a field that may arrive as NULL, an empty JSON array, or a JSON
+#' array of several values (`simplifyVector = FALSE` turns `[]` into
+#' `list()`, not into something `is.null()` catches). `unlist()` collapses
+#' any of those to a plain vector before length is checked, so a length-0
+#' result - not a bare `[[1L]]` on it - is what decides NA. Without this,
+#' `as.character(list())[[1L]]` throws "subscript out of bounds": a shape
+#' the honest reader never emits (.jstr/.jnum always write a scalar or
+#' null) but a dishonest one can, and one bad field must not cost the
+#' package its whole citation set.
+.cit_chr <- function(x) {
+  x <- as.character(unlist(x))
+  if (!length(x)) NA_character_ else x[[1L]]
+}
 
+#' Integer counterpart of .cit_chr(), for fields read as a count or index
+#' (`n_entries`, `i`). Same reasoning: a null or `[]` index must normalise
+#' to NA rather than reach vapply() as a length-0 result, which would abort
+#' the sort with "values must be length 1, but FUN(X[[1]]) result is length 0".
+.cit_int <- function(x) {
+  x <- suppressWarnings(as.integer(unlist(x)))
+  if (!length(x)) NA_integer_ else x[[1L]]
+}
+
+# No known input makes this return FALSE. jsonlite::fromJSON() only ever
+# hands back strings it has already validated as UTF-8 - even an escaped
+# lone surrogate such as "\uD800" decodes to a replacement character that
+# validUTF8() accepts - so every string reaching here has already passed.
+# Kept as a direct check on the invariant the rest of this function relies
+# on, in case that stops being true under a different JSON backend or a
+# jsonlite version with looser decoding, not because a reachable case is
+# known today.
 .cit_valid <- function(x) {
   x <- x[!is.na(x)]
   length(x) == 0L || all(validUTF8(enc2utf8(x)))
@@ -286,7 +315,22 @@ parse_citation_records <- function(lines, inputs_df, outcome) {
     if (!nzchar(l) || identical(l, "{\"t\":\"end\"}")) next
     r <- tryCatch(jsonlite::fromJSON(l, simplifyVector = FALSE),
                   error = function(e) NULL)
-    if (is.null(r) || is.null(r$id) || !(r$id %in% want)) next
+    if (is.null(r)) next
+    # length() first, not just is.null(): an id that arrived as a JSON array
+    # (forged or otherwise) is length 0 (absent), 1, or more, and computing
+    # `%in%` on a length-2+ id before checking that throws "'length = 2' in
+    # coercion to 'logical(1)'" rather than being refused like any other
+    # unrequested id. The length check short-circuits before `%in%` ever
+    # sees a multi-element id.
+    if (length(r$id) != 1L || !(r$id %in% want)) next
+    # Normalise to a plain length-1 character now, once, so every later
+    # identical()/vapply(..., character(1)) on r$id (by_id, the per-id
+    # Filter()) is comparing a guaranteed scalar rather than whatever shape
+    # survived matching - a single-element JSON array such as "id":["k1"]
+    # passes the check above (length 1, matches `want`) but is still a
+    # one-element list, not a string, and vapply(character(1)) on that
+    # throws rather than compares.
+    r$id <- .cit_chr(r$id)
     parsed[[length(parsed) + 1L]] <- r
   }
 
@@ -312,7 +356,12 @@ parse_citation_records <- function(lines, inputs_df, outcome) {
     payload_id <- NA_character_
     if (!is.null(doc) && status %in% c("ok", "empty")) {
       mine <- Filter(function(r) identical(r$id, id), ents)
-      mine <- mine[order(vapply(mine, function(r) as.integer(r$i), integer(1)))]
+      # .cit_int() rather than a bare as.integer(r$i): a null or `[]` index
+      # is length 0, and vapply(..., integer(1)) on a length-0 FUN() result
+      # aborts the whole package's parse ("values must be length 1"), not
+      # just this one entry.
+      idxs <- vapply(mine, function(r) .cit_int(r$i), integer(1))
+      mine <- mine[order(idxs)]
 
       cols <- function(r) c(.cit_chr(r$bibtype), .cit_chr(r$title), .cit_chr(r$year),
                             .cit_chr(r$header), .cit_chr(r$footer), .cit_chr(r$key),
@@ -321,15 +370,22 @@ parse_citation_records <- function(lines, inputs_df, outcome) {
                  unlist(lapply(mine, cols), use.names = FALSE))
 
       # JSON forbids invalid UTF-8 bytes in string content, so a corrupted
-      # field never survives as a string for .cit_valid() below to inspect:
-      # the whole line fails jsonlite::fromJSON() instead, and that entry
-      # silently disappears from `ents` above rather than erroring here. A
-      # doc that promised n_entries entries but yielded fewer is the only
-      # remaining signal that something was dropped, and that mismatch is
-      # treated as corruption rather than as a document with fewer entries
-      # than it claims.
-      declared_n <- suppressWarnings(as.integer(.cit_chr(doc$n_entries)))
-      if (!is.na(declared_n) && length(mine) != declared_n) {
+      # field never survives as a string for .cit_valid() to inspect: the
+      # whole line fails jsonlite::fromJSON() instead, and that entry
+      # silently disappears from `ents` above rather than erroring here.
+      # What is checked instead is identity, not just count: the entries
+      # that did parse must be exactly 1..n_entries, each index present once.
+      # A count match alone is not enough - an entry that vanished and a
+      # surviving duplicate of another entry add back up to the count
+      # declared while quietly replacing real content with a copy - and a
+      # missing, null, or non-integer n_entries on a doc claiming ok/empty is
+      # itself evidence of corruption, not a doc with no opinion on how many
+      # entries it has.
+      declared_n <- .cit_int(doc$n_entries)
+      shape_ok <- !is.na(declared_n) && declared_n >= 0L && !anyNA(idxs) &&
+                  length(idxs) == declared_n &&
+                  identical(sort(idxs), seq_len(declared_n))
+      if (!shape_ok) {
         status <- "malformed"
       } else if (!.cit_valid(texts)) {
         status <- "malformed"

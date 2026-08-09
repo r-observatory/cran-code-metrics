@@ -222,8 +222,8 @@ test_that("a record whose id was never requested is refused", {
   # The container evaluates code an author wrote. A forged record naming another
   # package must not become that package's citation.
   inp <- cit_inputs(list(id = "k1", version = "1.0", is_current = 1L))
-  lines <- c('{"t":"doc","id":"k1","status":"ok","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}',
-             '{"t":"doc","id":"FORGED","status":"ok","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}',
+  lines <- c('{"t":"doc","id":"k1","status":"empty","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}',
+             '{"t":"doc","id":"FORGED","status":"empty","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}',
              '{"t":"end"}')
   got <- parse_citation_records(lines, inp, "ok")
   expect_equal(nrow(got$citations), 1L)
@@ -281,4 +281,92 @@ test_that("an unresolvable release date is recorded as such rather than dropped"
   got <- parse_citation_records(lines, inp, "ok")
   expect_equal(got$citations$status, "error")
   expect_equal(got$citations$released_known, 0L)
+})
+
+# --- Records that parse as JSON but arrive in a shape the honest reader
+# never emits. None of these may abort the whole package's parse: one bad
+# record must cost at most its own version, never the versions around it.
+
+test_that("a null entry index does not abort the package's other versions", {
+  inp <- cit_inputs(list(id = "k1", version = "1.0"), list(id = "k2", version = "2.0"))
+  doc <- function(id) sprintf('{"t":"doc","id":"%s","status":"ok","n_entries":1,"mheader":null,"mfooter":null,"header_scope":"none","message":null}', id)
+  ent_ok <- '{"t":"entry","id":"k1","i":1,"bibtype":"Misc","title":"T","year":"2001","authors":[],"fields":{},"text_version":[],"header":null,"footer":null,"key":null,"bibtex":"@Misc{,}","citation":"T"}'
+  ent_null_i <- '{"t":"entry","id":"k2","i":null,"bibtype":"Misc","title":"T","year":"2001","authors":[],"fields":{},"text_version":[],"header":null,"footer":null,"key":null,"bibtex":"@Misc{,}","citation":"T"}'
+  got <- parse_citation_records(c(doc("k1"), ent_ok, doc("k2"), ent_null_i, '{"t":"end"}'), inp, "ok")
+  expect_equal(nrow(got$citations), 2L)
+  st <- setNames(got$citations$status, got$citations$version)
+  expect_equal(unname(st[["1.0"]]), "ok")
+  expect_equal(unname(st[["2.0"]]), "malformed")
+  # only k1 contributed: nothing from k2's record survives into storage
+  expect_equal(nrow(got$payloads), 1L)
+  expect_equal(nrow(got$entries), 1L)
+})
+
+test_that("an empty-array doc field does not abort the package's other versions", {
+  inp <- cit_inputs(list(id = "k1", version = "1.0"), list(id = "k2", version = "2.0"),
+                    list(id = "k3", version = "3.0"))
+  doc_ok <- '{"t":"doc","id":"k1","status":"empty","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}'
+  doc_bad_status <- '{"t":"doc","id":"k2","status":[],"n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}'
+  doc_bad_message <- '{"t":"doc","id":"k3","status":"error","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":[]}'
+  got <- parse_citation_records(c(doc_ok, doc_bad_status, doc_bad_message, '{"t":"end"}'), inp, "ok")
+  expect_equal(nrow(got$citations), 3L)
+  st  <- setNames(got$citations$status, got$citations$version)
+  msg <- setNames(got$citations$message, got$citations$version)
+  expect_equal(unname(st[["1.0"]]), "empty")
+  # status:[] normalises to NA rather than matching "ok"/"empty": nothing is
+  # built or stored for it, but the call itself does not throw.
+  expect_true(is.na(unname(st[["2.0"]])))
+  expect_equal(unname(st[["3.0"]]), "error")
+  expect_true(is.na(unname(msg[["3.0"]])))
+  # only k1's "empty" doc builds a (zero-entry) payload row; k2's status
+  # never matched "ok"/"empty" and k3 is "error", so neither builds one.
+  expect_equal(nrow(got$payloads), 1L)
+})
+
+test_that("an empty-array entry field does not abort the package's other versions", {
+  inp <- cit_inputs(list(id = "k1", version = "1.0"))
+  doc <- '{"t":"doc","id":"k1","status":"ok","n_entries":1,"mheader":null,"mfooter":null,"header_scope":"none","message":null}'
+  ent_bad_title <- '{"t":"entry","id":"k1","i":1,"bibtype":"Misc","title":[],"year":"2001","authors":[],"fields":{},"text_version":[],"header":null,"footer":null,"key":null,"bibtex":"@Misc{,}","citation":"T"}'
+  got <- parse_citation_records(c(doc, ent_bad_title, '{"t":"end"}'), inp, "ok")
+  expect_equal(got$citations$status, "ok")
+  expect_equal(nrow(got$entries), 1L)
+  expect_true(is.na(got$entries$title))
+})
+
+test_that("a non-scalar record id is refused rather than aborting the parse", {
+  inp <- cit_inputs(list(id = "k1", version = "1.0"), list(id = "k2", version = "2.0"))
+  doc_ok  <- '{"t":"doc","id":"k1","status":"empty","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}'
+  doc_bad <- '{"t":"doc","id":["k1","k2"],"status":"ok","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}'
+  got <- parse_citation_records(c(doc_ok, doc_bad, '{"t":"end"}'), inp, "ok")
+  expect_equal(nrow(got$citations), 2L)
+  st <- setNames(got$citations$status, got$citations$version)
+  expect_equal(unname(st[["1.0"]]), "empty")
+  # the array-id record names no version in the manifest, so k2 gets no doc
+  # record at all rather than the forged one being attributed to it.
+  expect_equal(unname(st[["2.0"]]), "crashed")
+})
+
+# --- n_entries must match which entries parsed, not just how many.
+
+test_that("a duplicated entry index is malformed even though the count matches", {
+  inp <- cit_inputs(list(id = "k1", version = "1.0"))
+  doc <- '{"t":"doc","id":"k1","status":"ok","n_entries":2,"mheader":null,"mfooter":null,"header_scope":"none","message":null}'
+  ent1 <- '{"t":"entry","id":"k1","i":1,"bibtype":"Misc","title":"T1","year":"2001","authors":[],"fields":{},"text_version":[],"header":null,"footer":null,"key":null,"bibtex":"@Misc{,}","citation":"T1"}'
+  # Entry 2 is corrupt and never arrives; a duplicate of entry 1 survives in
+  # its place, so the count still comes to 2.
+  dup <- '{"t":"entry","id":"k1","i":1,"bibtype":"Misc","title":"T1","year":"2001","authors":[],"fields":{},"text_version":[],"header":null,"footer":null,"key":null,"bibtex":"@Misc{,}","citation":"T1"}'
+  got <- parse_citation_records(c(doc, ent1, dup, '{"t":"end"}'), inp, "ok")
+  expect_equal(got$citations$status, "malformed")
+  expect_equal(nrow(got$entries), 0L)
+})
+
+test_that("a missing n_entries on an ok doc is malformed, not assumed absent", {
+  inp <- cit_inputs(list(id = "k1", version = "1.0"), list(id = "k2", version = "2.0"))
+  doc_missing <- '{"t":"doc","id":"k1","status":"ok","mheader":null,"mfooter":null,"header_scope":"none","message":null}'
+  ent1 <- '{"t":"entry","id":"k1","i":1,"bibtype":"Misc","title":"T1","year":"2001","authors":[],"fields":{},"text_version":[],"header":null,"footer":null,"key":null,"bibtex":"@Misc{,}","citation":"T1"}'
+  doc_null <- '{"t":"doc","id":"k2","status":"ok","n_entries":null,"mheader":null,"mfooter":null,"header_scope":"none","message":null}'
+  ent2 <- '{"t":"entry","id":"k2","i":1,"bibtype":"Misc","title":"T1","year":"2001","authors":[],"fields":{},"text_version":[],"header":null,"footer":null,"key":null,"bibtex":"@Misc{,}","citation":"T1"}'
+  got <- parse_citation_records(c(doc_missing, ent1, doc_null, ent2, '{"t":"end"}'), inp, "ok")
+  expect_equal(got$citations$status, c("malformed", "malformed"))
+  expect_equal(nrow(got$entries), 0L)
 })

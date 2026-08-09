@@ -503,3 +503,35 @@ parse_citation_records <- function(lines, inputs_df, outcome) {
                 else .empty_citation_entries_df()
   )
 }
+
+#' Evaluate one package's staged citations and shape the result.
+#'
+#' Wrapped so that nothing here can throw into analyze_package. The worker turns
+#' any error from analyze_package into a recorded package failure, and five of
+#' those drop the package from every metric this pipeline produces, so a citation
+#' file must never be able to cost a package its code metrics.
+citation_pass <- function(inputs_df, reader_path) {
+  empty <- list(citations = .empty_citations_df(),
+                payloads  = .empty_citation_payloads_df(),
+                entries   = .empty_citation_entries_df())
+  if (is.null(inputs_df) || nrow(inputs_df) == 0L) return(empty)
+
+  tryCatch({
+    run <- run_citation_reader(inputs_df, reader_path)
+    if (identical(run$outcome, "skipped")) return(empty)
+    parse_citation_records(run$lines, inputs_df, run$outcome)
+  }, error = function(e) {
+    warning(sprintf("citation pass failed for '%s': %s",
+                    inputs_df$package[[1L]], conditionMessage(e)))
+    list(citations = parse_citation_records(character(0L), inputs_df, "crashed")$citations,
+         payloads  = .empty_citation_payloads_df(),
+         entries   = .empty_citation_entries_df())
+  })
+}
+
+#' Path to the reader script, resolved the way update.R resolves its own sources.
+citation_reader_path <- function() {
+  fa <- grep("^--file=", commandArgs(FALSE), value = TRUE)
+  base <- if (length(fa) >= 1L) dirname(sub("^--file=", "", fa[1L])) else "scripts"
+  file.path(base, "cite_reader.R")
+}

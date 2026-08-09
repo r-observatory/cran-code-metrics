@@ -962,6 +962,17 @@ analyze_package <- function(repo_dir, package) {
     .empty_citation_inputs_df()
   }
 
+  # One container for this package's whole citation history. The worker's own
+  # elapsed-time limit is cleared across the call and restored after it: the
+  # limit does not fire during a blocking system2 but does as soon as one
+  # returns, and an error there would cost this package every metric above.
+  .cit_saved <- Sys.time()
+  setTimeLimit()
+  citation_out <- citation_pass(citation_inputs_df, citation_reader_path())
+  setTimeLimit(elapsed = max(30, WORKER_TIMEOUT -
+                 as.numeric(difftime(Sys.time(), .cit_saved, units = "secs"))),
+               transient = TRUE)
+
   summary_df <- add_cross_version_metrics(summary_df, api_df, deprecation_series)
 
   list(
@@ -972,6 +983,9 @@ analyze_package <- function(repo_dir, package) {
     edges     = edges_df,
     datasets  = datasets_df,
     vignettes = vignettes_df,
-    citation_inputs = citation_inputs_df
+    citation_inputs = citation_inputs_df,
+    citations         = citation_out$citations,
+    citation_payloads = citation_out$payloads,
+    citation_entries  = citation_out$entries
   )
 }

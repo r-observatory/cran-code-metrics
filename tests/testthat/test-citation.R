@@ -464,3 +464,32 @@ test_that(".empty_citations_df() has exactly the ten columns in order, matching 
   expect_equal(names(populated), want_names)
   expect_equal(names(empty), names(populated))
 })
+
+test_that("a package with no citation-bearing version returns empty frames", {
+  # The reader must not be launched at all. Starting a container per package
+  # regardless of whether it has anything to read would multiply the cost of the
+  # three quarters of CRAN that ships no citation file.
+  got <- citation_pass(.empty_citation_inputs_df(), "scripts/cite_reader.R")
+  expect_equal(nrow(got$citations), 0L)
+  expect_equal(nrow(got$payloads), 0L)
+  expect_equal(nrow(got$entries), 0L)
+})
+
+test_that("a citation pass survives a reader that cannot start", {
+  # A failure here must not propagate: analyze_package is wrapped in tryCatch by
+  # the worker, and an error there marks the package failed, which after five
+  # occurrences drops it from every metric the pipeline produces.
+  root <- withr::local_tempdir()
+  d <- file.path(root, "k1")
+  dir.create(file.path(d, "inst"), recursive = TRUE)
+  writeBin(charToRaw('bibentry("Misc", title = "T", author = person("A", "B"), year = "2001")'),
+           file.path(d, "inst", "CITATION"))
+  writeLines("Package: p\nVersion: 1.0\nTitle: T\n", file.path(d, "DESCRIPTION"))
+  inp <- data.frame(package = "p", version = "1.0", is_current = 1L,
+                    released = "2024-01-01", source_sha256 = strrep("a", 64L),
+                    dir = d, stringsAsFactors = FALSE)
+
+  got <- citation_pass(inp, "no/such/reader.R")
+  expect_equal(nrow(got$citations), 1L)
+  expect_true(got$citations$status %in% c("crashed", "timeout"))
+})

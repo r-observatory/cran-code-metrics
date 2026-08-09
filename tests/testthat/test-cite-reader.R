@@ -10,7 +10,7 @@ cite_reader_run <- function(jobs) {
     dir.create(file.path(d, "inst"), recursive = TRUE)
     writeBin(charToRaw(jobs[[id]]$citation), file.path(d, "inst", "CITATION"))
     writeLines(jobs[[id]]$desc, file.path(d, "DESCRIPTION"))
-    paste(id, d, jobs[[id]]$released %||% "NA", sep = "\t")
+    paste(id, d, jobs[[id]]$released %||% "2020-01-01", sep = "\t")
   }, character(1))
   writeLines(lines, man)
   rc <- system2("Rscript", c("--vanilla", shQuote(file.path("..", "..", "scripts", "cite_reader.R")),
@@ -123,6 +123,16 @@ test_that("an unknown release date is not fabricated as 1970", {
   expect_true(grepl("release date", d$message))
 })
 
+test_that("an unknown release date does not block a file that never asks for it", {
+  # Most CRAN citation files never call the clock at all, so an unresolved
+  # release date must not fail them just because it happens to be unresolved.
+  res <- cite_reader_run(list(j1 = list(
+    citation = 'bibentry("Manual", title = "T", author = person("A", "B"), year = "2001")',
+    desc = DESC, released = "NA")))
+  d <- recs(res, "doc")[[1L]]
+  expect_equal(d$status, "ok")
+})
+
 test_that("textVersion survives as an array, because it can legitimately be one", {
   res <- cite_reader_run(list(j1 = list(
     citation = 'bibentry("Misc", title = "T", author = person("A", "B"), year = "2001", textVersion = c("line one", "line two"))',
@@ -166,6 +176,44 @@ test_that("output written by the evaluated file cannot enter the record stream",
       sep = "\n"),
     desc = DESC)))
   expect_false(any(grepl("FORGED", res$lines)))
+  # A positive assertion is required alongside the negative one above: an
+  # absent FORGED string is also what an empty res$lines looks like, which is
+  # what a reader that never launched at all would produce. Asserting the
+  # real entry was read is what rules that out.
+  expect_equal(recs(res, "entry")[[1L]]$title, "T")
+})
+
+test_that("an evaluated citation file cannot rebind the reader's own JSON writer", {
+  # The evaluation environment for a CITATION file chains up to globalenv(),
+  # and `<<-` searches exactly that chain outward. If the JSON-writing
+  # helpers lived in globalenv(), a file that redefines .jstr this way would
+  # corrupt not just its own records but every later job's records in the
+  # same batch, because the poisoned binding would stay poisoned for the
+  # rest of the run.
+  res <- cite_reader_run(list(
+    poison = list(
+      citation = paste(
+        '.jstr <<- function(x) "\\"PWNED\\""',
+        'bibentry("Misc", title = "Poison Title", author = person("A", "B"), year = "2001")',
+        sep = "\n"),
+      desc = DESC),
+    after = list(
+      citation = 'bibentry("Misc", title = "Untouched Title", author = person("C", "D"), year = "2002")',
+      desc = DESC)))
+
+  expect_false(any(grepl("PWNED", res$lines)))
+
+  d <- recs(res, "doc")
+  by_id <- setNames(d, vapply(d, function(x) x$id, character(1)))
+  expect_equal(by_id$poison$status, "ok")
+  expect_equal(by_id$after$status, "ok")
+
+  e <- recs(res, "entry")
+  titles <- vapply(e, function(x) x$title, character(1))
+  expect_true("Poison Title" %in% titles)
+  # The one that matters: the second job's own records are untouched by the
+  # first job's attempt to rebind the writer.
+  expect_true("Untouched Title" %in% titles)
 })
 
 test_that("the legacy citEntry form is read like any other entry", {

@@ -6,6 +6,19 @@
 # Invoked as:  Rscript --vanilla scripts/cite_reader.R <manifest.tsv> <out.ndjson>
 # Manifest:    one job per line, tab separated: id, dir, released (YYYY-MM-DD|NA)
 
+# Every helper below is a binding inside this closure, never in globalenv().
+# The environment .eval_citation builds for an evaluated CITATION file chains
+# up to globalenv() (see clock's parent there), and `<<-` searches outward
+# along exactly that chain. A CITATION file containing
+# `.jstr <<- function(x) "\"PWNED\""` would silently rebind the real JSON
+# writer for the rest of the batch if these helpers lived in globalenv(): the
+# poisoned version would then be what every later job's records are built
+# with. Keeping the helpers as closure bindings instead means that search
+# walks past globalenv() without ever finding them, so it creates a throwaway
+# binding there and stops, while every call inside this script keeps
+# resolving the real, untouched helper through ordinary lexical scoping.
+ccm_main <- local({
+
 # ---- JSON, hand-rolled so the container needs no packages ------------------
 
 .jesc <- function(x) {
@@ -182,8 +195,6 @@
 }
 
 # ---- Driver ----------------------------------------------------------------
-# Everything lives in a function so that nothing of the reader's own state sits
-# in globalenv(), where an evaluated citation file could reach it.
 
 .run <- function(manifest_path, out_path) {
   jobs <- read.delim(manifest_path, header = FALSE, sep = "\t",
@@ -248,10 +259,13 @@
   tools::pskill(Sys.getpid(), tools::SIGKILL)
 }
 
+.run
+})
+
 if (identical(sys.nframe(), 0L)) {
   a <- commandArgs(trailingOnly = TRUE)
   if (length(a) < 2L) {
     stop("usage: Rscript --vanilla cite_reader.R <manifest.tsv> <out.ndjson>")
   }
-  .run(a[[1L]], a[[2L]])
+  ccm_main(a[[1L]], a[[2L]])
 }

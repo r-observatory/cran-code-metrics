@@ -302,7 +302,7 @@ run_citation_reader <- function(inputs_df, reader_path) {
 #' citation. A requested version with no record is recorded as crashed rather
 #' than as empty, because "we could not read it" and "it ships none" are
 #' different facts and the viewer says different things about them.
-parse_citation_records <- function(lines, inputs_df, outcome) {
+parse_citation_records <- function(lines, inputs_df, outcome, run_message = NA_character_) {
   if (is.null(inputs_df) || nrow(inputs_df) == 0L) {
     return(list(citations = .empty_citations_df(),
                 payloads  = .empty_citation_payloads_df(),
@@ -317,6 +317,16 @@ parse_citation_records <- function(lines, inputs_df, outcome) {
   # work is possible at all; the condition on allowing it is that its output
   # can never be mistaken for a run that went through the container.
   sandboxed <- if (identical(outcome, "unsandboxed")) 0L else 1L
+
+  # A whole-run failure (a reader that could not be launched, a required
+  # sandbox that never started) explains every row alike; a doc that simply
+  # never arrived for one version of an otherwise-successful run does not.
+  # Kept as its own flag, computed once, so the two are never conflated below.
+  is_run_failure <- !identical(outcome, "ok") && !identical(outcome, "unsandboxed")
+  # run_citation_reader() returns "" (not NA) for a clean run; that must not
+  # be stored as though it were a real explanation.
+  run_message <- if (length(run_message) != 1L || is.na(run_message) ||
+                     !nzchar(run_message)) NA_character_ else run_message
 
   parsed <- list()
   for (l in lines) {
@@ -353,7 +363,7 @@ parse_citation_records <- function(lines, inputs_df, outcome) {
     doc <- by_id[[id]]
     rel_known <- as.integer(!is.na(inputs_df$released[[k]]))
 
-    if (!identical(outcome, "ok") && !identical(outcome, "unsandboxed")) {
+    if (is_run_failure) {
       status <- outcome; doc <- NULL
     } else if (is.null(doc)) {
       status <- "crashed"
@@ -465,7 +475,9 @@ parse_citation_records <- function(lines, inputs_df, outcome) {
       is_current = as.integer(inputs_df$is_current[[k]]),
       payload_id = payload_id, source_sha256 = inputs_df$source_sha256[[k]],
       status = status, sandboxed = sandboxed, released_known = rel_known,
-      message = if (is.null(doc)) NA_character_ else .cit_chr(doc$message),
+      message = if (is_run_failure) run_message
+                 else if (is.null(doc)) NA_character_
+                 else .cit_chr(doc$message),
       evaluated_at = now, stringsAsFactors = FALSE)
   }
 
@@ -519,19 +531,67 @@ citation_pass <- function(inputs_df, reader_path) {
   tryCatch({
     run <- run_citation_reader(inputs_df, reader_path)
     if (identical(run$outcome, "skipped")) return(empty)
-    parse_citation_records(run$lines, inputs_df, run$outcome)
+    # run$message carries a whole-run explanation (e.g. "a container is
+    # required to evaluate citation files") that applies to every row this
+    # call produces, not to any one version's own record. Threaded through
+    # rather than discarded, or a misconfigured run (wrong reader path, a
+    # required sandbox that never started) is indistinguishable in the stored
+    # data from every version's reader having independently crashed.
+    parse_citation_records(run$lines, inputs_df, run$outcome, run$message)
   }, error = function(e) {
     warning(sprintf("citation pass failed for '%s': %s",
                     inputs_df$package[[1L]], conditionMessage(e)))
-    list(citations = parse_citation_records(character(0L), inputs_df, "crashed")$citations,
-         payloads  = .empty_citation_payloads_df(),
-         entries   = .empty_citation_entries_df())
+    # A second tryCatch, not just the outer one: parse_citation_records() has
+    # its own stopifnot assertions, and this fallback call must not be able to
+    # throw either. Only "crashed" ever reaches it here, which is why those
+    # assertions cannot fire today, but that is a fact about the current call
+    # site, not a guarantee parse_citation_records() itself makes - the
+    # "nothing here can throw" contract this function exists for should not
+    # depend on that staying true.
+    tryCatch(
+      list(citations = parse_citation_records(character(0L), inputs_df, "crashed")$citations,
+           payloads  = .empty_citation_payloads_df(),
+           entries   = .empty_citation_entries_df()),
+      error = function(e2) empty
+    )
   })
 }
 
-#' Path to the reader script, resolved the way update.R resolves its own sources.
+#' Directory this file was itself source()d from, found by walking the call
+#' stack for a source() frame's own `ofile` local rather than trusting the
+#' process's entry point. commandArgs()'s --file= names whatever script
+#' Rscript was originally invoked on; that is scripts/update.R in production,
+#' but under testthat it is tests/testthat.R while the working directory has
+#' already been moved to tests/testthat/, and any future wrapper that
+#' source()s update.R inherits the same mismatch. Computed once at source
+#' time, since sys.frame() only sees frames live on the stack right now.
+.CITATION_SOURCE_DIR <- local({
+  d <- NA_character_
+  for (i in seq_len(sys.nframe())) {
+    of <- sys.frame(i)$ofile
+    if (is.character(of) && length(of) == 1L && nzchar(of))
+      d <- dirname(normalizePath(of, mustWork = FALSE))
+  }
+  d
+})
+
+#' Path to the reader script.
+#'
+#' Tried in order: the directory citation.R was itself source()d from (correct
+#' regardless of what the process's entry point was), then the entry-point-based
+#' guess update.R's own CLI block uses for its sources, then a bare "scripts/"
+#' fallback. Each candidate is required to actually exist before being
+#' returned, so a resolution failure here is loud (the caller sees a path that
+#' fails file.exists()) rather than silently producing a wrong-but-plausible
+#' string that only fails once run_citation_reader() tries to use it.
 citation_reader_path <- function() {
+  if (!is.na(.CITATION_SOURCE_DIR)) {
+    p <- file.path(.CITATION_SOURCE_DIR, "cite_reader.R")
+    if (file.exists(p)) return(p)
+  }
   fa <- grep("^--file=", commandArgs(FALSE), value = TRUE)
   base <- if (length(fa) >= 1L) dirname(sub("^--file=", "", fa[1L])) else "scripts"
-  file.path(base, "cite_reader.R")
+  p <- file.path(base, "cite_reader.R")
+  if (file.exists(p)) return(p)
+  file.path("scripts", "cite_reader.R")
 }

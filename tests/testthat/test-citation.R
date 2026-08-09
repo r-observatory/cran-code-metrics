@@ -468,11 +468,22 @@ test_that(".empty_citations_df() has exactly the ten columns in order, matching 
 test_that("a package with no citation-bearing version returns empty frames", {
   # The reader must not be launched at all. Starting a container per package
   # regardless of whether it has anything to read would multiply the cost of the
-  # three quarters of CRAN that ships no citation file.
+  # three quarters of CRAN that ships no citation file. Asserted directly by
+  # counting calls, not just by inspecting the (necessarily empty) result: an
+  # empty result is also what a container that started and returned nothing
+  # would produce, so checking only the frames would not catch a regression
+  # that launches the reader anyway.
+  calls <- 0L
+  old <- run_citation_reader
+  assign("run_citation_reader", function(...) { calls <<- calls + 1L; old(...) },
+         envir = environment(citation_pass))
+  on.exit(assign("run_citation_reader", old, envir = environment(citation_pass)), add = TRUE)
+
   got <- citation_pass(.empty_citation_inputs_df(), "scripts/cite_reader.R")
   expect_equal(nrow(got$citations), 0L)
   expect_equal(nrow(got$payloads), 0L)
   expect_equal(nrow(got$entries), 0L)
+  expect_equal(calls, 0L)
 })
 
 test_that("a citation pass survives a reader that cannot start", {
@@ -489,7 +500,45 @@ test_that("a citation pass survives a reader that cannot start", {
                     released = "2024-01-01", source_sha256 = strrep("a", 64L),
                     dir = d, stringsAsFactors = FALSE)
 
-  got <- citation_pass(inp, "no/such/reader.R")
+  # expect_warning() rather than letting it pass silently: keeps the suite's
+  # warning count meaningful, and pins down that this specific path (a reader
+  # that cannot be found at all) is what produced the crash.
+  got <- expect_warning(citation_pass(inp, "no/such/reader.R"), "No such file")
   expect_equal(nrow(got$citations), 1L)
-  expect_true(got$citations$status %in% c("crashed", "timeout"))
+  # Indexed to a scalar rather than relying on %in% over the whole column:
+  # correct today at one row, but %in% over a longer vector would still pass
+  # if only some rows matched, silently the wrong shape should this fixture
+  # ever grow to more than one version.
+  expect_true(got$citations$status[[1L]] %in% c("crashed", "timeout"))
+})
+
+test_that("citation_reader_path() resolves to a file that actually exists", {
+  # A guard against IMPORTANT 1 regressing silently: an unresolvable reader
+  # path degrades to every version reading as "crashed" with no error
+  # anywhere, which is indistinguishable from the reader itself failing.
+  expect_true(file.exists(citation_reader_path()))
+})
+
+test_that("a whole-run failure's message reaches every row it produces", {
+  # run_citation_reader()'s own message (e.g. "a container is required to
+  # evaluate citation files") explains every row alike; discarding it makes a
+  # single misconfigured run indistinguishable from many independent crashes.
+  inp <- cit_inputs(list(id = "k1", version = "1.0"), list(id = "k2", version = "2.0"))
+  got <- parse_citation_records(character(0L), inp, "crashed", "a container is required")
+  expect_equal(got$citations$message, rep("a container is required", 2L))
+})
+
+test_that("a whole-run message is not attached to a per-version doc that simply never arrived", {
+  # An "ok" run missing one version's doc record is a different fact from a
+  # run that never started, and must not be reported with the same message.
+  inp <- cit_inputs(list(id = "k1", version = "1.0"))
+  got <- parse_citation_records(character(0L), inp, "ok", "should not appear")
+  expect_equal(got$citations$status, "crashed")
+  expect_true(is.na(got$citations$message))
+})
+
+test_that("an empty run message normalises to NA, not to an empty string", {
+  inp <- cit_inputs(list(id = "k1", version = "1.0"))
+  got <- parse_citation_records(character(0L), inp, "timeout", "")
+  expect_true(is.na(got$citations$message))
 })

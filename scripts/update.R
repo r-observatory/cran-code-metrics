@@ -381,6 +381,12 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     on.exit(unlink(dest, recursive = TRUE, force = TRUE), add = TRUE)
     on.exit(setTimeLimit(), add = TRUE)
     setTimeLimit(elapsed = WORKER_TIMEOUT, transient = TRUE)
+    # Published so analyze_package()'s citation pass can restore the elapsed
+    # limit against this package's real deadline rather than starting a fresh
+    # clock of its own: setTimeLimit() restarts its clock on every call, so
+    # timing from the citation call's own start would silently grant the
+    # package a second WORKER_TIMEOUT on top of whatever it had already spent.
+    .worker_deadline <<- Sys.time() + WORKER_TIMEOUT
     ok <- tryCatch(io$clone(pkg, dest), error = function(e) FALSE)
     if (!isTRUE(ok)) {
       .done(FALSE, "clone", 0L)

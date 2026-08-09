@@ -966,11 +966,21 @@ analyze_package <- function(repo_dir, package) {
   # elapsed-time limit is cleared across the call and restored after it: the
   # limit does not fire during a blocking system2 but does as soon as one
   # returns, and an error there would cost this package every metric above.
-  .cit_saved <- Sys.time()
+  # Restored against the worker's own published deadline (scripts/update.R),
+  # not against a freshly-started clock here: setTimeLimit() restarts its
+  # clock on every call, so timing from this call's own start rather than the
+  # worker's would silently grant the package a second WORKER_TIMEOUT on top
+  # of whatever it had already spent before the citation pass ran. Falls back
+  # to a fresh WORKER_TIMEOUT-from-now when called outside the worker (direct
+  # test calls), where no such deadline has been published.
   setTimeLimit()
   citation_out <- citation_pass(citation_inputs_df, citation_reader_path())
-  setTimeLimit(elapsed = max(30, WORKER_TIMEOUT -
-                 as.numeric(difftime(Sys.time(), .cit_saved, units = "secs"))),
+  .cit_deadline <- if (exists(".worker_deadline", inherits = TRUE)) {
+    get(".worker_deadline", inherits = TRUE)
+  } else {
+    Sys.time() + WORKER_TIMEOUT
+  }
+  setTimeLimit(elapsed = max(30, as.numeric(difftime(.cit_deadline, Sys.time(), units = "secs"))),
                transient = TRUE)
 
   summary_df <- add_cross_version_metrics(summary_df, api_df, deprecation_series)

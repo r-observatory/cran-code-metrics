@@ -640,6 +640,8 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
 #'             file, line, loc, n_params, cyclocomp), latest version only
 #'   $edges    per-call-edge detail (package, version, graph, from, to),
 #'             latest version only
+#'   $citation_inputs  one row per version shipping inst/CITATION, carrying the
+#'             staging directory the reader will be given
 #'
 #' Per-function and per-call-edge detail is emitted only by the analyzer binary
 #' and only for the package's latest version (the last row of versions_df, which
@@ -653,12 +655,19 @@ analyze_package <- function(repo_dir, package) {
   versions_df <- list_versions(repo_dir)
   churn_all   <- package_churn(repo_dir)
 
+  # One staging root per package. The container mounts a subdirectory of this
+  # and nothing else, so it is created here and removed when the package is done.
+  cit_stage <- tempfile(pattern = paste0("ccm_cit_", package, "_"))
+  dir.create(cit_stage, recursive = TRUE)
+  on.exit(unlink(cit_stage, recursive = TRUE, force = TRUE), add = TRUE)
+
   summary_rows       <- vector("list", nrow(versions_df))
   api_rows           <- vector("list", nrow(versions_df))
   functions_rows     <- vector("list", nrow(versions_df))
   edges_rows         <- vector("list", nrow(versions_df))
   datasets_rows      <- vector("list", nrow(versions_df))
   vignettes_rows     <- vector("list", nrow(versions_df))
+  citation_inputs    <- vector("list", nrow(versions_df))
   prev_exports       <- NULL
   deprecation_series <- vector("list", nrow(versions_df))
   # Time-gated per-version heartbeat. A single package with thousands of versions
@@ -851,9 +860,19 @@ analyze_package <- function(repo_dir, package) {
         .empty_vignettes_rows()
       }
 
+      # Two files per citation-bearing version, staged for the reader. Nothing
+      # is evaluated here; this only decides what the container will be allowed
+      # to see.
+      citation_input <- tryCatch(
+        stage_citation_inputs(tmp, cit_stage, package, v,
+                              as.integer(is_latest), date),
+        error = function(e) .empty_citation_inputs_df()
+      )
+
       list(safe_metrics = safe_metrics, api_row = api_row, prev_exports = curr_exports,
            dep_sig = dep_sig, functions_row = functions_row, edges_row = edges_row,
-           datasets_row = datasets_row, vignettes_row = vignettes_row)
+           datasets_row = datasets_row, vignettes_row = vignettes_row,
+           citation_input = citation_input)
     })
 
     summary_rows[[i]]       <- iter$safe_metrics
@@ -862,6 +881,7 @@ analyze_package <- function(repo_dir, package) {
     edges_rows[[i]]         <- iter$edges_row
     datasets_rows[[i]]      <- iter$datasets_row
     vignettes_rows[[i]]     <- iter$vignettes_row
+    citation_inputs[[i]]    <- iter$citation_input
     prev_exports            <- iter$prev_exports
     deprecation_series[[i]] <- iter$dep_sig
   }
@@ -936,6 +956,12 @@ analyze_package <- function(repo_dir, package) {
     .empty_vignettes_rows()
   }
 
+  citation_inputs_df <- if (length(citation_inputs) > 0L) {
+    do.call(rbind, citation_inputs)
+  } else {
+    .empty_citation_inputs_df()
+  }
+
   summary_df <- add_cross_version_metrics(summary_df, api_df, deprecation_series)
 
   list(
@@ -945,6 +971,7 @@ analyze_package <- function(repo_dir, package) {
     functions = functions_df,
     edges     = edges_df,
     datasets  = datasets_df,
-    vignettes = vignettes_df
+    vignettes = vignettes_df,
+    citation_inputs = citation_inputs_df
   )
 }

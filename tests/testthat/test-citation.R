@@ -129,3 +129,81 @@ test_that("an unsandboxed run is refused when the sandbox is required", {
   expect_equal(got$outcome, "crashed")
   expect_true(grepl("required", got$message))
 })
+
+test_that("staged files are made readable and traversable under a restrictive umask", {
+  # dir.create()/file.copy() apply the process umask. Under 077 that leaves
+  # the staged directory at 0700: a container uid other than the one that
+  # staged it could not even traverse in. run_citation_reader() must widen
+  # that regardless of what umask built it, or the container-uid read fails
+  # closed as a crash at best and, for the manifest specifically, open into a
+  # wrongly-recorded "ok" at worst (see the next test's sibling finding).
+  old_umask <- Sys.umask("0077")
+  on.exit(Sys.umask(old_umask), add = TRUE)
+
+  tmp <- withr::local_tempdir()
+  stg <- withr::local_tempdir()
+  dir.create(file.path(tmp, "inst"))
+  writeBin(charToRaw('bibentry("Misc", title = "t")\n'), file.path(tmp, "inst", "CITATION"))
+  writeLines("Package: p\nVersion: 1.0\n", file.path(tmp, "DESCRIPTION"))
+
+  got <- stage_citation_inputs(tmp, stg, "p", "1.0", 1L, "2024-01-01")
+  expect_equal(nrow(got), 1L)
+
+  # The umask actually produced a restrictive tree - otherwise the assertions
+  # below would pass whether or not the fix does anything.
+  expect_equal(format(file.info(got$dir)$mode), "700")
+
+  run_citation_reader(got, file.path("..", "..", "scripts", "cite_reader.R"))
+
+  expect_equal(format(file.info(got$dir)$mode), "755")
+  expect_equal(format(file.info(file.path(got$dir, "inst"))$mode), "755")
+  expect_equal(format(file.info(file.path(got$dir, "inst", "CITATION"))$mode), "644")
+  expect_equal(format(file.info(file.path(got$dir, "DESCRIPTION"))$mode), "644")
+})
+
+test_that("the container argument vector carries every isolation flag and mounts nothing extra", {
+  argv <- .citation_docker_argv("/host/stage", "/host/stage/out.ndjson",
+                                file.path("..", "..", "scripts", "cite_reader.R"),
+                                "rocker/r-ver:4.4.1")
+
+  flag_value <- function(flag) {
+    i <- which(argv == flag)
+    expect_length(i, 1L)
+    argv[[i + 1L]]
+  }
+
+  expect_equal(flag_value("--network"), "none")
+  expect_true("--read-only" %in% argv)
+  expect_equal(flag_value("--cap-drop"), "ALL")
+  expect_equal(flag_value("--security-opt"), "no-new-privileges")
+  # Non-root: both uid and gid are positive, so "0", "0:0" and "" all fail.
+  expect_match(flag_value("--user"), "^[1-9][0-9]*:[1-9][0-9]*$")
+  expect_true(nzchar(flag_value("--pids-limit")))
+  expect_true(nzchar(flag_value("--memory")))
+  expect_true(nzchar(flag_value("--cpus")))
+  expect_match(flag_value("--tmpfs"), "^/tmp:")
+
+  # Exactly three host mounts: the read-only stage, the read-only reader
+  # script, and the one writable output file. Nothing else from the host.
+  mounts <- argv[which(argv == "-v") + 1L]
+  expect_length(mounts, 3L)
+
+  stage_mount  <- mounts[startsWith(mounts, "/host/stage:")]
+  reader_mount <- mounts[grepl(":/reader\\.R:", mounts, fixed = FALSE)]
+  out_mount    <- mounts[grepl(":/out\\.ndjson:", mounts, fixed = FALSE)]
+  expect_length(stage_mount, 1L)
+  expect_length(reader_mount, 1L)
+  expect_length(out_mount, 1L)
+  expect_true(endsWith(stage_mount, ":ro"))
+  expect_true(endsWith(reader_mount, ":ro"))
+  expect_true(endsWith(out_mount, ":rw"))
+
+  # The output mount is the only writable one.
+  expect_equal(mounts[endsWith(mounts, ":rw")], out_mount)
+
+  # The command run inside the container names container-side paths, never
+  # the host paths that were just asserted above.
+  n <- length(argv)
+  expect_equal(argv[(n - 4L):n],
+              c("Rscript", "--vanilla", "/reader.R", "/stage/manifest.tsv", "/out.ndjson"))
+})

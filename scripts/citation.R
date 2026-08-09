@@ -116,6 +116,60 @@ citation_sandbox_mode <- function() {
   "ok"
 }
 
+#' Make a staged tree traversable and readable by any uid.
+#'
+#' dir.create() and file.copy() apply the process umask, so under a
+#' restrictive umask (027, 077) the tree stage_citation_inputs() built can
+#' come out 0750 or 0700. The container's non-root user then cannot even
+#' traverse into /stage/<id>. That does not crash: the reader's per-job
+#' tryCatch turns the resulting open() failure into a "status":"error" record
+#' for every job, the terminator still gets written, and .citation_outcome()
+#' reports "ok" - a failure that fails open into permanently wrong data is
+#' worse than one that crashes. Fixed here, right before the reader runs, so
+#' it covers whatever staging produced regardless of the umask that built it.
+.citation_make_stage_readable <- function(root) {
+  paths <- list.files(root, recursive = TRUE, all.files = TRUE,
+                      full.names = TRUE, include.dirs = TRUE, no.. = TRUE)
+  paths <- c(root, paths)
+  is_dir <- file.info(paths)$isdir
+  is_dir[is.na(is_dir)] <- FALSE
+  # a+rX: directories get read+traverse, files get read only. use_umask =
+  # FALSE so the umask that caused the problem cannot re-narrow the fix.
+  if (any(is_dir))  Sys.chmod(paths[is_dir],  mode = "0755", use_umask = FALSE)
+  if (any(!is_dir)) Sys.chmod(paths[!is_dir], mode = "0644", use_umask = FALSE)
+}
+
+#' Build the docker argument vector that runs the reader with nothing else
+#' reachable.
+#'
+#' Extracted from run_citation_reader() so the flag set has one definition and
+#' so it can be unit-tested without a daemon: these flags are the security
+#' boundary, and a dropped or misspelled one would otherwise fail nothing.
+#'
+#' @param root Host staging root, mounted read-only at /stage.
+#' @param outf Host output file, mounted read-write at /out.ndjson.
+#' @param reader_path Path to scripts/cite_reader.R, mounted read-only at /reader.R.
+#' @param image Image reference to run.
+#' @return Character vector of docker arguments, command name not included.
+.citation_docker_argv <- function(root, outf, reader_path, image) {
+  c("run", "--rm",
+    "--network", "none",
+    "--read-only",
+    "--cap-drop", "ALL",
+    "--security-opt", "no-new-privileges",
+    "--user", "65534:65534",
+    "--pids-limit", "128",
+    "--memory", "1g",
+    "--cpus", "1",
+    "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+    "-v", paste0(root, ":/stage:ro"),
+    "-v", paste0(outf, ":/out.ndjson:rw"),
+    "-v", paste0(normalizePath(reader_path), ":/reader.R:ro"),
+    "-e", "HOME=/tmp",
+    image,
+    "Rscript", "--vanilla", "/reader.R", "/stage/manifest.tsv", "/out.ndjson")
+}
+
 #' Evaluate one package's staged citation files.
 #'
 #' One container per package. Never one per version, because container start
@@ -151,24 +205,15 @@ run_citation_reader <- function(inputs_df, reader_path) {
                    ifelse(is.na(inputs_df$released), "NA", inputs_df$released),
                    sep = "\t"), man)
   file.create(outf)
+  # Sweep the whole staging root readable first - this also covers man, which
+  # the container reads from /stage - then widen outf last, after the sweep,
+  # so the sweep's own 0644 on outf (it is a file under root too) does not
+  # clobber the write grant the container needs to produce it.
+  .citation_make_stage_readable(root)
+  Sys.chmod(outf, mode = "0666", use_umask = FALSE)
 
   argv <- if (mode == "docker") {
-    c("run", "--rm",
-      "--network", "none",
-      "--read-only",
-      "--cap-drop", "ALL",
-      "--security-opt", "no-new-privileges",
-      "--user", "65534:65534",
-      "--pids-limit", "128",
-      "--memory", "1g",
-      "--cpus", "1",
-      "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
-      "-v", paste0(root, ":/stage:ro"),
-      "-v", paste0(outf, ":/out.ndjson:rw"),
-      "-v", paste0(normalizePath(reader_path), ":/reader.R:ro"),
-      "-e", "HOME=/tmp",
-      CITATION_IMAGE,
-      "Rscript", "--vanilla", "/reader.R", "/stage/manifest.tsv", "/out.ndjson")
+    .citation_docker_argv(root, outf, reader_path, CITATION_IMAGE)
   } else {
     c("--vanilla", normalizePath(reader_path), man, outf)
   }

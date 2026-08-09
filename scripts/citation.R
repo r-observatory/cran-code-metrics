@@ -237,7 +237,8 @@ run_citation_reader <- function(inputs_df, reader_path) {
   data.frame(package = character(0L), version = character(0L),
              is_current = integer(0L), payload_id = character(0L),
              source_sha256 = character(0L), status = character(0L),
-             released_known = integer(0L), message = character(0L),
+             sandboxed = integer(0L), released_known = integer(0L),
+             message = character(0L),
              evaluated_at = character(0L), stringsAsFactors = FALSE)
 }
 
@@ -309,6 +310,13 @@ parse_citation_records <- function(lines, inputs_df, outcome) {
   }
   now <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
   want <- basename(inputs_df$dir)
+  # Derived from the outcome this call was handed, never from anything in a
+  # doc record: a package's own CITATION file has no way to know or claim
+  # which boundary read it, and this column exists so that fact can never be
+  # confused with the doc's own status. The unsandboxed path exists so local
+  # work is possible at all; the condition on allowing it is that its output
+  # can never be mistaken for a run that went through the container.
+  sandboxed <- if (identical(outcome, "unsandboxed")) 0L else 1L
 
   parsed <- list()
   for (l in lines) {
@@ -456,7 +464,7 @@ parse_citation_records <- function(lines, inputs_df, outcome) {
       package = inputs_df$package[[k]], version = inputs_df$version[[k]],
       is_current = as.integer(inputs_df$is_current[[k]]),
       payload_id = payload_id, source_sha256 = inputs_df$source_sha256[[k]],
-      status = status, released_known = rel_known,
+      status = status, sandboxed = sandboxed, released_known = rel_known,
       message = if (is.null(doc)) NA_character_ else .cit_chr(doc$message),
       evaluated_at = now, stringsAsFactors = FALSE)
   }
@@ -477,7 +485,14 @@ parse_citation_records <- function(lines, inputs_df, outcome) {
   stopifnot(
     "citations$status must never be NA" = !anyNA(citations$status),
     "citations$status must be one of the known statuses" =
-      all(citations$status %in% known_statuses)
+      all(citations$status %in% known_statuses),
+    # sandboxed is not read from a record, so it cannot inherit the NA/enum
+    # holes doc$status could - but it holds the same NOT NULL contract, and
+    # a debug run mistaken for a production one is exactly the failure this
+    # column exists to rule out, so it gets the same loud check.
+    "citations$sandboxed must never be NA" = !anyNA(citations$sandboxed),
+    "citations$sandboxed must be 0 or 1" =
+      all(citations$sandboxed %in% c(0L, 1L))
   )
 
   list(

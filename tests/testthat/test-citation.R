@@ -417,3 +417,50 @@ test_that("a doc record with no status key at all is malformed", {
   expect_equal(got$citations$status, "malformed")
   expect_false(anyNA(got$citations$status))
 })
+
+# --- sandboxed records how a citation was read, independently of whether it
+# was read successfully: a debug run must never be mistaken for one that
+# went through the container, and that fact is not something a doc record
+# (code a package author wrote) gets any say in.
+
+test_that("an unsandboxed outcome yields sandboxed 0 while the doc's own status is preserved", {
+  inp <- cit_inputs(list(id = "k1", version = "1.0"))
+  doc <- '{"t":"doc","id":"k1","status":"empty","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}'
+  got <- parse_citation_records(c(doc, '{"t":"end"}'), inp, "unsandboxed")
+  expect_equal(got$citations$sandboxed, 0L)
+  # sandboxed must never be conflated with status: the doc said "empty", and
+  # that is still what is stored, not "unsandboxed".
+  expect_equal(got$citations$status, "empty")
+})
+
+test_that("an ok outcome yields sandboxed 1", {
+  inp <- cit_inputs(list(id = "k1", version = "1.0"))
+  doc <- '{"t":"doc","id":"k1","status":"empty","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}'
+  got <- parse_citation_records(c(doc, '{"t":"end"}'), inp, "ok")
+  expect_equal(got$citations$sandboxed, 1L)
+})
+
+test_that("timeout, crashed and skipped outcomes all yield a non-NA sandboxed", {
+  inp <- cit_inputs(list(id = "k1", version = "1.0"))
+  for (oc in c("timeout", "crashed", "skipped")) {
+    got <- parse_citation_records(character(0L), inp, oc)
+    expect_false(anyNA(got$citations$sandboxed), info = oc)
+    expect_equal(got$citations$sandboxed, 1L, info = oc)
+    expect_equal(got$citations$status, oc, info = oc)
+  }
+})
+
+test_that(".empty_citations_df() has exactly the ten columns in order, matching a populated frame", {
+  want_names <- c("package", "version", "is_current", "payload_id",
+                  "source_sha256", "status", "sandboxed", "released_known",
+                  "message", "evaluated_at")
+  empty <- .empty_citations_df()
+  expect_equal(names(empty), want_names)
+  expect_equal(nrow(empty), 0L)
+
+  inp <- cit_inputs(list(id = "k1", version = "1.0"))
+  doc <- '{"t":"doc","id":"k1","status":"empty","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}'
+  populated <- parse_citation_records(c(doc, '{"t":"end"}'), inp, "ok")$citations
+  expect_equal(names(populated), want_names)
+  expect_equal(names(empty), names(populated))
+})

@@ -232,3 +232,173 @@ run_citation_reader <- function(inputs_df, reader_path) {
   if (outcome == "ok" && mode != "docker") outcome <- "unsandboxed"
   list(lines = lines, outcome = outcome, message = "")
 }
+
+.empty_citations_df <- function() {
+  data.frame(package = character(0L), version = character(0L),
+             is_current = integer(0L), payload_id = character(0L),
+             source_sha256 = character(0L), status = character(0L),
+             released_known = integer(0L), message = character(0L),
+             evaluated_at = character(0L), stringsAsFactors = FALSE)
+}
+
+.empty_citation_payloads_df <- function() {
+  data.frame(payload_id = character(0L), n_entries = integer(0L),
+             mheader = character(0L), mfooter = character(0L),
+             header_scope = character(0L), stringsAsFactors = FALSE)
+}
+
+.empty_citation_entries_df <- function() {
+  data.frame(payload_id = character(0L), entry_index = integer(0L),
+             bibtype = character(0L), title = character(0L), year = character(0L),
+             authors_json = character(0L), fields_json = character(0L),
+             text_version_json = character(0L), header = character(0L),
+             footer = character(0L), entry_key = character(0L),
+             fmt_bibtex = character(0L), fmt_citation = character(0L),
+             stringsAsFactors = FALSE)
+}
+
+.cit_chr <- function(x) if (is.null(x)) NA_character_ else as.character(x)[[1L]]
+
+.cit_valid <- function(x) {
+  x <- x[!is.na(x)]
+  length(x) == 0L || all(validUTF8(enc2utf8(x)))
+}
+
+#' Turn one package's reader output into the three frames the DB stores.
+#'
+#' Every record is matched against the manifest that was asked for. A record
+#' naming an id that was never requested is discarded: the container evaluates
+#' code an author wrote, and a forged record must not become another package's
+#' citation. A requested version with no record is recorded as crashed rather
+#' than as empty, because "we could not read it" and "it ships none" are
+#' different facts and the viewer says different things about them.
+parse_citation_records <- function(lines, inputs_df, outcome) {
+  if (is.null(inputs_df) || nrow(inputs_df) == 0L) {
+    return(list(citations = .empty_citations_df(),
+                payloads  = .empty_citation_payloads_df(),
+                entries   = .empty_citation_entries_df()))
+  }
+  now <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+  want <- basename(inputs_df$dir)
+
+  parsed <- list()
+  for (l in lines) {
+    if (!nzchar(l) || identical(l, "{\"t\":\"end\"}")) next
+    r <- tryCatch(jsonlite::fromJSON(l, simplifyVector = FALSE),
+                  error = function(e) NULL)
+    if (is.null(r) || is.null(r$id) || !(r$id %in% want)) next
+    parsed[[length(parsed) + 1L]] <- r
+  }
+
+  docs <- Filter(function(r) identical(r$t, "doc"), parsed)
+  ents <- Filter(function(r) identical(r$t, "entry"), parsed)
+  by_id <- setNames(docs, vapply(docs, function(r) r$id, character(1)))
+
+  cit_rows <- list(); pay_rows <- list(); ent_rows <- list()
+
+  for (k in seq_len(nrow(inputs_df))) {
+    id  <- want[[k]]
+    doc <- by_id[[id]]
+    rel_known <- as.integer(!is.na(inputs_df$released[[k]]))
+
+    if (!identical(outcome, "ok") && !identical(outcome, "unsandboxed")) {
+      status <- outcome; doc <- NULL
+    } else if (is.null(doc)) {
+      status <- "crashed"
+    } else {
+      status <- .cit_chr(doc$status)
+    }
+
+    payload_id <- NA_character_
+    if (!is.null(doc) && status %in% c("ok", "empty")) {
+      mine <- Filter(function(r) identical(r$id, id), ents)
+      mine <- mine[order(vapply(mine, function(r) as.integer(r$i), integer(1)))]
+
+      cols <- function(r) c(.cit_chr(r$bibtype), .cit_chr(r$title), .cit_chr(r$year),
+                            .cit_chr(r$header), .cit_chr(r$footer), .cit_chr(r$key),
+                            .cit_chr(r$bibtex), .cit_chr(r$citation))
+      texts <- c(.cit_chr(doc$mheader), .cit_chr(doc$mfooter),
+                 unlist(lapply(mine, cols), use.names = FALSE))
+
+      # JSON forbids invalid UTF-8 bytes in string content, so a corrupted
+      # field never survives as a string for .cit_valid() below to inspect:
+      # the whole line fails jsonlite::fromJSON() instead, and that entry
+      # silently disappears from `ents` above rather than erroring here. A
+      # doc that promised n_entries entries but yielded fewer is the only
+      # remaining signal that something was dropped, and that mismatch is
+      # treated as corruption rather than as a document with fewer entries
+      # than it claims.
+      declared_n <- suppressWarnings(as.integer(.cit_chr(doc$n_entries)))
+      if (!is.na(declared_n) && length(mine) != declared_n) {
+        status <- "malformed"
+      } else if (!.cit_valid(texts)) {
+        status <- "malformed"
+      } else {
+        # Content only: r$t and r$id are the job's own bookkeeping, not part
+        # of what a reader sees rendered, and hashing them in would key the
+        # payload to which version produced it rather than to what it says -
+        # the exact dedup this hash exists to do would then never fire, since
+        # id differs on every version by construction.
+        entry_body <- function(r) jsonlite::toJSON(list(
+          bibtype = .cit_chr(r$bibtype), title = .cit_chr(r$title),
+          year = .cit_chr(r$year), authors = r$authors, fields = r$fields,
+          text_version = r$text_version, header = .cit_chr(r$header),
+          footer = .cit_chr(r$footer), key = .cit_chr(r$key),
+          bibtex = .cit_chr(r$bibtex), citation = .cit_chr(r$citation)
+        ), auto_unbox = TRUE)
+        body <- paste(vapply(mine, function(r) as.character(entry_body(r)),
+                             character(1)), collapse = "\n")
+        payload_id <- digest::digest(
+          paste(.cit_chr(doc$mheader), .cit_chr(doc$mfooter),
+                .cit_chr(doc$header_scope), body, sep = "\x1f"),
+          algo = "sha256", serialize = FALSE)
+
+        pay_rows[[payload_id]] <- data.frame(
+          payload_id = payload_id,
+          n_entries  = length(mine),
+          mheader    = .cit_chr(doc$mheader),
+          mfooter    = .cit_chr(doc$mfooter),
+          header_scope = .cit_chr(doc$header_scope),
+          stringsAsFactors = FALSE)
+
+        if (is.null(ent_rows[[payload_id]]) && length(mine) > 0L) {
+          ent_rows[[payload_id]] <- do.call(rbind, lapply(seq_along(mine), function(i) {
+            r <- mine[[i]]
+            data.frame(
+              payload_id  = payload_id,
+              entry_index = i,
+              bibtype     = .cit_chr(r$bibtype),
+              title       = .cit_chr(r$title),
+              year        = .cit_chr(r$year),
+              authors_json = as.character(jsonlite::toJSON(r$authors, auto_unbox = TRUE)),
+              fields_json  = as.character(jsonlite::toJSON(r$fields,  auto_unbox = TRUE)),
+              text_version_json = as.character(jsonlite::toJSON(r$text_version,
+                                                               auto_unbox = FALSE)),
+              header    = .cit_chr(r$header),
+              footer    = .cit_chr(r$footer),
+              entry_key = .cit_chr(r$key),
+              fmt_bibtex   = .cit_chr(r$bibtex),
+              fmt_citation = .cit_chr(r$citation),
+              stringsAsFactors = FALSE)
+          }))
+        }
+      }
+    }
+
+    cit_rows[[k]] <- data.frame(
+      package = inputs_df$package[[k]], version = inputs_df$version[[k]],
+      is_current = as.integer(inputs_df$is_current[[k]]),
+      payload_id = payload_id, source_sha256 = inputs_df$source_sha256[[k]],
+      status = status, released_known = rel_known,
+      message = if (is.null(doc)) NA_character_ else .cit_chr(doc$message),
+      evaluated_at = now, stringsAsFactors = FALSE)
+  }
+
+  list(
+    citations = do.call(rbind, cit_rows) %||% .empty_citations_df(),
+    payloads  = if (length(pay_rows)) do.call(rbind, unname(pay_rows))
+                else .empty_citation_payloads_df(),
+    entries   = if (length(ent_rows)) do.call(rbind, unname(ent_rows))
+                else .empty_citation_entries_df()
+  )
+}

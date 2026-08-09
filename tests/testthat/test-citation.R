@@ -207,3 +207,78 @@ test_that("the container argument vector carries every isolation flag and mounts
   expect_equal(argv[(n - 4L):n],
               c("Rscript", "--vanilla", "/reader.R", "/stage/manifest.tsv", "/out.ndjson"))
 })
+
+cit_inputs <- function(...) {
+  rows <- list(...)
+  do.call(rbind, lapply(rows, function(r) {
+    data.frame(package = r$package %||% "p", version = r$version,
+               is_current = r$is_current %||% 0L, released = "2024-01-01",
+               source_sha256 = r$sha %||% strrep("a", 64L),
+               dir = file.path(tempdir(), r$id), stringsAsFactors = FALSE)
+  }))
+}
+
+test_that("a record whose id was never requested is refused", {
+  # The container evaluates code an author wrote. A forged record naming another
+  # package must not become that package's citation.
+  inp <- cit_inputs(list(id = "k1", version = "1.0", is_current = 1L))
+  lines <- c('{"t":"doc","id":"k1","status":"ok","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}',
+             '{"t":"doc","id":"FORGED","status":"ok","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}',
+             '{"t":"end"}')
+  got <- parse_citation_records(lines, inp, "ok")
+  expect_equal(nrow(got$citations), 1L)
+  expect_equal(got$citations$package, "p")
+})
+
+test_that("a version whose doc record never arrived is recorded as crashed", {
+  inp <- cit_inputs(list(id = "k1", version = "1.0"), list(id = "k2", version = "2.0"))
+  lines <- c('{"t":"doc","id":"k1","status":"empty","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}',
+             '{"t":"end"}')
+  got <- parse_citation_records(lines, inp, "ok")
+  expect_equal(nrow(got$citations), 2L)
+  st <- setNames(got$citations$status, got$citations$version)
+  expect_equal(unname(st[["1.0"]]), "empty")
+  expect_equal(unname(st[["2.0"]]), "crashed")
+})
+
+test_that("identical results across versions share one payload row", {
+  inp <- cit_inputs(list(id = "k1", version = "1.0"), list(id = "k2", version = "2.0"))
+  doc <- function(id) sprintf('{"t":"doc","id":"%s","status":"ok","n_entries":1,"mheader":null,"mfooter":null,"header_scope":"none","message":null}', id)
+  ent <- function(id) sprintf('{"t":"entry","id":"%s","i":1,"bibtype":"Misc","title":"T","year":"2001","authors":[],"fields":{},"text_version":[],"header":null,"footer":null,"key":null,"bibtex":"@Misc{,}","citation":"T"}', id)
+  got <- parse_citation_records(c(doc("k1"), ent("k1"), doc("k2"), ent("k2"), '{"t":"end"}'), inp, "ok")
+  expect_equal(nrow(got$citations), 2L)
+  expect_equal(length(unique(got$citations$payload_id)), 1L)
+  expect_equal(nrow(got$payloads), 1L)
+  expect_equal(nrow(got$entries), 1L)
+})
+
+test_that("a timeout marks every requested version, and writes no payload", {
+  inp <- cit_inputs(list(id = "k1", version = "1.0"))
+  got <- parse_citation_records(character(0L), inp, "timeout")
+  expect_equal(got$citations$status, "timeout")
+  expect_true(is.na(got$citations$payload_id))
+  expect_equal(nrow(got$payloads), 0L)
+})
+
+test_that("invalid UTF-8 in a field fails the record rather than storing it", {
+  # json_encode in the viewer returns false on a malformed byte, which empties
+  # the payload script tag and silently kills the format picker for that package.
+  inp <- cit_inputs(list(id = "k1", version = "1.0"))
+  bad <- rawToChar(as.raw(c(0x41, 0xff, 0x42)))
+  lines <- c(sprintf('{"t":"doc","id":"k1","status":"ok","n_entries":1,"mheader":null,"mfooter":null,"header_scope":"none","message":null}'),
+             sprintf('{"t":"entry","id":"k1","i":1,"bibtype":"Misc","title":"%s","year":"2001","authors":[],"fields":{},"text_version":[],"header":null,"footer":null,"key":null,"bibtex":"@Misc{,}","citation":"T"}', bad),
+             '{"t":"end"}')
+  got <- parse_citation_records(lines, inp, "ok")
+  expect_equal(got$citations$status, "malformed")
+  expect_equal(nrow(got$entries), 0L)
+})
+
+test_that("an unresolvable release date is recorded as such rather than dropped", {
+  inp <- cit_inputs(list(id = "k1", version = "1.0"))
+  inp$released <- NA_character_
+  lines <- c('{"t":"doc","id":"k1","status":"error","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":"no known release date, so a citation year cannot be resolved"}',
+             '{"t":"end"}')
+  got <- parse_citation_records(lines, inp, "ok")
+  expect_equal(got$citations$status, "error")
+  expect_equal(got$citations$released_known, 0L)
+})

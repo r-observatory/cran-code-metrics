@@ -24,9 +24,6 @@
 #'   loc_vignettes  integer  LOC in vignettes/
 #'   compiled_share numeric  loc_src / loc_total (0 when loc_total == 0)
 #'   has_src        logical  any compiled source files present
-#'   has_citation   logical  inst/CITATION is shipped, so utils::citation()
-#'                           prints what the authors wrote rather than an entry
-#'                           built from DESCRIPTION
 #'   lang_breakdown character JSON object mapping file extension -> line count
 metrics_structure <- function(ctx) {
   files <- ctx$files
@@ -40,12 +37,6 @@ metrics_structure <- function(ctx) {
   is_tests     <- grepl("^tests/",     files)
   is_docs      <- grepl("^man/",       files)
   is_vignettes <- grepl("^vignettes/", files)
-  # The file utils::citation() reads. Detected here rather than from a
-  # repository tree because it ships inside the tarball: every CRAN package is
-  # covered, at the version that shipped it, including the ones with no public
-  # repository. Distinct from a CITATION.cff at a repository root, which is the
-  # CFF standard and a different file with a different reader.
-  has_citation <- any(files == "inst/CITATION")
 
   # Non-code / binary extensions excluded from LOC
   noncode_pat <- paste0(
@@ -107,7 +98,6 @@ metrics_structure <- function(ctx) {
     loc_vignettes  = loc_vignettes,
     compiled_share = compiled_share,
     has_src        = has_src,
-    has_citation   = has_citation,
     lang_breakdown = lang_breakdown
   )
 }

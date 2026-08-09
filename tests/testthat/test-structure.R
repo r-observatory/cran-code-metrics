@@ -109,33 +109,28 @@ test_that("metrics_structure handles empty file list (NA-safe)", {
   expect_equal(m$compiled_share, 0)
 })
 
-test_that("metrics_structure: inst/CITATION is detected as a shipped citation", {
+test_that("a shipped inst/CITATION is detected from the released file list", {
   # utils::citation() reads inst/CITATION from the installed package, so what
-  # matters is whether the tarball shipped one. That is what this file list is:
-  # the contents of a released version, not a repository at HEAD.
-  mk <- function(files) {
-    fm <- setNames(as.list(rep("x\n", length(files))), files)
-    build_context("mypkg", "1.0", "1.0", "2024-01-01", files,
-                  function(p) fm[[p]] %||% "")
-  }
-
-  with_it <- metrics_structure(mk(c("DESCRIPTION", "R/foo.R", "inst/CITATION")))
-  expect_true(with_it$has_citation)
-
-  without <- metrics_structure(mk(c("DESCRIPTION", "R/foo.R")))
-  expect_false(without$has_citation)
+  # matters is whether the tarball shipped one. Detected from the file list and
+  # not from extraction, so a failed extraction can never report a package as
+  # shipping no citation file when it ships one.
+  expect_equal(citation_shipped(c("DESCRIPTION", "R/foo.R", "inst/CITATION")), 1L)
+  expect_equal(citation_shipped(c("DESCRIPTION", "R/foo.R")), 0L)
 
   # A CITATION.cff at the root is the CFF standard, read by repository hosts.
   # It is not the file citation() reads and must not be mistaken for it.
-  cff <- metrics_structure(mk(c("DESCRIPTION", "CITATION.cff")))
-  expect_false(cff$has_citation)
+  expect_equal(citation_shipped(c("DESCRIPTION", "CITATION.cff")), 0L)
 
   # Nor is a CITATION anywhere else in the tree the installed one.
-  expect_false(metrics_structure(mk(c("CITATION")))$has_citation)
-  expect_false(metrics_structure(mk(c("man/CITATION")))$has_citation)
-  expect_false(metrics_structure(mk(c("inst/extdata/CITATION")))$has_citation)
+  expect_equal(citation_shipped("CITATION"), 0L)
+  expect_equal(citation_shipped("man/CITATION"), 0L)
+  expect_equal(citation_shipped("inst/extdata/CITATION"), 0L)
 
   # Shipping both is normal and each is reported on its own terms.
-  both <- metrics_structure(mk(c("inst/CITATION", "CITATION.cff")))
-  expect_true(both$has_citation)
+  expect_equal(citation_shipped(c("inst/CITATION", "CITATION.cff")), 1L)
+
+  # A version whose extraction produced no file list is not a package that
+  # ships no citation; it is a package we know nothing about. Zero is the
+  # honest answer only because the row itself will be absent.
+  expect_equal(citation_shipped(character(0L)), 0L)
 })

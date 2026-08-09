@@ -762,6 +762,12 @@ analyze_package <- function(repo_dir, package) {
       typed_deps <- meta_typed_deps(ctx$desc)
       for (fld in names(typed_deps)) metrics[[fld]] <- typed_deps[[fld]]
 
+      # Whether this version ships the file utils::citation() reads. Stamped
+      # here rather than in a metric group because the metric groups only run
+      # when the analyzer binary is absent, which never happens in CI, so a
+      # group-computed field never becomes a column at all.
+      metrics[["has_citation"]] <- citation_shipped(ctx$files)
+
       # Coerce each metric to a length-1 scalar (guard against bad group output)
       safe_metrics <- lapply(metrics, function(x) {
         if (is.null(x) || length(x) != 1L) NA else x

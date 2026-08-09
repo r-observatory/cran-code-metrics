@@ -91,3 +91,99 @@ stage_citation_inputs <- function(tmp, stage_dir, package, version,
     stringsAsFactors = FALSE
   )
 }
+
+#' Whether a container is available to evaluate citation files in.
+citation_sandbox_mode <- function() {
+  bin <- Sys.which("docker")
+  if (!nzchar(bin)) return("none")
+  rc <- suppressWarnings(system2(bin, c("info", "--format", "{{.ServerVersion}}"),
+                                 stdout = FALSE, stderr = FALSE, timeout = 20))
+  if (identical(rc, 0L)) "docker" else "none"
+}
+
+#' Classify a reader run from its output and exit status.
+#'
+#' The terminator is the contract. A stream without one means the process died
+#' partway, and treating that as an empty result would record a package that
+#' ships a citation as one that ships none. Anything after the terminator is not
+#' ours: a finalizer registered by an evaluated file runs at R shutdown, which is
+#' after the terminator is written.
+.citation_outcome <- function(lines, rc) {
+  if (identical(as.integer(rc), 124L)) return("timeout")
+  end <- which(lines == "{\"t\":\"end\"}")
+  if (length(end) == 0L) return("crashed")
+  if (end[[1L]] != length(lines)) return("crashed")
+  "ok"
+}
+
+#' Evaluate one package's staged citation files.
+#'
+#' One container per package. Never one per version, because container start
+#' dominates the cost; never one per shard, because a file in package A must not
+#' run in a process that will later serialise package B's record.
+#'
+#' @param inputs_df Frame from stage_citation_inputs(), one row per version.
+#' @param reader_path Path to scripts/cite_reader.R.
+#' @return list(lines, outcome, message)
+run_citation_reader <- function(inputs_df, reader_path) {
+  empty <- function(outcome, message = "") {
+    list(lines = character(0L), outcome = outcome, message = message)
+  }
+  if (is.null(inputs_df) || nrow(inputs_df) == 0L) return(empty("skipped"))
+
+  mode <- citation_sandbox_mode()
+  # Read live rather than through the CITATION_SANDBOX constant: config.R's
+  # top-level `<-` captures Sys.getenv() once at source time, before a caller
+  # (production or test) can change it. RPKG_ANALYZER_BIN in binary.R uses the
+  # same live-read pattern for the same reason.
+  sandbox_setting <- Sys.getenv("CITATION_SANDBOX", unset = "allow")
+  if (mode == "none" && !identical(sandbox_setting, "allow")) {
+    return(empty("crashed", "a container is required to evaluate citation files"))
+  }
+
+  root <- dirname(inputs_df$dir[[1L]])
+  man  <- file.path(root, "manifest.tsv")
+  outf <- file.path(root, "out.ndjson")
+  ids  <- basename(inputs_df$dir)
+
+  writeLines(paste(ids,
+                   if (mode == "docker") file.path("/stage", ids) else inputs_df$dir,
+                   ifelse(is.na(inputs_df$released), "NA", inputs_df$released),
+                   sep = "\t"), man)
+  file.create(outf)
+
+  argv <- if (mode == "docker") {
+    c("run", "--rm",
+      "--network", "none",
+      "--read-only",
+      "--cap-drop", "ALL",
+      "--security-opt", "no-new-privileges",
+      "--user", "65534:65534",
+      "--pids-limit", "128",
+      "--memory", "1g",
+      "--cpus", "1",
+      "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+      "-v", paste0(root, ":/stage:ro"),
+      "-v", paste0(outf, ":/out.ndjson:rw"),
+      "-v", paste0(normalizePath(reader_path), ":/reader.R:ro"),
+      "-e", "HOME=/tmp",
+      CITATION_IMAGE,
+      "Rscript", "--vanilla", "/reader.R", "/stage/manifest.tsv", "/out.ndjson")
+  } else {
+    c("--vanilla", normalizePath(reader_path), man, outf)
+  }
+  cmd <- if (mode == "docker") Sys.which("docker") else Sys.which("Rscript")
+
+  # system2 pastes args into a shell string and quotes only the command, so
+  # every element has to be quoted here.
+  rc <- tryCatch(
+    suppressWarnings(system2(cmd, shQuote(argv), stdout = FALSE, stderr = FALSE,
+                             timeout = CITATION_TIMEOUT)),
+    error = function(e) 1L
+  )
+
+  lines <- tryCatch(readLines(outf, warn = FALSE), error = function(e) character(0L))
+  outcome <- .citation_outcome(lines, rc)
+  if (outcome == "ok" && mode != "docker") outcome <- "unsandboxed"
+  list(lines = lines, outcome = outcome, message = "")
+}

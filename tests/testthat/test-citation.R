@@ -69,3 +69,63 @@ test_that("a version with no DESCRIPTION still stages, with an empty meta", {
   expect_equal(nrow(got), 1L)
   expect_true(file.exists(file.path(got$dir, "DESCRIPTION")))
 })
+
+test_that("an empty input frame runs nothing at all", {
+  got <- run_citation_reader(.empty_citation_inputs_df(),
+                             file.path("..", "..", "scripts", "cite_reader.R"))
+  expect_equal(got$outcome, "skipped")
+  expect_equal(length(got$lines), 0L)
+})
+
+test_that("the sandbox mode is docker when docker is usable, else none", {
+  mode <- citation_sandbox_mode()
+  expect_true(mode %in% c("docker", "none"))
+})
+
+test_that("a missing terminator is reported as a crash, not as an empty result", {
+  # A truncated stream means the process died partway. Treating it as "this
+  # package ships no citation" would silently delete real data.
+  got <- .citation_outcome(c('{"t":"doc","id":"a","status":"ok"}'), 0L)
+  expect_equal(got, "crashed")
+  ok <- .citation_outcome(c('{"t":"doc","id":"a","status":"ok"}', '{"t":"end"}'), 0L)
+  expect_equal(ok, "ok")
+  expect_equal(.citation_outcome(character(0L), 124L), "timeout")
+})
+
+test_that("bytes after the terminator are refused", {
+  # A finalizer registered by an evaluated file runs after the terminator is
+  # written. Anything past it is not ours.
+  got <- .citation_outcome(c('{"t":"doc","id":"a","status":"ok"}',
+                             '{"t":"end"}',
+                             '{"t":"doc","id":"FORGED","status":"ok"}'), 0L)
+  expect_equal(got, "crashed")
+})
+
+test_that("the reader runs unsandboxed locally and says so", {
+  skip_if(citation_sandbox_mode() == "docker", "docker is available")
+  withr::local_envvar(CITATION_SANDBOX = "allow")
+  root <- withr::local_tempdir()
+  d <- file.path(root, "k1")
+  dir.create(file.path(d, "inst"), recursive = TRUE)
+  writeBin(charToRaw('bibentry("Misc", title = "T", author = person("A", "B"), year = "2001")'),
+           file.path(d, "inst", "CITATION"))
+  writeLines("Package: p\nVersion: 1.0\nTitle: T\n", file.path(d, "DESCRIPTION"))
+  inp <- data.frame(package = "p", version = "1.0", is_current = 1L,
+                    released = "2024-01-01", source_sha256 = strrep("a", 64L),
+                    dir = d, stringsAsFactors = FALSE)
+
+  got <- run_citation_reader(inp, file.path("..", "..", "scripts", "cite_reader.R"))
+  expect_equal(got$outcome, "unsandboxed")
+  expect_true(any(grepl('"t":"end"', got$lines)))
+})
+
+test_that("an unsandboxed run is refused when the sandbox is required", {
+  skip_if(citation_sandbox_mode() == "docker", "docker is available")
+  withr::local_envvar(CITATION_SANDBOX = "require")
+  inp <- data.frame(package = "p", version = "1.0", is_current = 1L,
+                    released = "2024-01-01", source_sha256 = strrep("a", 64L),
+                    dir = tempdir(), stringsAsFactors = FALSE)
+  got <- run_citation_reader(inp, file.path("..", "..", "scripts", "cite_reader.R"))
+  expect_equal(got$outcome, "crashed")
+  expect_true(grepl("required", got$message))
+})

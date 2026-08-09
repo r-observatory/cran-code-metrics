@@ -7,7 +7,11 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned, not floating. The citation reader runs in a container, and whether
+    # unprivileged user namespaces are permitted and what container tooling is
+    # present differ between runner images. A boundary that changes when the
+    # base image is migrated is not one. Upgrade deliberately.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: r-lib/actions/setup-r@v2

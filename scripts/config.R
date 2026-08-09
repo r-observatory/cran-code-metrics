@@ -64,7 +64,7 @@ R_SOURCE_RE <- "^R/.*\\.[Rr]$"
 #   docker buildx imagetools inspect rocker/r-ver:4.4.1 --format '{{.Manifest.Digest}}'
 CITATION_IMAGE <- Sys.getenv(
   "CITATION_IMAGE",
-  unset = "rocker/r-ver:4.4.1")
+  unset = "rocker/r-ver@sha256:78cb94ce2db23aaaf7b546450fcf70b5a3f2ace5a9b5fa1f87217da329211312")
 
 # Wall-clock cap for one package's whole citation pass, in seconds. A package
 # with hundreds of versions still gets one bounded run: the cost is dominated by

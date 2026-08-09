@@ -178,7 +178,17 @@ default_io <- function() {
     },
 
     clone = function(pkg, dest) {
-      clone_package(pkg, dest, token = Sys.getenv("GITHUB_TOKEN", ""))
+      ok <- clone_package(pkg, dest, token = Sys.getenv("GITHUB_TOKEN", ""))
+      # The clone URL carries the token, and git writes it into
+      # work/<pkg>/.git/config. Nothing staged for the container comes from this
+      # directory, but the credential has no reason to sit on disk for the life of
+      # the analysis either.
+      if (isTRUE(ok)) {
+        suppressWarnings(system2("git", c("-C", shQuote(dest), "remote", "set-url",
+                                          "origin", shQuote(paste0(CRAN_GIT_BASE, "/", pkg, ".git"))),
+                                 stdout = FALSE, stderr = FALSE))
+      }
+      ok
     }
   )
 }

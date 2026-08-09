@@ -38,10 +38,16 @@ concurrency:
 
 jobs:
   update:
-    runs-on: ubuntu-latest
+    # Pinned, not floating. The citation reader runs in a container, and whether
+    # unprivileged user namespaces are permitted and what container tooling is
+    # present differ between runner images. A boundary that changes when the
+    # base image is migrated is not one. Upgrade deliberately.
+    runs-on: ubuntu-24.04
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: r-lib/actions/setup-r@v2
         with:
           r-version: "release"
@@ -114,11 +120,18 @@ jobs:
           echo "PREV_DATA_TAG=${DATA_SRC}" >> "$GITHUB_ENV"
           ls -la out || true
 
+      - name: Pull the citation reader image
+        run: docker pull "$CITATION_IMAGE"
+        env:
+          CITATION_IMAGE: rocker/r-ver@sha256:78cb94ce2db23aaaf7b546450fcf70b5a3f2ace5a9b5fa1f87217da329211312
+
       - name: Analyze shards and publish after each
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NOTES_TITLE_PREFIX: CRAN
+          CITATION_SANDBOX: require
+          CITATION_IMAGE: rocker/r-ver@sha256:78cb94ce2db23aaaf7b546450fcf70b5a3f2ace5a9b5fa1f87217da329211312
         run: |
           set -euo pipefail
           TODAY="$(date -u +%Y-%m-%d)"

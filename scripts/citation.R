@@ -350,7 +350,18 @@ parse_citation_records <- function(lines, inputs_df, outcome) {
     } else if (is.null(doc)) {
       status <- "crashed"
     } else {
-      status <- .cit_chr(doc$status)
+      # A status is a value this pipeline defines, not one a package
+      # author's evaluated code gets to invent: doc$status is validated
+      # here, once, right where it is first taken from the record, so
+      # every later branch (the "ok"/"empty" check below, the citations
+      # row itself) sees one of exactly three known values or "malformed" -
+      # never NA and never an arbitrary string. NA matters specifically:
+      # citations.status is NOT NULL, and this frame is written inside the
+      # same transaction as the rest of the shard, so one package's `[]`
+      # in this one field would otherwise roll back everyone else's work
+      # in the batch, not just this package's citation.
+      doc_status <- .cit_chr(doc$status)
+      status <- if (doc_status %in% c("ok", "empty", "error")) doc_status else "malformed"
     }
 
     payload_id <- NA_character_
@@ -450,8 +461,27 @@ parse_citation_records <- function(lines, inputs_df, outcome) {
       evaluated_at = now, stringsAsFactors = FALSE)
   }
 
+  citations <- do.call(rbind, cit_rows) %||% .empty_citations_df()
+
+  # citations.status is NOT NULL, and this frame is written inside the same
+  # transaction as the rest of the shard, so a single NA or unrecognised
+  # value here would abort every other package's write in the same batch,
+  # not just this one's. Every branch above is meant to leave status as one
+  # of exactly these seven strings; asserting it here catches a hole in
+  # that reasoning at the point it was made, not as a constraint violation
+  # three layers away. "unsandboxed" is deliberately not among them: an
+  # unsandboxed outcome only widens which doc records get trusted (treated
+  # the same as "ok" above), it is never itself written as a status.
+  known_statuses <- c("ok", "empty", "error", "malformed",
+                       "crashed", "timeout", "skipped")
+  stopifnot(
+    "citations$status must never be NA" = !anyNA(citations$status),
+    "citations$status must be one of the known statuses" =
+      all(citations$status %in% known_statuses)
+  )
+
   list(
-    citations = do.call(rbind, cit_rows) %||% .empty_citations_df(),
+    citations = citations,
     payloads  = if (length(pay_rows)) do.call(rbind, unname(pay_rows))
                 else .empty_citation_payloads_df(),
     entries   = if (length(ent_rows)) do.call(rbind, unname(ent_rows))

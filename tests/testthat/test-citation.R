@@ -228,6 +228,7 @@ test_that("a record whose id was never requested is refused", {
   got <- parse_citation_records(lines, inp, "ok")
   expect_equal(nrow(got$citations), 1L)
   expect_equal(got$citations$package, "p")
+  expect_false(anyNA(got$citations$status))
 })
 
 test_that("a version whose doc record never arrived is recorded as crashed", {
@@ -239,6 +240,7 @@ test_that("a version whose doc record never arrived is recorded as crashed", {
   st <- setNames(got$citations$status, got$citations$version)
   expect_equal(unname(st[["1.0"]]), "empty")
   expect_equal(unname(st[["2.0"]]), "crashed")
+  expect_false(anyNA(got$citations$status))
 })
 
 test_that("identical results across versions share one payload row", {
@@ -250,6 +252,7 @@ test_that("identical results across versions share one payload row", {
   expect_equal(length(unique(got$citations$payload_id)), 1L)
   expect_equal(nrow(got$payloads), 1L)
   expect_equal(nrow(got$entries), 1L)
+  expect_false(anyNA(got$citations$status))
 })
 
 test_that("a timeout marks every requested version, and writes no payload", {
@@ -258,6 +261,7 @@ test_that("a timeout marks every requested version, and writes no payload", {
   expect_equal(got$citations$status, "timeout")
   expect_true(is.na(got$citations$payload_id))
   expect_equal(nrow(got$payloads), 0L)
+  expect_false(anyNA(got$citations$status))
 })
 
 test_that("invalid UTF-8 in a field fails the record rather than storing it", {
@@ -271,6 +275,7 @@ test_that("invalid UTF-8 in a field fails the record rather than storing it", {
   got <- parse_citation_records(lines, inp, "ok")
   expect_equal(got$citations$status, "malformed")
   expect_equal(nrow(got$entries), 0L)
+  expect_false(anyNA(got$citations$status))
 })
 
 test_that("an unresolvable release date is recorded as such rather than dropped", {
@@ -281,6 +286,7 @@ test_that("an unresolvable release date is recorded as such rather than dropped"
   got <- parse_citation_records(lines, inp, "ok")
   expect_equal(got$citations$status, "error")
   expect_equal(got$citations$released_known, 0L)
+  expect_false(anyNA(got$citations$status))
 })
 
 # --- Records that parse as JSON but arrive in a shape the honest reader
@@ -300,6 +306,7 @@ test_that("a null entry index does not abort the package's other versions", {
   # only k1 contributed: nothing from k2's record survives into storage
   expect_equal(nrow(got$payloads), 1L)
   expect_equal(nrow(got$entries), 1L)
+  expect_false(anyNA(got$citations$status))
 })
 
 test_that("an empty-array doc field does not abort the package's other versions", {
@@ -313,14 +320,15 @@ test_that("an empty-array doc field does not abort the package's other versions"
   st  <- setNames(got$citations$status, got$citations$version)
   msg <- setNames(got$citations$message, got$citations$version)
   expect_equal(unname(st[["1.0"]]), "empty")
-  # status:[] normalises to NA rather than matching "ok"/"empty": nothing is
-  # built or stored for it, but the call itself does not throw.
-  expect_true(is.na(unname(st[["2.0"]])))
+  # status:[] is validated against the known set, not passed through: it
+  # normalises to "malformed", never to NA (citations.status is NOT NULL).
+  expect_equal(unname(st[["2.0"]]), "malformed")
   expect_equal(unname(st[["3.0"]]), "error")
   expect_true(is.na(unname(msg[["3.0"]])))
-  # only k1's "empty" doc builds a (zero-entry) payload row; k2's status
-  # never matched "ok"/"empty" and k3 is "error", so neither builds one.
+  # only k1's "empty" doc builds a (zero-entry) payload row; k2 is
+  # malformed and k3 is "error", so neither builds one.
   expect_equal(nrow(got$payloads), 1L)
+  expect_false(anyNA(got$citations$status))
 })
 
 test_that("an empty-array entry field does not abort the package's other versions", {
@@ -331,6 +339,7 @@ test_that("an empty-array entry field does not abort the package's other version
   expect_equal(got$citations$status, "ok")
   expect_equal(nrow(got$entries), 1L)
   expect_true(is.na(got$entries$title))
+  expect_false(anyNA(got$citations$status))
 })
 
 test_that("a non-scalar record id is refused rather than aborting the parse", {
@@ -344,6 +353,7 @@ test_that("a non-scalar record id is refused rather than aborting the parse", {
   # the array-id record names no version in the manifest, so k2 gets no doc
   # record at all rather than the forged one being attributed to it.
   expect_equal(unname(st[["2.0"]]), "crashed")
+  expect_false(anyNA(got$citations$status))
 })
 
 # --- n_entries must match which entries parsed, not just how many.
@@ -358,6 +368,7 @@ test_that("a duplicated entry index is malformed even though the count matches",
   got <- parse_citation_records(c(doc, ent1, dup, '{"t":"end"}'), inp, "ok")
   expect_equal(got$citations$status, "malformed")
   expect_equal(nrow(got$entries), 0L)
+  expect_false(anyNA(got$citations$status))
 })
 
 test_that("a missing n_entries on an ok doc is malformed, not assumed absent", {
@@ -369,4 +380,40 @@ test_that("a missing n_entries on an ok doc is malformed, not assumed absent", {
   got <- parse_citation_records(c(doc_missing, ent1, doc_null, ent2, '{"t":"end"}'), inp, "ok")
   expect_equal(got$citations$status, c("malformed", "malformed"))
   expect_equal(nrow(got$entries), 0L)
+  expect_false(anyNA(got$citations$status))
+})
+
+# --- citations.status is NOT NULL and this frame is written inside the same
+# transaction as the rest of the shard: a doc's own status is validated
+# against the fixed set the pipeline defines, never passed through raw.
+
+test_that("a doc status arriving as an empty array is malformed, and the row is still written", {
+  inp <- cit_inputs(list(id = "k1", version = "1.0"))
+  doc <- '{"t":"doc","id":"k1","status":[],"n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}'
+  got <- parse_citation_records(c(doc, '{"t":"end"}'), inp, "ok")
+  expect_equal(nrow(got$citations), 1L)
+  expect_equal(got$citations$status, "malformed")
+  expect_false(anyNA(got$citations$status))
+})
+
+test_that("an invented doc status is malformed, and the invented string is stored nowhere", {
+  inp <- cit_inputs(list(id = "k1", version = "1.0"))
+  doc <- '{"t":"doc","id":"k1","status":"pwned","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}'
+  got <- parse_citation_records(c(doc, '{"t":"end"}'), inp, "ok")
+  expect_equal(got$citations$status, "malformed")
+  no_pwned <- function(df) {
+    chr_cols <- df[vapply(df, is.character, logical(1))]
+    !any(vapply(chr_cols, function(col) any(grepl("pwned", col, fixed = TRUE)), logical(1)))
+  }
+  expect_true(no_pwned(got$citations))
+  expect_true(no_pwned(got$payloads))
+  expect_true(no_pwned(got$entries))
+})
+
+test_that("a doc record with no status key at all is malformed", {
+  inp <- cit_inputs(list(id = "k1", version = "1.0"))
+  doc <- '{"t":"doc","id":"k1","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}'
+  got <- parse_citation_records(c(doc, '{"t":"end"}'), inp, "ok")
+  expect_equal(got$citations$status, "malformed")
+  expect_false(anyNA(got$citations$status))
 })

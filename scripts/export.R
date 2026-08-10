@@ -421,7 +421,6 @@ open_or_init_db <- function(path) {
       payload_id     TEXT,
       source_sha256  TEXT NOT NULL,
       status         TEXT NOT NULL,
-      sandboxed      INTEGER NOT NULL,
       released_known INTEGER NOT NULL DEFAULT 1,
       message        TEXT,
       evaluated_at   TEXT,

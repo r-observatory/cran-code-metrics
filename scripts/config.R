@@ -56,24 +56,7 @@ README_SOURCES <- c("README.md", "README.Rmd", "README.qmd", "README.markdown")
 # security and health metric, silently, with the row still looking populated.
 R_SOURCE_RE <- "^R/.*\\.[Rr]$"
 
-# Image the citation reader runs in. Docker is chosen over bubblewrap because it
-# is preinstalled on the runner and, since its daemon runs as root, it does not
-# depend on unprivileged user namespaces, which Ubuntu restricts by default and
-# which differ between runner images. Pin by digest so an image rebuild cannot
-# change the boundary under a scheduled run. Resolve a new digest with:
-#   docker buildx imagetools inspect rocker/r-ver:4.4.1 --format '{{.Manifest.Digest}}'
-CITATION_IMAGE <- Sys.getenv(
-  "CITATION_IMAGE",
-  unset = "rocker/r-ver@sha256:78cb94ce2db23aaaf7b546450fcf70b5a3f2ace5a9b5fa1f87217da329211312")
-
 # Wall-clock cap for one package's whole citation pass, in seconds. A package
 # with hundreds of versions still gets one bounded run: the cost is dominated by
-# container start, not by evaluation.
+# starting the reader, not by evaluating any one file.
 CITATION_TIMEOUT <- as.integer(Sys.getenv("CITATION_TIMEOUT", unset = "180"))
-
-# CITATION_SANDBOX: "require" refuses to evaluate without a container, "allow"
-# permits an unsandboxed local run that is recorded as such. CI sets require.
-# Not cached as a constant here: run_citation_reader() (citation.R) reads it
-# live with Sys.getenv() at call time, the same pattern rpkg_analyzer_bin()
-# (binary.R) uses for RPKG_ANALYZER_BIN, so a caller can set it per run
-# without re-sourcing this file.

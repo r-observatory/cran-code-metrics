@@ -1,5 +1,5 @@
 # scripts/citation.R: reading inst/CITATION out of a released version.
-# Dependency: config.R must be sourced first (CITATION_IMAGE, CITATION_TIMEOUT).
+# Dependency: config.R must be sourced first (CITATION_TIMEOUT).
 
 #' Whether a released version ships the file utils::citation() reads.
 #'
@@ -17,8 +17,8 @@ citation_shipped <- function(files) {
 
 #' Zero-row frame of staged citation inputs.
 #'
-#' One row per version that ships a citation file. `dir` is the staging
-#' directory the container will mount; `source_sha256` identifies the citation
+#' One row per version that ships a citation file. `dir` is the directory the
+#' two staged files were written to; `source_sha256` identifies the citation
 #' bytes so a reader can tell whether the file changed between releases.
 .empty_citation_inputs_df <- function() {
   data.frame(
@@ -34,11 +34,15 @@ citation_shipped <- function(files) {
 
 #' Stage the two files a citation reader needs, and nothing else.
 #'
-#' The container sees only what is staged here. It is deliberately not given the
-#' extracted package tree, the clone, or the workspace: the clone URL carries a
-#' write-scoped token (git.R:16-27 writes it into work/<pkg>/.git/config), so an
-#' evaluated citation file that can read the filesystem could otherwise exfiltrate
-#' it. Two files go in, nothing else is reachable.
+#' The reader is pointed at what is staged here and nothing else. It is
+#' deliberately not given the extracted package tree, the clone, or the
+#' workspace: the clone URL carries a write-scoped token (git.R:16-27 writes it
+#' into work/<pkg>/.git/config), and an evaluated citation file has no business
+#' being handed the analysis. Two files go in, and nothing else is named to it.
+#' That narrows what is in front of an evaluated file, not what a determined one
+#' could reach - the reader is an ordinary process with this user's filesystem
+#' access. What it is genuinely denied is this process's environment, which
+#' run_citation_reader() builds by name rather than passing on.
 #'
 #' Bytes are read with readBin rather than through ctx$read, because the context
 #' reader collapses readLines output and so drops the trailing newline and
@@ -92,15 +96,6 @@ stage_citation_inputs <- function(tmp, stage_dir, package, version,
   )
 }
 
-#' Whether a container is available to evaluate citation files in.
-citation_sandbox_mode <- function() {
-  bin <- Sys.which("docker")
-  if (!nzchar(bin)) return("none")
-  rc <- suppressWarnings(system2(bin, c("info", "--format", "{{.ServerVersion}}"),
-                                 stdout = FALSE, stderr = FALSE, timeout = 20))
-  if (identical(rc, 0L)) "docker" else "none"
-}
-
 #' Classify a reader run from its output and exit status.
 #'
 #' The terminator is the contract. A stream without one means the process died
@@ -116,65 +111,44 @@ citation_sandbox_mode <- function() {
   "ok"
 }
 
-#' Make a staged tree traversable and readable by any uid.
+#' The environment the reader is handed, built by name instead of inherited.
 #'
-#' dir.create() and file.copy() apply the process umask, so under a
-#' restrictive umask (027, 077) the tree stage_citation_inputs() built can
-#' come out 0750 or 0700. The container's non-root user then cannot even
-#' traverse into /stage/<id>. That does not crash: the reader's per-job
-#' tryCatch turns the resulting open() failure into a "status":"error" record
-#' for every job, the terminator still gets written, and .citation_outcome()
-#' reports "ok" - a failure that fails open into permanently wrong data is
-#' worse than one that crashes. Fixed here, right before the reader runs, so
-#' it covers whatever staging produced regardless of the umask that built it.
-.citation_make_stage_readable <- function(root) {
-  paths <- list.files(root, recursive = TRUE, all.files = TRUE,
-                      full.names = TRUE, include.dirs = TRUE, no.. = TRUE)
-  paths <- c(root, paths)
-  is_dir <- file.info(paths)$isdir
-  is_dir[is.na(is_dir)] <- FALSE
-  # a+rX: directories get read+traverse, files get read only. use_umask =
-  # FALSE so the umask that caused the problem cannot re-narrow the fix.
-  if (any(is_dir))  Sys.chmod(paths[is_dir],  mode = "0755", use_umask = FALSE)
-  if (any(!is_dir)) Sys.chmod(paths[!is_dir], mode = "0644", use_umask = FALSE)
-}
-
-#' Build the docker argument vector that runs the reader with nothing else
-#' reachable.
+#' A CITATION file is R code, and evaluating it runs Sys.getenv() if the file
+#' asks to. That is not hypothetical: a file that reads GITHUB_TOKEN and puts
+#' the value in its title lands the token in the stored title, and the
+#' environment this pipeline runs under carries that token with push rights.
+#' So the reader starts from an empty environment with only the few names R
+#' needs to start copied in, and a name that is not listed here does not exist
+#' for the code being evaluated.
 #'
-#' Extracted from run_citation_reader() so the flag set has one definition and
-#' so it can be unit-tested without a daemon: these flags are the security
-#' boundary, and a dropped or misspelled one would otherwise fail nothing.
+#' An allowlist rather than unsetting the dangerous names one by one: a
+#' blocklist has to be kept in step with every credential any caller might ever
+#' export, and the first one nobody thought of is the one that leaks.
 #'
-#' @param root Host staging root, mounted read-only at /stage.
-#' @param outf Host output file, mounted read-write at /out.ndjson.
-#' @param reader_path Path to scripts/cite_reader.R, mounted read-only at /reader.R.
-#' @param image Image reference to run.
-#' @return Character vector of docker arguments, command name not included.
-.citation_docker_argv <- function(root, outf, reader_path, image) {
-  c("run", "--rm",
-    "--network", "none",
-    "--read-only",
-    "--cap-drop", "ALL",
-    "--security-opt", "no-new-privileges",
-    "--user", "65534:65534",
-    "--pids-limit", "128",
-    "--memory", "1g",
-    "--cpus", "1",
-    "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
-    "-v", paste0(root, ":/stage:ro"),
-    "-v", paste0(outf, ":/out.ndjson:rw"),
-    "-v", paste0(normalizePath(reader_path), ":/reader.R:ro"),
-    "-e", "HOME=/tmp",
-    image,
-    "Rscript", "--vanilla", "/reader.R", "/stage/manifest.tsv", "/out.ndjson")
+#' @return Character vector of NAME=value assignments.
+.citation_child_env <- function() {
+  # PATH and HOME so R starts and path.expand() has something to expand;
+  # TMPDIR because the reader writes temporaries; TZ and the locale names
+  # because they decide how dates and non-ASCII citation text render, and a
+  # reader that silently changed encoding relative to the process that staged
+  # its input would store different bytes than the same file does today.
+  keep <- c("PATH", "HOME", "TMPDIR", "TZ", "LANG", "LC_ALL", "LC_CTYPE")
+  vals <- Sys.getenv(keep, unset = NA_character_)
+  vals <- vals[!is.na(vals)]
+  c(sprintf("R_HOME=%s", R.home()), sprintf("%s=%s", names(vals), vals))
 }
 
 #' Evaluate one package's staged citation files.
 #'
-#' One container per package. Never one per version, because container start
+#' One reader process per package. Never one per version, because process start
 #' dominates the cost; never one per shard, because a file in package A must not
 #' run in a process that will later serialise package B's record.
+#'
+#' A subprocess rather than this session, for two reasons that have nothing to
+#' do with what else is on the machine: an evaluated file that calls q() or
+#' segfaults would otherwise take the worker down in the middle of its shard,
+#' and one that calls cat() would otherwise write into the record stream this
+#' function reads back.
 #'
 #' @param inputs_df Frame from stage_citation_inputs(), one row per version.
 #' @param reader_path Path to scripts/cite_reader.R.
@@ -185,14 +159,16 @@ run_citation_reader <- function(inputs_df, reader_path) {
   }
   if (is.null(inputs_df) || nrow(inputs_df) == 0L) return(empty("skipped"))
 
-  mode <- citation_sandbox_mode()
-  # Read live rather than through the CITATION_SANDBOX constant: config.R's
-  # top-level `<-` captures Sys.getenv() once at source time, before a caller
-  # (production or test) can change it. RPKG_ANALYZER_BIN in binary.R uses the
-  # same live-read pattern for the same reason.
-  sandbox_setting <- Sys.getenv("CITATION_SANDBOX", unset = "allow")
-  if (mode == "none" && !identical(sandbox_setting, "allow")) {
-    return(empty("crashed", "a container is required to evaluate citation files"))
+  # env(1) is what makes the allowlist an allowlist. system2()'s own `env`
+  # argument only prepends NAME=value assignments to the shell command, so it
+  # sets the names it is given and leaves every other one inherited - it can
+  # add a variable but never remove one, and removing is the point here.
+  # `env -i` starts the child from nothing instead. Refused rather than run
+  # with this process's environment attached if env(1) is not there.
+  envbin <- Sys.which("env")
+  if (!nzchar(envbin)) {
+    return(empty("crashed", paste("env(1) is required to run the citation reader",
+                                  "without this process's environment")))
   }
 
   root <- dirname(inputs_df$dir[[1L]])
@@ -200,45 +176,41 @@ run_citation_reader <- function(inputs_df, reader_path) {
   outf <- file.path(root, "out.ndjson")
   ids  <- basename(inputs_df$dir)
 
-  writeLines(paste(ids,
-                   if (mode == "docker") file.path("/stage", ids) else inputs_df$dir,
+  writeLines(paste(ids, inputs_df$dir,
                    ifelse(is.na(inputs_df$released), "NA", inputs_df$released),
                    sep = "\t"), man)
   file.create(outf)
-  # Sweep the whole staging root readable first - this also covers man, which
-  # the container reads from /stage - then widen outf last, after the sweep,
-  # so the sweep's own 0644 on outf (it is a file under root too) does not
-  # clobber the write grant the container needs to produce it.
-  .citation_make_stage_readable(root)
-  Sys.chmod(outf, mode = "0666", use_umask = FALSE)
 
-  argv <- if (mode == "docker") {
-    .citation_docker_argv(root, outf, reader_path, CITATION_IMAGE)
-  } else {
-    c("--vanilla", normalizePath(reader_path), man, outf)
-  }
-  cmd <- if (mode == "docker") Sys.which("docker") else Sys.which("Rscript")
+  # Resolved here rather than inside the suppressWarnings() below:
+  # normalizePath() warns when the path does not exist, and that warning is how
+  # a caller learns the reader could not be found at all, rather than seeing
+  # every version of every package quietly read as crashed.
+  argv <- c("--vanilla", normalizePath(reader_path), man, outf)
+  # R.home()'s own Rscript rather than whatever PATH resolves first, so the
+  # reader runs under the R this pipeline is running under and the R_HOME it is
+  # handed names that same installation.
+  rscript <- file.path(R.home("bin"), "Rscript")
 
   # system2 pastes args into a shell string and quotes only the command, so
   # every element has to be quoted here.
   rc <- tryCatch(
-    suppressWarnings(system2(cmd, shQuote(argv), stdout = FALSE, stderr = FALSE,
+    suppressWarnings(system2(envbin,
+                             c("-i", shQuote(.citation_child_env()),
+                               shQuote(rscript), shQuote(argv)),
+                             stdout = FALSE, stderr = FALSE,
                              timeout = CITATION_TIMEOUT)),
     error = function(e) 1L
   )
 
   lines <- tryCatch(readLines(outf, warn = FALSE), error = function(e) character(0L))
-  outcome <- .citation_outcome(lines, rc)
-  if (outcome == "ok" && mode != "docker") outcome <- "unsandboxed"
-  list(lines = lines, outcome = outcome, message = "")
+  list(lines = lines, outcome = .citation_outcome(lines, rc), message = "")
 }
 
 .empty_citations_df <- function() {
   data.frame(package = character(0L), version = character(0L),
              is_current = integer(0L), payload_id = character(0L),
              source_sha256 = character(0L), status = character(0L),
-             sandboxed = integer(0L), released_known = integer(0L),
-             message = character(0L),
+             released_known = integer(0L), message = character(0L),
              evaluated_at = character(0L), stringsAsFactors = FALSE)
 }
 
@@ -296,7 +268,7 @@ run_citation_reader <- function(inputs_df, reader_path) {
 #' Turn one package's reader output into the three frames the DB stores.
 #'
 #' Every record is matched against the manifest that was asked for. A record
-#' naming an id that was never requested is discarded: the container evaluates
+#' naming an id that was never requested is discarded: the reader evaluates
 #' code an author wrote, and a forged record must not become another package's
 #' citation. A requested version with no record is recorded as crashed rather
 #' than as empty, because "we could not read it" and "it ships none" are
@@ -309,19 +281,12 @@ parse_citation_records <- function(lines, inputs_df, outcome, run_message = NA_c
   }
   now <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
   want <- basename(inputs_df$dir)
-  # Derived from the outcome this call was handed, never from anything in a
-  # doc record: a package's own CITATION file has no way to know or claim
-  # which boundary read it, and this column exists so that fact can never be
-  # confused with the doc's own status. The unsandboxed path exists so local
-  # work is possible at all; the condition on allowing it is that its output
-  # can never be mistaken for a run that went through the container.
-  sandboxed <- if (identical(outcome, "unsandboxed")) 0L else 1L
 
-  # A whole-run failure (a reader that could not be launched, a required
-  # sandbox that never started) explains every row alike; a doc that simply
-  # never arrived for one version of an otherwise-successful run does not.
-  # Kept as its own flag, computed once, so the two are never conflated below.
-  is_run_failure <- !identical(outcome, "ok") && !identical(outcome, "unsandboxed")
+  # A whole-run failure (a reader that could not be launched, a run that hit
+  # the wall clock) explains every row alike; a doc that simply never arrived
+  # for one version of an otherwise-successful run does not. Kept as its own
+  # flag, computed once, so the two are never conflated below.
+  is_run_failure <- !identical(outcome, "ok")
   # run_citation_reader() returns "" (not NA) for a clean run; that must not
   # be stored as though it were a real explanation.
   run_message <- if (length(run_message) != 1L || is.na(run_message) ||
@@ -491,7 +456,7 @@ parse_citation_records <- function(lines, inputs_df, outcome, run_message = NA_c
       package = inputs_df$package[[k]], version = inputs_df$version[[k]],
       is_current = as.integer(inputs_df$is_current[[k]]),
       payload_id = payload_id, source_sha256 = inputs_df$source_sha256[[k]],
-      status = status, sandboxed = sandboxed, released_known = rel_known,
+      status = status, released_known = rel_known,
       message = if (is_run_failure) run_message
                  else if (is.null(doc)) NA_character_
                  else .cit_chr(doc$message),
@@ -506,22 +471,13 @@ parse_citation_records <- function(lines, inputs_df, outcome, run_message = NA_c
   # not just this one's. Every branch above is meant to leave status as one
   # of exactly these seven strings; asserting it here catches a hole in
   # that reasoning at the point it was made, not as a constraint violation
-  # three layers away. "unsandboxed" is deliberately not among them: an
-  # unsandboxed outcome only widens which doc records get trusted (treated
-  # the same as "ok" above), it is never itself written as a status.
+  # three layers away.
   known_statuses <- c("ok", "empty", "error", "malformed",
                        "crashed", "timeout", "skipped")
   stopifnot(
     "citations$status must never be NA" = !anyNA(citations$status),
     "citations$status must be one of the known statuses" =
-      all(citations$status %in% known_statuses),
-    # sandboxed is not read from a record, so it cannot inherit the NA/enum
-    # holes doc$status could - but it holds the same NOT NULL contract, and
-    # a debug run mistaken for a production one is exactly the failure this
-    # column exists to rule out, so it gets the same loud check.
-    "citations$sandboxed must never be NA" = !anyNA(citations$sandboxed),
-    "citations$sandboxed must be 0 or 1" =
-      all(citations$sandboxed %in% c(0L, 1L))
+      all(citations$status %in% known_statuses)
   )
 
   list(
@@ -548,12 +504,12 @@ citation_pass <- function(inputs_df, reader_path) {
   tryCatch({
     run <- run_citation_reader(inputs_df, reader_path)
     if (identical(run$outcome, "skipped")) return(empty)
-    # run$message carries a whole-run explanation (e.g. "a container is
-    # required to evaluate citation files") that applies to every row this
-    # call produces, not to any one version's own record. Threaded through
-    # rather than discarded, or a misconfigured run (wrong reader path, a
-    # required sandbox that never started) is indistinguishable in the stored
-    # data from every version's reader having independently crashed.
+    # run$message carries a whole-run explanation (e.g. "env(1) is required to
+    # run the citation reader without this process's environment") that applies
+    # to every row this call produces, not to any one version's own record.
+    # Threaded through rather than discarded, or a misconfigured run is
+    # indistinguishable in the stored data from every version's reader having
+    # independently crashed.
     parse_citation_records(run$lines, inputs_df, run$outcome, run$message)
   }, error = function(e) {
     warning(sprintf("citation pass failed for '%s': %s",

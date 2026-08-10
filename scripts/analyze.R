@@ -668,8 +668,9 @@ analyze_package <- function(repo_dir, package) {
   versions_df <- list_versions(repo_dir)
   churn_all   <- package_churn(repo_dir)
 
-  # One staging root per package. The container mounts a subdirectory of this
-  # and nothing else, so it is created here and removed when the package is done.
+  # One staging root per package. The reader is pointed at subdirectories of
+  # this and nothing else, so it is created here and removed when the package
+  # is done.
   cit_stage <- tempfile(pattern = paste0("ccm_cit_", package, "_"))
   dir.create(cit_stage, recursive = TRUE)
   on.exit(unlink(cit_stage, recursive = TRUE, force = TRUE), add = TRUE)
@@ -874,8 +875,7 @@ analyze_package <- function(repo_dir, package) {
       }
 
       # Two files per citation-bearing version, staged for the reader. Nothing
-      # is evaluated here; this only decides what the container will be allowed
-      # to see.
+      # is evaluated here; this only decides what the reader will be handed.
       citation_input <- tryCatch(
         stage_citation_inputs(tmp, cit_stage, package, v,
                               as.integer(is_latest), date),
@@ -975,7 +975,7 @@ analyze_package <- function(repo_dir, package) {
     .empty_citation_inputs_df()
   }
 
-  # One container for this package's whole citation history. The worker's own
+  # One reader process for this package's whole citation history. The worker's own
   # elapsed-time limit is cleared across the call and restored after it: the
   # limit does not fire during a blocking system2 but does as soon as one
   # returns, and an error there would cost this package every metric above.

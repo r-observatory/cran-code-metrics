@@ -77,30 +77,6 @@ test_that("an empty input frame runs nothing at all", {
   expect_equal(length(got$lines), 0L)
 })
 
-test_that("the sandbox mode is none when no docker binary is on PATH", {
-  bin_dir <- withr::local_tempdir()
-  withr::local_envvar(PATH = bin_dir)
-  expect_equal(citation_sandbox_mode(), "none")
-})
-
-test_that("the sandbox mode is none when docker is on PATH but the daemon does not respond", {
-  bin_dir <- withr::local_tempdir()
-  fake <- file.path(bin_dir, "docker")
-  writeLines(c("#!/bin/sh", "exit 1"), fake)
-  Sys.chmod(fake, "0755")
-  withr::local_envvar(PATH = paste(bin_dir, Sys.getenv("PATH"), sep = .Platform$path.sep))
-  expect_equal(citation_sandbox_mode(), "none")
-})
-
-test_that("the sandbox mode is docker when docker is on PATH and the daemon responds", {
-  bin_dir <- withr::local_tempdir()
-  fake <- file.path(bin_dir, "docker")
-  writeLines(c("#!/bin/sh", 'echo "27.0.0"', "exit 0"), fake)
-  Sys.chmod(fake, "0755")
-  withr::local_envvar(PATH = paste(bin_dir, Sys.getenv("PATH"), sep = .Platform$path.sep))
-  expect_equal(citation_sandbox_mode(), "docker")
-})
-
 test_that("a missing terminator is reported as a crash, not as an empty result", {
   # A truncated stream means the process died partway. Treating it as "this
   # package ships no citation" would silently delete real data.
@@ -120,118 +96,76 @@ test_that("bytes after the terminator are refused", {
   expect_equal(got, "crashed")
 })
 
-test_that("the reader runs unsandboxed locally and says so", {
-  skip_if(citation_sandbox_mode() == "docker", "docker is available")
-  withr::local_envvar(CITATION_SANDBOX = "allow")
-  root <- withr::local_tempdir()
+# --- The reader is a real subprocess, and it is started from an environment
+# built by name rather than from this one.
+
+stage_one <- function(root, citation_src) {
   d <- file.path(root, "k1")
   dir.create(file.path(d, "inst"), recursive = TRUE)
-  writeBin(charToRaw('bibentry("Misc", title = "T", author = person("A", "B"), year = "2001")'),
-           file.path(d, "inst", "CITATION"))
+  writeBin(charToRaw(citation_src), file.path(d, "inst", "CITATION"))
   writeLines("Package: p\nVersion: 1.0\nTitle: T\n", file.path(d, "DESCRIPTION"))
-  inp <- data.frame(package = "p", version = "1.0", is_current = 1L,
-                    released = "2024-01-01", source_sha256 = strrep("a", 64L),
-                    dir = d, stringsAsFactors = FALSE)
+  data.frame(package = "p", version = "1.0", is_current = 1L,
+             released = "2024-01-01", source_sha256 = strrep("a", 64L),
+             dir = d, stringsAsFactors = FALSE)
+}
 
-  got <- run_citation_reader(inp, file.path("..", "..", "scripts", "cite_reader.R"))
-  expect_equal(got$outcome, "unsandboxed")
+reader <- function() file.path("..", "..", "scripts", "cite_reader.R")
+
+test_that("the reader evaluates a staged citation and terminates its stream", {
+  root <- withr::local_tempdir()
+  inp <- stage_one(root,
+    'bibentry("Misc", title = "T", author = person("A", "B"), year = "2001")')
+
+  got <- run_citation_reader(inp, reader())
+  expect_equal(got$outcome, "ok")
   expect_true(any(grepl('"t":"end"', got$lines)))
 })
 
-test_that("an unsandboxed run is refused when the sandbox is required", {
-  skip_if(citation_sandbox_mode() == "docker", "docker is available")
-  withr::local_envvar(CITATION_SANDBOX = "require")
-  inp <- data.frame(package = "p", version = "1.0", is_current = 1L,
-                    released = "2024-01-01", source_sha256 = strrep("a", 64L),
-                    dir = tempdir(), stringsAsFactors = FALSE)
-  got <- run_citation_reader(inp, file.path("..", "..", "scripts", "cite_reader.R"))
-  expect_equal(got$outcome, "crashed")
-  expect_true(grepl("required", got$message))
+test_that("the child environment carries what R needs and no credential", {
+  # Allowlisted by name, so a variable nobody anticipated is absent by default
+  # rather than present until someone remembers to unset it.
+  withr::local_envvar(GITHUB_TOKEN = "ghp_notARealToken_0123456789",
+                      GH_TOKEN = "ghp_notARealToken_0123456789")
+  env <- .citation_child_env()
+  names_only <- sub("=.*$", "", env)
+
+  expect_true("R_HOME" %in% names_only)
+  expect_true("PATH" %in% names_only)
+  expect_false("GITHUB_TOKEN" %in% names_only)
+  expect_false("GH_TOKEN" %in% names_only)
+  expect_false(any(grepl("notARealToken", env, fixed = TRUE)))
 })
 
-test_that("staged files are made readable and traversable under a restrictive umask", {
-  # dir.create()/file.copy() apply the process umask. Under 077 that leaves
-  # the staged directory at 0700: a container uid other than the one that
-  # staged it could not even traverse in. .citation_make_stage_readable()
-  # must widen that regardless of what umask built it, or the container-uid
-  # read fails closed as a crash at best and, for the manifest specifically,
-  # open into a wrongly-recorded "ok" at worst (see the next test's sibling
-  # finding).
-  #
-  # Calls .citation_make_stage_readable() directly rather than going through
-  # run_citation_reader(): the latter launches a real `docker run` whenever a
-  # daemon is reachable, which is true on every CI runner, and nothing here
-  # needs a reader to actually execute - only the permission sweep
-  # run_citation_reader() performs before it does.
-  old_umask <- Sys.umask("0077")
-  on.exit(Sys.umask(old_umask), add = TRUE)
+test_that("a token in this process's environment never reaches the evaluated file", {
+  # Not hypothetical, and not asserted only on the allowlist: a CITATION file
+  # is R code and may call Sys.getenv(), and this pipeline runs with a
+  # GITHUB_TOKEN that has push rights. Evaluated with the environment
+  # inherited, this exact fixture puts the token in the title column, which is
+  # published. What the file reads must be "".
+  withr::local_envvar(GITHUB_TOKEN = "ghp_notARealToken_0123456789")
+  root <- withr::local_tempdir()
+  inp <- stage_one(root, paste0(
+    'bibentry("Misc", title = Sys.getenv("GITHUB_TOKEN"), ',
+    'author = person("A", "B"), year = "2001")'))
 
-  tmp <- withr::local_tempdir()
-  stg <- withr::local_tempdir()
-  dir.create(file.path(tmp, "inst"))
-  writeBin(charToRaw('bibentry("Misc", title = "t")\n'), file.path(tmp, "inst", "CITATION"))
-  writeLines("Package: p\nVersion: 1.0\n", file.path(tmp, "DESCRIPTION"))
+  run <- run_citation_reader(inp, reader())
+  expect_equal(run$outcome, "ok")
+  expect_false(any(grepl("notARealToken", run$lines, fixed = TRUE)))
 
-  got <- stage_citation_inputs(tmp, stg, "p", "1.0", 1L, "2024-01-01")
-  expect_equal(nrow(got), 1L)
-
-  # The umask actually produced a restrictive tree - otherwise the assertions
-  # below would pass whether or not the fix does anything.
-  expect_equal(format(file.info(got$dir)$mode), "700")
-
-  .citation_make_stage_readable(dirname(got$dir))
-
-  expect_equal(format(file.info(got$dir)$mode), "755")
-  expect_equal(format(file.info(file.path(got$dir, "inst"))$mode), "755")
-  expect_equal(format(file.info(file.path(got$dir, "inst", "CITATION"))$mode), "644")
-  expect_equal(format(file.info(file.path(got$dir, "DESCRIPTION"))$mode), "644")
-})
-
-test_that("the container argument vector carries every isolation flag and mounts nothing extra", {
-  argv <- .citation_docker_argv("/host/stage", "/host/stage/out.ndjson",
-                                file.path("..", "..", "scripts", "cite_reader.R"),
-                                "rocker/r-ver:4.4.1")
-
-  flag_value <- function(flag) {
-    i <- which(argv == flag)
-    expect_length(i, 1L)
-    argv[[i + 1L]]
+  got <- parse_citation_records(run$lines, inp, run$outcome)
+  expect_equal(got$citations$status, "ok")
+  expect_equal(nrow(got$entries), 1L)
+  # An empty title is dropped by bibentry() rather than stored as "", so the
+  # column comes back NA. Either way it does not carry the token.
+  expect_true(is.na(got$entries$title))
+  no_token <- function(df) {
+    chr <- df[vapply(df, is.character, logical(1))]
+    !any(vapply(chr, function(col) any(grepl("notARealToken", col, fixed = TRUE)),
+                logical(1)))
   }
-
-  expect_equal(flag_value("--network"), "none")
-  expect_true("--read-only" %in% argv)
-  expect_equal(flag_value("--cap-drop"), "ALL")
-  expect_equal(flag_value("--security-opt"), "no-new-privileges")
-  # Non-root: both uid and gid are positive, so "0", "0:0" and "" all fail.
-  expect_match(flag_value("--user"), "^[1-9][0-9]*:[1-9][0-9]*$")
-  expect_true(nzchar(flag_value("--pids-limit")))
-  expect_true(nzchar(flag_value("--memory")))
-  expect_true(nzchar(flag_value("--cpus")))
-  expect_match(flag_value("--tmpfs"), "^/tmp:")
-
-  # Exactly three host mounts: the read-only stage, the read-only reader
-  # script, and the one writable output file. Nothing else from the host.
-  mounts <- argv[which(argv == "-v") + 1L]
-  expect_length(mounts, 3L)
-
-  stage_mount  <- mounts[startsWith(mounts, "/host/stage:")]
-  reader_mount <- mounts[grepl(":/reader\\.R:", mounts, fixed = FALSE)]
-  out_mount    <- mounts[grepl(":/out\\.ndjson:", mounts, fixed = FALSE)]
-  expect_length(stage_mount, 1L)
-  expect_length(reader_mount, 1L)
-  expect_length(out_mount, 1L)
-  expect_true(endsWith(stage_mount, ":ro"))
-  expect_true(endsWith(reader_mount, ":ro"))
-  expect_true(endsWith(out_mount, ":rw"))
-
-  # The output mount is the only writable one.
-  expect_equal(mounts[endsWith(mounts, ":rw")], out_mount)
-
-  # The command run inside the container names container-side paths, never
-  # the host paths that were just asserted above.
-  n <- length(argv)
-  expect_equal(argv[(n - 4L):n],
-              c("Rscript", "--vanilla", "/reader.R", "/stage/manifest.tsv", "/out.ndjson"))
+  expect_true(no_token(got$citations))
+  expect_true(no_token(got$payloads))
+  expect_true(no_token(got$entries))
 })
 
 cit_inputs <- function(...) {
@@ -245,7 +179,7 @@ cit_inputs <- function(...) {
 }
 
 test_that("a record whose id was never requested is refused", {
-  # The container evaluates code an author wrote. A forged record naming another
+  # The reader evaluates code an author wrote. A forged record naming another
   # package must not become that package's citation.
   inp <- cit_inputs(list(id = "k1", version = "1.0", is_current = 1L))
   lines <- c('{"t":"doc","id":"k1","status":"empty","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}',
@@ -464,41 +398,18 @@ test_that("a doc record with no status key at all is malformed", {
   expect_false(anyNA(got$citations$status))
 })
 
-# --- sandboxed records how a citation was read, independently of whether it
-# was read successfully: a debug run must never be mistaken for one that
-# went through the container, and that fact is not something a doc record
-# (code a package author wrote) gets any say in.
-
-test_that("an unsandboxed outcome yields sandboxed 0 while the doc's own status is preserved", {
-  inp <- cit_inputs(list(id = "k1", version = "1.0"))
-  doc <- '{"t":"doc","id":"k1","status":"empty","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}'
-  got <- parse_citation_records(c(doc, '{"t":"end"}'), inp, "unsandboxed")
-  expect_equal(got$citations$sandboxed, 0L)
-  # sandboxed must never be conflated with status: the doc said "empty", and
-  # that is still what is stored, not "unsandboxed".
-  expect_equal(got$citations$status, "empty")
-})
-
-test_that("an ok outcome yields sandboxed 1", {
-  inp <- cit_inputs(list(id = "k1", version = "1.0"))
-  doc <- '{"t":"doc","id":"k1","status":"empty","n_entries":0,"mheader":null,"mfooter":null,"header_scope":"none","message":null}'
-  got <- parse_citation_records(c(doc, '{"t":"end"}'), inp, "ok")
-  expect_equal(got$citations$sandboxed, 1L)
-})
-
-test_that("timeout, crashed and skipped outcomes all yield a non-NA sandboxed", {
+test_that("a whole-run outcome becomes the status of every version it covers", {
   inp <- cit_inputs(list(id = "k1", version = "1.0"))
   for (oc in c("timeout", "crashed", "skipped")) {
     got <- parse_citation_records(character(0L), inp, oc)
-    expect_false(anyNA(got$citations$sandboxed), info = oc)
-    expect_equal(got$citations$sandboxed, 1L, info = oc)
     expect_equal(got$citations$status, oc, info = oc)
+    expect_false(anyNA(got$citations$status), info = oc)
   }
 })
 
-test_that(".empty_citations_df() has exactly the ten columns in order, matching a populated frame", {
+test_that(".empty_citations_df() has exactly the nine columns in order, matching a populated frame", {
   want_names <- c("package", "version", "is_current", "payload_id",
-                  "source_sha256", "status", "sandboxed", "released_known",
+                  "source_sha256", "status", "released_known",
                   "message", "evaluated_at")
   empty <- .empty_citations_df()
   expect_equal(names(empty), want_names)
@@ -512,13 +423,13 @@ test_that(".empty_citations_df() has exactly the ten columns in order, matching 
 })
 
 test_that("a package with no citation-bearing version returns empty frames", {
-  # The reader must not be launched at all. Starting a container per package
+  # The reader must not be launched at all. Starting a process per package
   # regardless of whether it has anything to read would multiply the cost of the
   # three quarters of CRAN that ships no citation file. Asserted directly by
   # counting calls, not just by inspecting the (necessarily empty) result: an
-  # empty result is also what a container that started and returned nothing
-  # would produce, so checking only the frames would not catch a regression
-  # that launches the reader anyway.
+  # empty result is also what a reader that started and returned nothing would
+  # produce, so checking only the frames would not catch a regression that
+  # launches the reader anyway.
   calls <- 0L
   old <- run_citation_reader
   assign("run_citation_reader", function(...) { calls <<- calls + 1L; old(...) },
@@ -566,12 +477,13 @@ test_that("citation_reader_path() resolves to a file that actually exists", {
 })
 
 test_that("a whole-run failure's message reaches every row it produces", {
-  # run_citation_reader()'s own message (e.g. "a container is required to
-  # evaluate citation files") explains every row alike; discarding it makes a
-  # single misconfigured run indistinguishable from many independent crashes.
+  # run_citation_reader()'s own message (e.g. "env(1) is required to run the
+  # citation reader without this process's environment") explains every row
+  # alike; discarding it makes a single misconfigured run indistinguishable
+  # from many independent crashes.
   inp <- cit_inputs(list(id = "k1", version = "1.0"), list(id = "k2", version = "2.0"))
-  got <- parse_citation_records(character(0L), inp, "crashed", "a container is required")
-  expect_equal(got$citations$message, rep("a container is required", 2L))
+  got <- parse_citation_records(character(0L), inp, "crashed", "env(1) is required")
+  expect_equal(got$citations$message, rep("env(1) is required", 2L))
 })
 
 test_that("a whole-run message is not attached to a per-version doc that simply never arrived", {

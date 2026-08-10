@@ -12,7 +12,7 @@ cit_sum <- function(pkg, ver) {
 cit_one <- function(pkg, ver, pid, status = "ok") {
   data.frame(package = pkg, version = ver, is_current = 1L, payload_id = pid,
              source_sha256 = strrep("a", 64L), status = status,
-             sandboxed = 1L, released_known = 1L, message = NA_character_,
+             released_known = 1L, message = NA_character_,
              evaluated_at = "2026-08-08T00:00:00Z", stringsAsFactors = FALSE)
 }
 

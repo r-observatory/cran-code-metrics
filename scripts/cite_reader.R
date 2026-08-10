@@ -1,7 +1,9 @@
 # scripts/cite_reader.R: evaluates inst/CITATION and writes NDJSON.
 #
-# Runs inside the sandbox container, never in the pipeline process. Base R only,
-# so a stock R image needs no package installed alongside untrusted code.
+# Runs as its own process, never in the pipeline process: an evaluated file that
+# calls q() or segfaults must not take a worker down mid-shard, and one that
+# calls cat() must not write into the record stream. Base R only, so it needs
+# nothing installed alongside the code it evaluates.
 #
 # Invoked as:  Rscript --vanilla scripts/cite_reader.R <manifest.tsv> <out.ndjson>
 # Manifest:    one job per line, tab separated: id, dir, released (YYYY-MM-DD|NA)
@@ -19,7 +21,7 @@
 # resolving the real, untouched helper through ordinary lexical scoping.
 ccm_main <- local({
 
-# ---- JSON, hand-rolled so the container needs no packages ------------------
+# ---- JSON, hand-rolled so the reader needs no packages ---------------------
 
 .jesc <- function(x) {
   x <- gsub("\\", "\\\\", x, fixed = TRUE)
@@ -89,8 +91,11 @@ ccm_main <- local({
 #' the same rows.
 #'
 #' Masking is only for determinism. It is not a security boundary and is not
-#' relied on as one: eval(quote(f()), baseenv()) walks straight past it. The
-#' boundary is the container and what was staged into it.
+#' relied on as one: eval(quote(f()), baseenv()) walks straight past it, and
+#' nothing here confines what an evaluated file can do. What this process does
+#' guarantee is narrower and worth stating plainly: a crash here costs one
+#' package's citations rather than a worker's whole shard, and the environment
+#' it was started with holds no credential to read (scripts/citation.R).
 .eval_citation <- function(cfile, meta, released) {
   clock <- new.env(parent = globalenv())
   d <- as.Date(released)

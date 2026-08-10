@@ -1,5 +1,5 @@
-# The reader that runs inside the container. Invoked as a subprocess so the test
-# exercises the real entry point, not an internal function.
+# The reader the pipeline launches per package. Invoked as a subprocess so the
+# test exercises the real entry point, not an internal function.
 
 cite_reader_run <- function(jobs) {
   root <- withr::local_tempdir(.local_envir = parent.frame())

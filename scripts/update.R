@@ -177,18 +177,14 @@ default_io <- function() {
       combined[order(combined$package), ]
     },
 
+    # Unauthenticated, because github.com/cran is a public mirror and nothing
+    # here needs a credential to read it. Passing one put the token on git's
+    # command line, where every process on the machine could read it out of ps
+    # or /proc/<pid>/cmdline - including a citation file being evaluated by a
+    # sibling worker while this clone was in flight. The token had been here
+    # since the first commit without ever answering a measured rate limit.
     clone = function(pkg, dest) {
-      ok <- clone_package(pkg, dest, token = Sys.getenv("GITHUB_TOKEN", ""))
-      # The clone URL carries the token, and git writes it into
-      # work/<pkg>/.git/config. Nothing staged for the citation reader comes
-      # from this directory, but the credential has no reason to sit on disk for
-      # the life of the analysis either.
-      if (isTRUE(ok)) {
-        suppressWarnings(system2("git", c("-C", shQuote(dest), "remote", "set-url",
-                                          "origin", shQuote(paste0(CRAN_GIT_BASE, "/", pkg, ".git"))),
-                                 stdout = FALSE, stderr = FALSE))
-      }
-      ok
+      clone_package(pkg, dest)
     }
   )
 }

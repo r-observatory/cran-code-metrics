@@ -138,15 +138,26 @@ test_that("the child environment carries what R needs and no credential", {
 
 test_that("a token in this process's environment never reaches the evaluated file", {
   # Not hypothetical, and not asserted only on the allowlist: a CITATION file
-  # is R code and may call Sys.getenv(), and this pipeline runs with a
-  # GITHUB_TOKEN that has push rights. Evaluated with the environment
-  # inherited, this exact fixture puts the token in the title column, which is
-  # published. What the file reads must be "".
-  withr::local_envvar(GITHUB_TOKEN = "ghp_notARealToken_0123456789")
+  # is R code and may call Sys.getenv(), and this pipeline runs alongside
+  # credentials with push rights. Evaluated with the environment inherited,
+  # this exact fixture puts the token in the title column, which is published.
+  #
+  # The sentinel is bracketed rather than bare because an assertion that the
+  # title is merely absent proves too little: a scrub that dropped the field, or
+  # a reader that never ran the file at all, would satisfy it just as well as
+  # the property being tested. "T[]" can only be produced by evaluating
+  # Sys.getenv() and getting "" back, so one assertion carries both halves.
+  #
+  # Both names, because the workflow sets both and a fix that only covers the
+  # one that was named in the report is not a fix.
+  withr::local_envvar(GITHUB_TOKEN = "ghp_notARealToken_0123456789",
+                      GH_TOKEN = "ghp_alsoNotARealToken_9876543210")
   root <- withr::local_tempdir()
   inp <- stage_one(root, paste0(
-    'bibentry("Misc", title = Sys.getenv("GITHUB_TOKEN"), ',
-    'author = person("A", "B"), year = "2001")'))
+    'c(bibentry("Misc", title = paste0("T[", Sys.getenv("GITHUB_TOKEN"), "]"), ',
+    'author = person("A", "B"), year = "2001"), ',
+    'bibentry("Misc", title = paste0("G[", Sys.getenv("GH_TOKEN"), "]"), ',
+    'author = person("C", "D"), year = "2002"))'))
 
   run <- run_citation_reader(inp, reader())
   expect_equal(run$outcome, "ok")
@@ -154,18 +165,121 @@ test_that("a token in this process's environment never reaches the evaluated fil
 
   got <- parse_citation_records(run$lines, inp, run$outcome)
   expect_equal(got$citations$status, "ok")
-  expect_equal(nrow(got$entries), 1L)
-  # An empty title is dropped by bibentry() rather than stored as "", so the
-  # column comes back NA. Either way it does not carry the token.
-  expect_true(is.na(got$entries$title))
+  expect_equal(nrow(got$entries), 2L)
+  expect_identical(sort(got$entries$title), c("G[]", "T[]"))
   no_token <- function(df) {
     chr <- df[vapply(df, is.character, logical(1))]
-    !any(vapply(chr, function(col) any(grepl("notARealToken", col, fixed = TRUE)),
+    # The substring both sentinels share, so one pass covers either name.
+    !any(vapply(chr, function(col) any(grepl("otARealToken", col, fixed = TRUE)),
                 logical(1)))
   }
   expect_true(no_token(got$citations))
   expect_true(no_token(got$payloads))
   expect_true(no_token(got$entries))
+})
+
+test_that("the reader is refused, not run, when env(1) is missing", {
+  # The fail-closed half of the environment property, and the only half with no
+  # coverage until now: CI has env(1), so the token test above never reaches
+  # this branch. A change that replaced the refusal with a quiet fallback to a
+  # plain Rscript - which inherits this process's environment, credentials and
+  # all - would pass every other test in this file.
+  root <- withr::local_tempdir()
+  inp <- stage_one(root,
+    'bibentry("Misc", title = "T", author = person("A", "B"), year = "2001")')
+
+  withr::local_envvar(PATH = withr::local_tempdir())
+  skip_if(nzchar(Sys.which("env")), "env(1) is still resolvable with an empty PATH")
+
+  got <- run_citation_reader(inp, reader())
+  expect_equal(got$outcome, "crashed")
+  expect_match(got$message, "env(1) is required", fixed = TRUE)
+  expect_equal(length(got$lines), 0L)
+  # Refused rather than run: no reader was started, so there is no output file.
+  expect_false(file.exists(file.path(root, "out.ndjson")))
+})
+
+test_that("a process the evaluated file backgrounds does not outlive the reader", {
+  # The reader kills itself when it is done, and system2(timeout=) kills the
+  # process it started. Neither reaches a process an evaluated file put in the
+  # background: that one is reparented and keeps running, which is what makes
+  # tampering with the database later in the run practical. The reader is
+  # launched into its own process group and the group is killed, so it does not.
+  skip_on_os("windows")
+  watch  <- withr::local_tempdir()
+  marker <- file.path(watch, "marker")
+  ran    <- file.path(watch, "ran")
+
+  root <- withr::local_tempdir()
+  inp <- stage_one(root, paste0(
+    "system(", deparse(sprintf("(sleep 3; touch %s) &", shQuote(marker))), "); ",
+    "file.create(", deparse(ran), "); ",
+    'bibentry("Misc", title = "T", author = person("A", "B"), year = "2001")'))
+
+  got <- run_citation_reader(inp, reader())
+  expect_equal(got$outcome, "ok")
+  # Without this the assertion below passes for the wrong reason: a fixture
+  # whose system() call never ran leaves no marker either.
+  expect_true(file.exists(ran))
+
+  Sys.sleep(5)
+  expect_false(file.exists(marker))
+})
+
+test_that("a process group is killed only when it is provably not this one", {
+  # .kill_process_group() sends SIGKILL to a whole group. Everything that
+  # decides what group that is has to fail closed, because the failure mode is
+  # this worker killing itself and every package queued behind it.
+  f <- withr::local_tempfile()
+
+  own <- .own_process_group()
+  skip_if(is.na(own), "ps(1) did not report this process's group")
+
+  writeLines(as.character(own), f)
+  expect_true(is.na(.reader_process_group(f, own)))     # our own group
+  writeLines("1", f)
+  expect_true(is.na(.reader_process_group(f, own)))     # init
+  writeLines("not-a-pid", f)
+  expect_true(is.na(.reader_process_group(f, own)))     # forged
+  writeLines(character(0L), f)
+  expect_true(is.na(.reader_process_group(f, own)))     # never recorded
+  writeLines(c("101", "202"), f)
+  expect_true(is.na(.reader_process_group(f, own)))     # ambiguous
+
+  # NA when this process's own group is unknown, whatever was recorded: without
+  # it there is nothing to compare against, so there is no safe kill.
+  writeLines("424242", f)
+  expect_true(is.na(.reader_process_group(f, NA_integer_)))
+  expect_equal(.reader_process_group(f, own), 424242L)
+
+  expect_false(.kill_process_group(NA_integer_))
+  expect_false(.kill_process_group(integer(0L)))
+})
+
+test_that("the reader is started with the ceilings and its group recorded", {
+  # The command is assembled once and read here, because the three things it
+  # does interact: a limit that aborts the line, or an exec that hands the
+  # reader to a shell this process cannot redirect, changes the other two.
+  cmd <- .citation_reader_command("/usr/bin/env", "/usr/bin/Rscript",
+                                  c("--vanilla", "r.R"), "/tmp/pg")
+
+  expect_match(cmd, sprintf("ulimit -t %d", CITATION_CPU_SECONDS), fixed = TRUE)
+  expect_match(cmd, sprintf("ulimit -f %d", CITATION_FILE_SIZE_KB), fixed = TRUE)
+  expect_match(cmd, sprintf("ulimit -v %d", CITATION_ADDRESS_SPACE_KB), fixed = TRUE)
+  # Per-uid, so a value low enough to matter would strangle the pipeline's own
+  # parallel workers before it stopped anything hostile.
+  expect_no_match(cmd, "ulimit -u", fixed = TRUE)
+  # Recorded from the launching shell, which is alive by definition. Asking
+  # about the reader instead would return nothing for every package that
+  # finished quickly, which is nearly all of them.
+  expect_match(cmd, "ps -o pgid= -p $$", fixed = TRUE)
+  expect_match(cmd, "wait $reader", fixed = TRUE)
+  # exec would make the reader a direct child of the shell R wraps every
+  # system2() in, whose stderr is this process's and cannot be redirected from
+  # here; that shell then announces the reader's self-SIGKILL for every
+  # successful package.
+  expect_no_match(cmd, "exec ", fixed = TRUE)
+  expect_match(cmd, "env' -i", fixed = TRUE)
 })
 
 cit_inputs <- function(...) {

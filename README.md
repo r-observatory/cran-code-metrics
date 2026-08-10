@@ -46,7 +46,8 @@ that are new or have a new release, and writes the updated code and dataset
 databases plus their manifests. The bootstrap fills the full catalog over
 several runs: each shard is published so progress survives a restart, and the
 workflow keeps starting shards until the catalog is complete or a time budget
-is reached. Set `GITHUB_TOKEN` so git fetches are authenticated.
+is reached. No credential is needed or read: the mirror it clones from is
+public, and nothing under `scripts/` looks at `GITHUB_TOKEN` or `GH_TOKEN`.
 
 ## Notes
 

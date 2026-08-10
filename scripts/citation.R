@@ -34,15 +34,26 @@ citation_shipped <- function(files) {
 
 #' Stage the two files a citation reader needs, and nothing else.
 #'
-#' The reader is pointed at what is staged here and nothing else. It is
-#' deliberately not given the extracted package tree, the clone, or the
-#' workspace: the clone URL carries a write-scoped token (git.R:16-27 writes it
-#' into work/<pkg>/.git/config), and an evaluated citation file has no business
-#' being handed the analysis. Two files go in, and nothing else is named to it.
-#' That narrows what is in front of an evaluated file, not what a determined one
-#' could reach - the reader is an ordinary process with this user's filesystem
-#' access. What it is genuinely denied is this process's environment, which
-#' run_citation_reader() builds by name rather than passing on.
+#' The reader is pointed at what is staged here and nothing else: not the
+#' extracted package tree, not the clone, not the workspace. Two files go in,
+#' and no other path is named to it.
+#'
+#' What that is worth has changed, so it is worth saying exactly. The original
+#' reason was that the clone URL carried a write-scoped token, which git wrote
+#' into work/<pkg>/.git/config, and staging kept an evaluated file from being
+#' pointed at it. That reason is gone: the clone is unauthenticated (update.R),
+#' so there is no credential in the workspace to be kept away from.
+#'
+#' What staging still achieves is narrower. The two files are copies, so a file
+#' that rewrites its own inst/CITATION or DESCRIPTION damages a scratch copy
+#' rather than the tree the metrics were computed from, and the reader's inputs
+#' do not shift when the analysis's do. What it does not achieve is confinement:
+#' the reader is an ordinary process with this user's filesystem access, and an
+#' evaluated file can name any path it likes whether or not we named it first.
+#' Confinement is elsewhere - the reader is handed an environment built by name
+#' rather than inherited, runs under a wall clock plus CPU, address-space and
+#' file-size ceilings, and is killed as a process group so that nothing it
+#' started outlives it (run_citation_reader()).
 #'
 #' Bytes are read with readBin rather than through ctx$read, because the context
 #' reader collapses readLines output and so drops the trailing newline and
@@ -138,6 +149,113 @@ stage_citation_inputs <- function(tmp, stage_dir, package, version,
   c(sprintf("R_HOME=%s", R.home()), sprintf("%s=%s", names(vals), vals))
 }
 
+#' This process's own process group, or NA when it cannot be determined.
+#'
+#' Read rather than assumed, because it is the only thing standing between
+#' .kill_process_group() and this shard killing itself. NA when ps(1) is absent
+#' or says something unexpected, and every caller treats NA as "do not kill":
+#' losing the group kill costs one stray process, and getting it wrong costs the
+#' worker and every package still queued behind it.
+.own_process_group <- function() {
+  out <- tryCatch(
+    suppressWarnings(system2("ps", c("-o", "pgid=", "-p", Sys.getpid()),
+                             stdout = TRUE, stderr = FALSE)),
+    error = function(e) character(0L))
+  out <- trimws(out)
+  out <- out[nzchar(out)]
+  if (length(out) != 1L || !grepl("^[0-9]+$", out)) return(NA_integer_)
+  suppressWarnings(as.integer(out))
+}
+
+#' The reader's process group, as its own launching shell recorded it.
+#'
+#' Refused, rather than returned, unless it is a positive integer that is
+#' neither an init-like group nor this process's own. That last check is what
+#' makes the kill safe: system2(timeout=) runs its command in a new process
+#' group, so a value equal to ours means the isolation did not happen and
+#' killing it would take this worker down with the reader.
+#'
+#' @param path Path the launching shell wrote its process group id to.
+#' @param own  This process's group, from .own_process_group().
+#' @return Integer process group, or NA when there is nothing safe to kill.
+.reader_process_group <- function(path, own = .own_process_group()) {
+  if (is.na(own)) return(NA_integer_)
+  txt <- tryCatch(readLines(path, warn = FALSE), error = function(e) character(0L))
+  txt <- trimws(txt)
+  txt <- txt[nzchar(txt)]
+  if (length(txt) != 1L || !grepl("^[0-9]+$", txt)) return(NA_integer_)
+  pgid <- suppressWarnings(as.integer(txt))
+  if (is.na(pgid) || pgid <= 1L || identical(pgid, own)) return(NA_integer_)
+  pgid
+}
+
+#' SIGKILL a whole process group.
+#'
+#' Through the shell rather than tools::pskill(), which refuses a negative pid
+#' and so cannot address a group at all: pskill(-pgid) returns FALSE without
+#' signalling anything. A group that is already empty is not an error worth
+#' reporting - the common case is that the reader exited cleanly and left
+#' nothing behind - so the exit status is discarded.
+#'
+#' @param pgid Process group from .reader_process_group(); NA does nothing.
+#' @return TRUE when a kill was attempted, FALSE when there was nothing to kill.
+.kill_process_group <- function(pgid) {
+  if (length(pgid) != 1L || is.na(pgid)) return(invisible(FALSE))
+  tryCatch(
+    suppressWarnings(system2("/bin/sh",
+                             c("-c", shQuote(sprintf("kill -9 -%d", pgid))),
+                             stdout = FALSE, stderr = FALSE)),
+    error = function(e) NULL)
+  invisible(TRUE)
+}
+
+#' The single shell command that starts one reader.
+#'
+#' Assembled in one place because the three things it has to do interact, and
+#' each of them is wrong on its own.
+#'
+#' It records the process group before starting anything, from `$$` rather than
+#' from the reader's pid: the reader usually exits in well under a second, and
+#' asking ps(1) about a process that has already gone gives nothing at all. The
+#' launching shell is in the same group and is alive by definition.
+#'
+#' It applies the ceilings one per line rather than as a single ulimit call, so
+#' that a limit the platform rejects (macOS refuses -v) does not take the others
+#' down with it, and tolerates each failure so that a shell without one of them
+#' still runs the reader.
+#'
+#' It starts the reader in the background and waits, rather than exec-ing it.
+#' The reader ends by killing itself (cite_reader.R), and whichever shell has it
+#' as a direct child announces that death on its own stderr. exec-ing hands that
+#' role to the shell R wraps every system2() in, whose stderr is this process's
+#' and cannot be redirected from here - which is where a 2 KB `Killed: 9` line
+#' per successful package came from. Waiting keeps the announcement inside a
+#' shell whose stderr system2() has already pointed at /dev/null, and lets that
+#' shell exit with the reader's status so R sees an ordinary exit.
+#'
+#' @param envbin,rscript Absolute paths to env(1) and Rscript.
+#' @param argv    Arguments for Rscript.
+#' @param pgid_path Where the shell should record its process group.
+#' @return A single /bin/sh command string.
+.citation_reader_command <- function(envbin, rscript, argv, pgid_path) {
+  # system2 pastes args into a shell string and quotes only the command, so
+  # every element has to be quoted here.
+  reader <- paste(shQuote(envbin), "-i",
+                  paste(shQuote(.citation_child_env()), collapse = " "),
+                  shQuote(rscript),
+                  paste(shQuote(argv), collapse = " "))
+  paste(c(
+    sprintf("ulimit -t %d 2>/dev/null || :", CITATION_CPU_SECONDS),
+    sprintf("ulimit -f %d 2>/dev/null || :", CITATION_FILE_SIZE_KB),
+    sprintf("ulimit -v %d 2>/dev/null || :", CITATION_ADDRESS_SPACE_KB),
+    sprintf("ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' > %s || :",
+            shQuote(pgid_path)),
+    paste(reader, "& reader=$!"),
+    "wait $reader",
+    "exit $?"
+  ), collapse = "; ")
+}
+
 #' Evaluate one package's staged citation files.
 #'
 #' One reader process per package. Never one per version, because process start
@@ -191,16 +309,29 @@ run_citation_reader <- function(inputs_df, reader_path) {
   # handed names that same installation.
   rscript <- file.path(R.home("bin"), "Rscript")
 
-  # system2 pastes args into a shell string and quotes only the command, so
-  # every element has to be quoted here.
+  # Deliberately not under the staging root: that root is the one directory an
+  # evaluated file is told about, and this file decides what gets a SIGKILL.
+  # The pid is in the name explicitly rather than left to tempfile(): these run
+  # in forked mclapply workers that share a temporary directory, and two workers
+  # agreeing on this path would have each of them killing the other's reader.
+  pgidf <- tempfile(sprintf("ccm_reader_pgid_%d_", Sys.getpid()))
+  on.exit(unlink(pgidf), add = TRUE)
+
   rc <- tryCatch(
-    suppressWarnings(system2(envbin,
-                             c("-i", shQuote(.citation_child_env()),
-                               shQuote(rscript), shQuote(argv)),
-                             stdout = FALSE, stderr = FALSE,
-                             timeout = CITATION_TIMEOUT)),
+    suppressWarnings(
+      system2("/bin/sh",
+              c("-c", shQuote(.citation_reader_command(envbin, rscript, argv, pgidf))),
+              stdout = FALSE, stderr = FALSE, timeout = CITATION_TIMEOUT)),
     error = function(e) 1L
   )
+
+  # On completion and on timeout alike, because the reader outliving its own
+  # exit is the point. system2(timeout=) kills the process it started and
+  # nothing else, so a process an evaluated file backgrounded is reparented and
+  # keeps running - long enough to write to the database this run is about to
+  # publish. Killing the group reaches it whether the reader exited cleanly, was
+  # killed by a ceiling, or ran out of wall clock.
+  .kill_process_group(.reader_process_group(pgidf))
 
   lines <- tryCatch(readLines(outf, warn = FALSE), error = function(e) character(0L))
   list(lines = lines, outcome = .citation_outcome(lines, rc), message = "")

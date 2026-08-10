@@ -56,6 +56,14 @@ next one, so peak disk stays small. Repositories that no longer exist are skippe
 and recorded in the manifest. All metrics are computed from git and the package
 source; there is no external `cloc` dependency.
 
+`inst/CITATION` files are evaluated to record what `citation()` renders for a
+package. That file is R code a CRAN package author wrote, so it runs in its own
+subprocess under a wall clock plus CPU, address-space and file-size ceilings
+(`scripts/config.R`, `scripts/citation.R`). The address-space ceiling is applied
+with `ulimit -v`, which macOS's `/bin/sh` refuses outright; on macOS that one
+ceiling is silently not in force, while the CPU-time and file-size ceilings
+still apply. CI runs Linux, where all three apply.
+
 ## Feedback
 
 Found a bug, a wrong number, or a missing package? Report it at [r-observatory/feedback](https://github.com/r-observatory/feedback/issues/new/choose). All feedback about R Observatory, the site, the data, and the pipelines, is tracked in one place.

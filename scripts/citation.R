@@ -1,5 +1,6 @@
 # scripts/citation.R: reading inst/CITATION out of a released version.
-# Dependency: config.R must be sourced first (CITATION_TIMEOUT).
+# Dependency: config.R must be sourced first (CITATION_TIMEOUT,
+# CITATION_CPU_SECONDS, CITATION_FILE_SIZE_KB, CITATION_ADDRESS_SPACE_KB).
 
 #' Whether a released version ships the file utils::citation() reads.
 #'
@@ -52,8 +53,14 @@ citation_shipped <- function(files) {
 #' evaluated file can name any path it likes whether or not we named it first.
 #' Confinement is elsewhere - the reader is handed an environment built by name
 #' rather than inherited, runs under a wall clock plus CPU, address-space and
-#' file-size ceilings, and is killed as a process group so that nothing it
-#' started outlives it (run_citation_reader()).
+#' file-size ceilings, and is killed as a process group when it returns or
+#' times out (run_citation_reader()). What that guarantees is narrower than
+#' "nothing it started outlives it": a process the file merely backgrounds
+#' stays in the reader's group and dies with the kill, but a process that
+#' deliberately leaves the group (a call to setsid(), say) is not addressed by
+#' `kill -9 -<pgid>` at all and keeps running. Measured, not assumed: such a
+#' process wrote its output about 25 seconds after the reader had already
+#' exited, under a process group id of its own.
 #'
 #' Bytes are read with readBin rather than through ctx$read, because the context
 #' reader collapses readLines output and so drops the trailing newline and
@@ -197,13 +204,26 @@ stage_citation_inputs <- function(tmp, stage_dir, package, version,
 #' reporting - the common case is that the reader exited cleanly and left
 #' nothing behind - so the exit status is discarded.
 #'
+#' Checked with `kill -0` immediately before the `kill -9`, not just left to
+#' the pgid != own guard in .reader_process_group(): this call runs after
+#' system2() has already reaped the reader, so on the common path the group is
+#' empty by the time we get here and its id is free for the kernel to hand to
+#' any new process on the machine, including a sibling worker's own reader.
+#' `kill -0` confirms something is still using the id right before `kill -9`
+#' is sent to it. That narrows the window rather than closing it - a process
+#' can still be assigned the id between the check and the kill - but the
+#' pgid != own guard only protects this worker's own reader from itself, not a
+#' sibling's.
+#'
 #' @param pgid Process group from .reader_process_group(); NA does nothing.
 #' @return TRUE when a kill was attempted, FALSE when there was nothing to kill.
 .kill_process_group <- function(pgid) {
   if (length(pgid) != 1L || is.na(pgid)) return(invisible(FALSE))
   tryCatch(
     suppressWarnings(system2("/bin/sh",
-                             c("-c", shQuote(sprintf("kill -9 -%d", pgid))),
+                             c("-c", shQuote(sprintf(
+                               "kill -0 -%d 2>/dev/null && kill -9 -%d 2>/dev/null || :",
+                               pgid, pgid))),
                              stdout = FALSE, stderr = FALSE)),
     error = function(e) NULL)
   invisible(TRUE)

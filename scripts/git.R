@@ -6,20 +6,29 @@
 
 #' Clone a CRAN mirror repo from github.com/cran.
 #'
+#' Unauthenticated, unconditionally: github.com/cran is a public mirror, and
+#' this function has no branch that can put a credential in the clone URL.
+#' It used to: a `token` parameter built
+#' https://x-access-token:<token>@github.com/cran/<pkg>.git from it, and that
+#' URL is what system2() passes as an argv element to git, where every other
+#' process on the machine can read it out of ps or /proc/<pid>/cmdline for the
+#' length of the clone - including a citation file being evaluated by a
+#' sibling worker while the clone was in flight. That branch is removed, not
+#' merely unused, so the leak it made possible cannot be reintroduced by a
+#' future call site.
+#'
+#' If the CRAN mirror ever genuinely needs authentication, do it without
+#' putting the credential in argv or in the clone URL (which git also writes
+#' into <dest>/.git/config verbatim): GIT_ASKPASS, a git credential helper, or
+#' `git -c http.extraHeader=@<file>`, which reads the header from a file git
+#' opens itself rather than a value passed on the command line.
+#'
 #' @param pkg   Package name (exact case as it appears on CRAN).
 #' @param dest  Local path for the clone (passed as <directory> to git clone).
 #' @param base  Base URL; defaults to CRAN_GIT_BASE.
-#' @param token Optional GitHub personal access token. When supplied the clone
-#'   URL becomes https://x-access-token:<token>@github.com/cran/<pkg>.git so
-#'   the request authenticates without a credential helper or .netrc.
 #' @return TRUE on success, FALSE on any failure (404, network, etc.).
-clone_package <- function(pkg, dest, base = CRAN_GIT_BASE, token = NULL) {
-  if (!is.null(token) && nzchar(token)) {
-    url <- paste0("https://x-access-token:", token,
-                  "@github.com/cran/", pkg, ".git")
-  } else {
-    url <- paste0(base, "/", pkg, ".git")
-  }
+clone_package <- function(pkg, dest, base = CRAN_GIT_BASE) {
+  url <- paste0(base, "/", pkg, ".git")
   rc <- suppressWarnings(
     system2("git", c("clone", "--quiet", url, dest),
             stdout = FALSE, stderr = FALSE, timeout = GIT_TIMEOUT)

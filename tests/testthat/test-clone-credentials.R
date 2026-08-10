@@ -48,14 +48,21 @@ test_that("the URL a clone records carries no credential", {
   expect_identical(url, paste0(m$base, "/pkgA.git"))
 })
 
+test_that("clone_package has no token parameter to fall back on", {
+  # clone_package() no longer has an authenticated branch to send a future
+  # call down (scripts/git.R) - deleted, not merely unused. Asserted here as a
+  # structural guard: a `token` argument reappearing in the signature is the
+  # first step toward the leak this replaced, and this test catches that step
+  # directly rather than relying on nobody calling it that way.
+  expect_identical(names(formals(clone_package)), c("pkg", "dest", "base"))
+})
+
 test_that("the pipeline's own clone is unauthenticated", {
-  # The assertion that matters, because clone_package() keeps its token
-  # parameter: what changed is that the pipeline stopped passing one. Pointing
-  # CRAN_GIT_BASE at a local mirror is what gives this teeth. A token at the
-  # call site sends clone_package() down its authenticated branch, which ignores
-  # `base` and builds an https://x-access-token:...@github.com/... URL, so the
-  # clone of this fixture would fail and the recorded URL would not be the
-  # mirror's - either way this test fails rather than passing quietly.
+  # Pointing CRAN_GIT_BASE at a local mirror is what gives this teeth: if
+  # default_io()$clone() ever grew its own way of building an authenticated
+  # URL instead of passing `base` straight through, the clone of this fixture
+  # would fail or the recorded URL would not be the mirror's - either way this
+  # test fails rather than passing quietly.
   skip_if(!nzchar(Sys.which("git")), "git is required")
   m <- .local_cran_mirror(withr::local_tempdir(), "pkgB")
   dest <- file.path(withr::local_tempdir(), "clone")

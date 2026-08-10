@@ -91,10 +91,18 @@ CITATION_ADDRESS_SPACE_KB <- as.integer(
 
 # Largest single file the reader may write (ulimit -f), in blocks. Its own
 # output is one NDJSON record per version plus one per entry, a few megabytes
-# for the largest package on CRAN. bash counts 1024-byte blocks and dash counts
-# 512-byte blocks, so the effective cap is 256 MiB or 128 MiB depending on which
-# /bin/sh is present; both sit in the same wide gap between what the reader
-# writes and a size that would matter. It caps one file, not the total written,
-# so it bounds a runaway write rather than preventing a deliberate one.
+# for the largest package on CRAN.
+#
+# The block size ulimit -f counts in depends on which shell is running as
+# /bin/sh, not on the OS as such - measured directly, on this machine: macOS's
+# own /bin/sh is bash under the hood (`/bin/sh -c 'echo $BASH_VERSION'` prints
+# a version), and bash's ulimit -f counts 1024-byte blocks, so 262144 caps a
+# write at 268,435,456 bytes (256 MiB); /bin/dash counts 512-byte blocks, so
+# the same number caps a write at 134,217,728 bytes (128 MiB) under a /bin/sh
+# that resolves to dash, as it does by default on Debian- and Ubuntu-based
+# systems including this project's CI. Both sit in the same wide gap between
+# what the reader writes and a size that would matter. It caps one file, not
+# the total written, so it bounds a runaway write rather than preventing a
+# deliberate one.
 CITATION_FILE_SIZE_KB <- as.integer(
   Sys.getenv("CITATION_FILE_SIZE_KB", unset = "262144"))

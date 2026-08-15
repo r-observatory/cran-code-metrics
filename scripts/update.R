@@ -563,6 +563,37 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       n_versions = nrow(fresh_summary),
                       shard_failures = length(shard_failures)))
 
+  # ---- 8c. Retention guard --------------------------------------------------
+  # The published database is the pipeline's accumulated state, so publishing a
+  # smaller one overwrites collection nobody can recover except from an older
+  # release. The check belongs here rather than in the workflow's
+  # publish_metrics(): this is the last point where both this run's figures and
+  # the previous release's are in hand as data, publish_metrics is shell, and
+  # rewriting the comparison in jq would put the one check nobody can unit-test
+  # in the one place nobody reads. Refusing here IS refusing to publish: the
+  # step runs under `set -euo pipefail` and calls this script before it renders
+  # notes or touches `gh release`, so a non-zero exit stops the run first.
+  # The manifests above are written before the check on purpose. They are the
+  # evidence for the message, and nothing publishes them once we stop.
+  for (w in retention_warnings("code", code_manifest)) {
+    warning(w, call. = FALSE, immediate. = TRUE)
+  }
+  rebuilding <- isTRUE(force_full) || full_rebuild_requested()
+  violations <- c(
+    retention_violations(
+      "code", code_manifest,
+      read_manifest_file(file.path(out_dir, "prev-code-manifest.json")),
+      prior_tag = Sys.getenv("PREV_CODE_TAG", ""), force_full = rebuilding),
+    retention_violations(
+      "data", data_manifest,
+      read_manifest_file(file.path(out_dir, "prev-data-manifest.json")),
+      prior_tag = Sys.getenv("PREV_DATA_TAG", ""), force_full = rebuilding))
+  if (length(violations) > 0L) {
+    stop("refusing to publish: this run would drop history the previous ",
+         "release carried.\n  ", paste(violations, collapse = "\n  "),
+         retention_repair_advice(), call. = FALSE)
+  }
+
   if (length(fresh_pkgs) > 0L) {
     record_changed_packages(file.path(out_dir, "changed-packages.txt"), fresh_pkgs)
   }
@@ -852,6 +883,13 @@ run_harvest <- function(io, out_dir, ...) {
 # CLI entry point
 # ---------------------------------------------------------------------------
 if (identical(sys.nframe(), 0L)) {
+  # R prints at most warning.length bytes of an error and silently drops the
+  # rest, and the default is 1000. The retention refusal is longer than that
+  # once it lists the violations, and the half that falls off the end is the
+  # half telling the operator what to actually do, which is the whole point of
+  # writing it. 8170 is the documented maximum.
+  options(warning.length = 8170L)
+
   # Standalone invocation (Rscript scripts/update.R): source the pipeline in
   # dependency order. Locate this script's directory so it works from any cwd.
   .script_dir <- {
@@ -866,6 +904,7 @@ if (identical(sys.nframe(), 0L)) {
                              pattern = "[.]R$", full.names = TRUE))) source(.f)
   source(file.path(.script_dir, "analyze.R"))
   source(file.path(.script_dir, "export.R"))
+  source(file.path(.script_dir, "retention.R"))
 
   args <- commandArgs(trailingOnly = TRUE)
 

@@ -137,14 +137,16 @@ jobs:
             if have_asset "$CODE_SRC" cran-code-metrics.db; then
               get_asset "$CODE_SRC" cran-code-metrics.db
             fi
-            # code-manifest.json is the current name; manifest.json is the
-            # pre-split one, kept so a legacy code- tag still yields a baseline.
+            # code-manifest.json only. The pre-split manifest.json still
+            # attached to the `current` release cannot serve as a baseline: it
+            # has no series and no n_packages, and its n_versions is
+            # nrow(fresh_summary), one shard's row count rather than a database
+            # total, so preflight.R rejects it on sight. A tag whose manifest
+            # is missing or unusable gets its baseline measured from the
+            # database that did come back instead.
             if have_asset "$CODE_SRC" code-manifest.json; then
               get_asset "$CODE_SRC" code-manifest.json
               mv out/code-manifest.json out/prev-code-manifest.json
-            elif have_asset "$CODE_SRC" manifest.json; then
-              get_asset "$CODE_SRC" manifest.json
-              mv out/manifest.json out/prev-code-manifest.json
             fi
           fi
           if [ -n "$DATA_SRC" ]; then
@@ -155,9 +157,6 @@ jobs:
             if have_asset "$DATA_SRC" cran-data-metrics.db; then
               get_asset "$DATA_SRC" cran-data-metrics.db
             fi
-            # No manifest.json fallback on this side: the pre-split single
-            # manifest is the code series, and using it as the dataset baseline
-            # would measure cran_dataset_versions against a code n_versions.
             if have_asset "$DATA_SRC" data-manifest.json; then
               get_asset "$DATA_SRC" data-manifest.json
               mv out/data-manifest.json out/prev-data-manifest.json
@@ -169,7 +168,10 @@ jobs:
           # any shard writes to it. Rows, not bytes: a --harvest-descriptions
           # run clobbers the database asset and leaves the published manifest
           # stale, which moves the file size but never touches
-          # cran_code_summary.
+          # cran_code_summary. This is also where a release that published a
+          # database and no manifest gets a baseline measured from that
+          # database, so an interrupted upload costs a warning rather than
+          # every run from here on.
           Rscript scripts/preflight.R out/
 
           # Snapshot the pre-run package set so the release notes can tag

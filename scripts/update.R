@@ -591,8 +591,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   if (length(violations) > 0L) {
     stop("refusing to publish: this run would drop history the previous ",
          "release carried.\n  ", paste(violations, collapse = "\n  "),
-         "\nIf the shrink is intended, re-run with force_full so the wipe is ",
-         "recorded as a choice.", call. = FALSE)
+         retention_repair_advice(), call. = FALSE)
   }
 
   if (length(fresh_pkgs) > 0L) {
@@ -884,6 +883,13 @@ run_harvest <- function(io, out_dir, ...) {
 # CLI entry point
 # ---------------------------------------------------------------------------
 if (identical(sys.nframe(), 0L)) {
+  # R prints at most warning.length bytes of an error and silently drops the
+  # rest, and the default is 1000. The retention refusal is longer than that
+  # once it lists the violations, and the half that falls off the end is the
+  # half telling the operator what to actually do, which is the whole point of
+  # writing it. 8170 is the documented maximum.
+  options(warning.length = 8170L)
+
   # Standalone invocation (Rscript scripts/update.R): source the pipeline in
   # dependency order. Locate this script's directory so it works from any cwd.
   .script_dir <- {

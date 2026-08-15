@@ -17,6 +17,16 @@
 # published, and refuses the publish when history would be lost. The tolerances
 # are not guesses; each one is calibrated against the largest movement that
 # field has actually made, measured across the 30 releases of 2026-07-15..08-14.
+#
+# A guard on a pipeline that runs three times a day also has to fail toward
+# recovery. Its job is to stop a bad publish, not to become a state nobody can
+# get out of, and its message is part of the mechanism rather than decoration:
+# an operator who follows it has to end up better off, never holding a wiped
+# database. That is why the comparison against the shipped manifest is
+# one-sided, why a release that published no manifest gets a baseline measured
+# from its database rather than a refusal that repeats every run, and why
+# retention_repair_advice() names the release-level repair and rules force_full
+# out.
 
 # The floor for a field is the MORE PERMISSIVE of a ratio and a flat row
 # allowance: max_loss = 0 means "ratio only". A flat allowance matters on a
@@ -199,49 +209,138 @@ retention_warnings <- function(series, current) {
           .ret_fmt(api), .ret_fmt(summ), .ret_fmt(n_ver))
 }
 
-#' Whether a downloaded prior database agrees with the manifest that shipped
-#' with it.
+#' What an operator should actually do when one of these guards refuses.
 #'
-#' Exact equality, and in rows rather than bytes: a --harvest-descriptions run
-#' clobbers the database asset while leaving the published manifest stale, so
-#' the file size can legitimately differ from db_bytes, but harvest only ever
-#' writes cran_archived_meta and can never move these two counts.
+#' The message is part of the mechanism, so it gets the same care as the
+#' comparison. The first version of it named force_full as the only way
+#' forward, and force_full IS the wipe: update.R runs DELETE FROM
+#' cran_code_summary, cran_code_churn and cran_api_history, the shard publishes
+#' the resulting 400-package database as latest, and FORCE_FULL_REBUILD then
+#' exempts every later shard and every re-dispatch from this check. Rebuilding
+#' 33,282 packages at 400 a shard takes days, and the viewer serves a gutted
+#' catalog throughout. An operator following that advice out of a recoverable
+#' mishap would have destroyed exactly what the guard was protecting.
+#'
+#' @return A single string, ready to append to a refusal.
+retention_repair_advice <- function() {
+  paste0(
+    "\nLook at the PREVIOUS release first. publish_metrics uploads four assets ",
+    "in one `gh release upload --clobber`, which deletes each existing asset ",
+    "before uploading its replacement and cannot do so atomically, so an ",
+    "interrupted publish can leave one shard's database beside another ",
+    "shard's manifest.\n",
+    "If that is what happened, open the release the download step resolved as ",
+    "code src / data src and make its assets agree again: re-upload the ",
+    "database and the manifest that belong together, or delete that release ",
+    "so the day before it becomes latest again. Then re-run.\n",
+    "If that release is consistent, this run really did lose the rows, and ",
+    "the cause is upstream of the publish. Do not paper over it here.\n",
+    "force_full is not the repair either way. It deletes cran_code_summary, ",
+    "cran_code_churn and cran_api_history and republishes a 400-package ",
+    "catalog as latest, which is the outcome this check exists to prevent. ",
+    "Use it only for a rebuild of the whole catalog that you actually want.")
+}
+
+#' Whether a downloaded prior database has LESS in it than the manifest that
+#' shipped with it recorded.
+#'
+#' One-sided on purpose. Only `now < was` is the signature this guard is for: a
+#' truncated file, or a database from before the rows the manifest counted. The
+#' other direction, a database with MORE rows than its manifest, is what an
+#' interrupted `gh release upload --clobber` leaves when shard N's database
+#' lands and shard N-1's manifest is still attached, and it costs nothing: a
+#' smaller baseline only makes the retention floor more permissive, never less.
+#' Demanding equality in both directions made that mishap permanent, because
+#' the same release is still `latest_tag metrics` tomorrow and the day after,
+#' so every scheduled run failed in the download step before analysing a single
+#' package. See prior_db_notes() for how the stale side is reported instead.
+#'
+#' In rows rather than bytes: a --harvest-descriptions run clobbers the
+#' database asset while leaving the published manifest stale, so the file size
+#' can legitimately differ from db_bytes, but harvest only ever writes
+#' cran_archived_meta and can never move these two counts.
 #'
 #' @param series "code" or "data".
 #' @param counts list(n_packages, n_versions) measured from the downloaded DB.
 #' @param prior  Manifest published alongside that DB, or NULL (nothing to check).
 #' @return Character vector of violations, possibly empty.
 prior_db_violations <- function(series, counts, prior) {
-  if (is.null(prior) || length(prior) == 0L) return(character(0L))
-  tbls <- .RETENTION_KEY_TABLES[[series]]
+  tbls <- .ret_prior_tables(series, prior)
   if (is.null(tbls)) return(character(0L))
-
-  declared <- as.character(prior$series %||% "")
-  if (!identical(declared, series)) {
-    # The pre-split single manifest.json is the code series. Measuring the
-    # dataset database against it would compare cran_dataset_versions to a code
-    # n_versions and call a healthy database broken.
-    return(sprintf(
-      "the %s baseline manifest declares series \"%s\"; it does not describe %s",
-      series, declared, tbls$ver_table))
-  }
+  if (is.character(tbls)) return(tbls)
 
   out <- character(0L)
   was_ver <- .ret_at(prior, "n_versions")
   now_ver <- as.numeric(counts$n_versions %||% 0)
-  if (!is.null(was_ver) && now_ver != was_ver) {
+  if (!is.null(was_ver) && now_ver < was_ver) {
     out <- c(out, sprintf(
       "the downloaded %s database holds %s rows in %s; the manifest published with it says %s",
       series, .ret_fmt(now_ver), tbls$ver_table, .ret_fmt(was_ver)))
   }
   was_pkg <- .ret_at(prior, "n_packages")
   now_pkg <- as.numeric(counts$n_packages %||% 0)
-  if (!is.null(was_pkg) && now_pkg != was_pkg) {
+  if (!is.null(was_pkg) && now_pkg < was_pkg) {
     out <- c(out, sprintf(
       "the downloaded %s database covers %s packages in %s; the manifest published with it says %s",
       series, .ret_fmt(now_pkg), tbls$pkg_table, .ret_fmt(was_pkg)))
   }
   out
+}
+
+#' A downloaded prior database that is AHEAD of the manifest shipped with it.
+#'
+#' Not a violation, but not nothing either: it says the previous publish was
+#' interrupted partway through its four assets, and the release will keep
+#' handing out a mismatched pair until someone fixes it. Worth an annotation in
+#' the log every run, so it gets noticed before something less benign lands in
+#' the same window.
+#'
+#' @inheritParams prior_db_violations
+#' @return Character vector of notes, possibly empty.
+prior_db_notes <- function(series, counts, prior) {
+  tbls <- .ret_prior_tables(series, prior)
+  if (is.null(tbls) || is.character(tbls)) return(character(0L))
+
+  out <- character(0L)
+  was_ver <- .ret_at(prior, "n_versions")
+  now_ver <- as.numeric(counts$n_versions %||% 0)
+  if (!is.null(was_ver) && now_ver > was_ver) {
+    out <- c(out, sprintf(paste0(
+      "the downloaded %s database holds %s rows in %s but the manifest ",
+      "published with it says %s: the previous publish did not finish ",
+      "uploading its four assets. Building on it anyway (a smaller baseline ",
+      "only loosens the retention floor), but re-upload the manifest that ",
+      "belongs with that database."),
+      series, .ret_fmt(now_ver), tbls$ver_table, .ret_fmt(was_ver)))
+  }
+  was_pkg <- .ret_at(prior, "n_packages")
+  now_pkg <- as.numeric(counts$n_packages %||% 0)
+  if (!is.null(was_pkg) && now_pkg > was_pkg) {
+    out <- c(out, sprintf(paste0(
+      "the downloaded %s database covers %s packages in %s but the manifest ",
+      "published with it says %s"),
+      series, .ret_fmt(now_pkg), tbls$pkg_table, .ret_fmt(was_pkg)))
+  }
+  out
+}
+
+# Shared preamble for the two functions above: NULL when there is nothing to
+# compare, a character violation when the manifest describes a different
+# series, and the key-table names when the comparison can go ahead.
+.ret_prior_tables <- function(series, prior) {
+  if (is.null(prior) || length(prior) == 0L) return(NULL)
+  tbls <- .RETENTION_KEY_TABLES[[series]]
+  if (is.null(tbls)) return(NULL)
+  declared <- as.character(prior$series %||% "")
+  if (!identical(declared, series)) {
+    # Measuring the dataset database against a code manifest would compare
+    # cran_dataset_versions to a code n_versions and call a healthy database
+    # broken.
+    return(sprintf(
+      "the %s baseline manifest declares series \"%s\"; it does not describe %s",
+      series, declared, tbls$ver_table))
+  }
+  tbls
 }
 
 # Count rows and distinct packages in one table of a database file. A table
@@ -261,24 +360,114 @@ prior_db_violations <- function(series, counts, prior) {
   list(n_versions = n_ver, n_packages = n_pkg)
 }
 
+# The two series the download step brings back, named once.
+.ret_prior_specs <- function() list(
+  list(series = "code", manifest = "prev-code-manifest.json", db = DB_FILENAME),
+  list(series = "data", manifest = "prev-data-manifest.json", db = DATA_DB_FILENAME)
+)
+
+# The row counts a series' checks actually read, so a baseline measured from a
+# database carries exactly the fields retention_violations() will look for.
+.ret_check_tables <- function(series) {
+  checks <- .RETENTION_CHECKS[[series]]
+  if (is.null(checks)) return(character(0L))
+  paths <- vapply(checks, function(chk) chk$path, character(1L))
+  sub("^tables\\.", "", grep("^tables\\.", paths, value = TRUE))
+}
+
+#' A baseline measured from a downloaded database, for a release that
+#' published no manifest.
+#'
+#' The publish is not atomic (four assets, one --clobber, each existing asset
+#' deleted before its replacement lands), so a run that died in that window can
+#' leave a release carrying its database and no code-manifest.json. Refusing on
+#' that was a permanent outage: the same release stays latest, so every later
+#' run refused too, and the only recovery the refusal named was the wipe.
+#'
+#' The database is right there and it is the thing worth protecting, so measure
+#' it. The result is a real floor for retention_violations(): a run that then
+#' publishes less than what came back is still refused. It deliberately carries
+#' no bootstrap.n_universe, because nothing in the file records what the
+#' universe was; .ret_at() skips a field the baseline does not carry.
+#'
+#' Returns NULL when there is nothing to measure. An absent or empty database
+#' is exactly what a lost download leaves, and must stay indistinguishable from
+#' it, so it yields no baseline and retention_violations() refuses on the tag.
+#'
+#' @param series  "code" or "data".
+#' @param db_path Path to the downloaded database.
+#' @return A manifest-shaped list, or NULL.
+derive_baseline_manifest <- function(series, db_path) {
+  tbls <- .RETENTION_KEY_TABLES[[series]]
+  if (is.null(tbls) || !file.exists(db_path)) return(NULL)
+  size <- as.numeric(file.info(db_path)$size)
+  if (length(size) != 1L || is.na(size) || size <= 0) return(NULL)
+  counts <- .ret_db_counts(db_path, tbls$ver_table, tbls$pkg_table)
+  if (counts$n_versions <= 0 || counts$n_packages <= 0) return(NULL)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), db_path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  present <- DBI::dbListTables(con)
+  wanted <- .ret_check_tables(series)
+  table_counts <- stats::setNames(lapply(wanted, function(t) {
+    if (!t %in% present) return(0)
+    as.numeric(DBI::dbGetQuery(con, sprintf('SELECT COUNT(*) n FROM "%s"', t))$n)
+  }), wanted)
+
+  list(schema_version = 1L, series = series,
+       measured_from = basename(db_path), db_bytes = round(size),
+       n_packages = counts$n_packages, n_versions = counts$n_versions,
+       tables = table_counts)
+}
+
+#' Give a series a baseline when the prior release published none.
+#'
+#' Writes prev-<series>-manifest.json from the downloaded database, and only
+#' when that file is absent. A manifest that IS present is never replaced, even
+#' when it disagrees with the database: absence of a record is not evidence
+#' that nothing was lost, but a record saying the database used to be bigger
+#' is, and prior_db_violations() has to keep seeing it.
+#'
+#' @param out_dir Directory holding the downloaded assets.
+#' @return Character vector of notes describing what was measured, empty when
+#'   every series already had a published manifest.
+ensure_prior_baseline <- function(out_dir) {
+  notes <- character(0L)
+  for (spec in .ret_prior_specs()) {
+    mpath <- file.path(out_dir, spec$manifest)
+    if (file.exists(mpath)) next
+    derived <- derive_baseline_manifest(spec$series, file.path(out_dir, spec$db))
+    if (is.null(derived)) next
+    jsonlite::write_json(derived, mpath, auto_unbox = TRUE, pretty = TRUE)
+    notes <- c(notes, sprintf(paste0(
+      "the prior release carries %s but no %s manifest, which is what an ",
+      "interrupted `gh release upload --clobber` leaves. The baseline for ",
+      "this run was measured from the database instead: %s packages, %s rows ",
+      "in %s. Re-upload the manifest that belongs with that database so the ",
+      "next run has a published record to check against."),
+      spec$db, spec$series, .ret_fmt(derived$n_packages),
+      .ret_fmt(derived$n_versions),
+      .RETENTION_KEY_TABLES[[spec$series]]$ver_table))
+  }
+  notes
+}
+
 #' Check both downloaded prior databases against their manifests.
 #'
 #' Called once per run, from the download step, before any shard writes: the
-#' equality only holds on the first shard, because every later shard has
+#' comparison only holds on the first shard, because every later shard has
 #' legitimately added rows to the same file while prev-*-manifest.json still
 #' describes yesterday's release.
 #'
 #' @param out_dir Directory holding the downloaded prev-*-manifest.json files
 #'   and the two databases.
-#' @return Character vector of violations, empty when both agree (or when
-#'   there is no baseline manifest to check against).
+#' @return list(violations, notes). violations is empty when the run may build
+#'   on what came back; notes carries the recoverable mismatches, which are
+#'   worth saying out loud and are not worth stopping a daily pipeline for.
 preflight_prior_dbs <- function(out_dir) {
-  specs <- list(
-    list(series = "code", manifest = "prev-code-manifest.json", db = DB_FILENAME),
-    list(series = "data", manifest = "prev-data-manifest.json", db = DATA_DB_FILENAME)
-  )
-  out <- character(0L)
-  for (spec in specs) {
+  out   <- character(0L)
+  notes <- character(0L)
+  for (spec in .ret_prior_specs()) {
     mpath <- file.path(out_dir, spec$manifest)
     if (!file.exists(mpath)) next          # no baseline: nothing to check here
     prior <- read_manifest_file(mpath)
@@ -296,7 +485,8 @@ preflight_prior_dbs <- function(out_dir) {
     }
     tbls <- .RETENTION_KEY_TABLES[[spec$series]]
     counts <- .ret_db_counts(dbpath, tbls$ver_table, tbls$pkg_table)
-    out <- c(out, prior_db_violations(spec$series, counts, prior))
+    out   <- c(out, prior_db_violations(spec$series, counts, prior))
+    notes <- c(notes, prior_db_notes(spec$series, counts, prior))
   }
-  out
+  list(violations = out, notes = notes)
 }

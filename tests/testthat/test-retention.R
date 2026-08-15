@@ -277,20 +277,20 @@ test_that("preflight_prior_dbs reads the real databases and reports a truncated 
   m$n_packages <- 2L
   m$n_versions <- 3L
   write_manifest(file.path(out, "prev-code-manifest.json"), m)
-  expect_identical(preflight_prior_dbs(out), character(0L))
+  expect_identical(preflight_prior_dbs(out)$violations, character(0L))
 
   # Same manifest, a database that lost its rows.
   con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
   DBI::dbExecute(con, "DELETE FROM cran_code_summary")
   DBI::dbDisconnect(con)
-  v <- preflight_prior_dbs(out)
+  v <- preflight_prior_dbs(out)$violations
   expect_true(any(grepl("cran_code_summary", v, fixed = TRUE)))
 })
 
 test_that("preflight_prior_dbs reports a baseline manifest whose database never arrived", {
   out <- withr::local_tempdir()
   write_manifest(file.path(out, "prev-code-manifest.json"), .code_manifest_0814())
-  v <- preflight_prior_dbs(out)
+  v <- preflight_prior_dbs(out)$violations
   expect_true(any(grepl(DB_FILENAME, v, fixed = TRUE)))
 })
 
@@ -409,4 +409,150 @@ test_that("update.yml fails the run when a prior asset does not arrive", {
   # The shard loop must carry the rebuild exemption for the whole run, not
   # just for the shard that gets --bootstrap.
   expect_true(grepl("FORCE_FULL_REBUILD", y, fixed = TRUE))
+})
+
+# ---------------------------------------------------------------------------
+# The publish is not atomic, and the guard must not turn that into an outage
+# ---------------------------------------------------------------------------
+# publish_metrics() uploads four assets in one `gh release upload --clobber`,
+# which deletes each existing asset before uploading its replacement. gh cannot
+# do that atomically, so a 502, a dropped connection, the 350-minute job
+# timeout or an operator cancel can leave a release carrying shard N's database
+# next to shard N-1's manifest, or no manifest at all. Both states are read by
+# every later run, because the same release stays `latest_tag metrics`
+# tomorrow and the day after.
+
+test_that("a database ahead of its manifest proceeds, and one short of it refuses", {
+  m <- .code_manifest_0814()
+  # Shard N's database against shard N-1's manifest: a stale record, not a
+  # loss. A smaller baseline only makes the retention floor more permissive.
+  ahead <- list(n_packages = m$n_packages + 3L, n_versions = m$n_versions + 412L)
+  expect_identical(prior_db_violations("code", ahead, m), character(0L))
+  n <- prior_db_notes("code", ahead, m)
+  expect_true(length(n) > 0L)
+  expect_true(any(grepl("207876", n, fixed = TRUE)))
+  expect_true(any(grepl("207464", n, fixed = TRUE)))
+
+  # One row short is still a truncated file.
+  short <- list(n_packages = m$n_packages, n_versions = m$n_versions - 1L)
+  expect_true(length(prior_db_violations("code", short, m)) > 0L)
+  expect_identical(prior_db_notes("code", short, m), character(0L))
+})
+
+test_that("preflight_prior_dbs notes a stale manifest instead of failing the run", {
+  out <- withr::local_tempdir()
+  con <- open_or_init_db(file.path(out, DB_FILENAME))
+  DBI::dbWriteTable(con, "cran_code_summary", data.frame(
+    package = c("a", "a", "b"), version = c("1.0", "1.1", "2.0"),
+    stringsAsFactors = FALSE), append = TRUE)
+  DBI::dbDisconnect(con)
+  m <- .code_manifest_0814()
+  m$n_packages <- 1L
+  m$n_versions <- 1L
+  write_manifest(file.path(out, "prev-code-manifest.json"), m)
+
+  res <- preflight_prior_dbs(out)
+  expect_identical(res$violations, character(0L))
+  expect_true(any(grepl("cran_code_summary", res$notes, fixed = TRUE)))
+})
+
+test_that("a prior release that published no manifest still yields a baseline", {
+  out <- withr::local_tempdir()
+  con <- open_or_init_db(file.path(out, DB_FILENAME))
+  DBI::dbWriteTable(con, "cran_code_summary", data.frame(
+    package = c("a", "a", "b"), version = c("1.0", "1.1", "2.0"),
+    stringsAsFactors = FALSE), append = TRUE)
+  DBI::dbDisconnect(con)
+
+  notes <- ensure_prior_baseline(out)
+  expect_true(any(grepl(DB_FILENAME, notes, fixed = TRUE)))
+  m <- read_manifest_file(file.path(out, "prev-code-manifest.json"))
+  expect_identical(as.character(m$series), "code")
+  expect_equal(as.numeric(m$n_versions), 3)
+  expect_equal(as.numeric(m$n_packages), 2)
+  expect_true(as.numeric(m$db_bytes) > 0)
+
+  # It is a real floor, not a formality.
+  shrunk <- .code_manifest_0814()
+  shrunk$n_packages <- 1L
+  shrunk$n_versions <- 1L
+  expect_true(length(retention_violations("code", shrunk, m)) > 0L)
+  # And the check that runs next must not trip on the file just written.
+  expect_identical(preflight_prior_dbs(out)$violations, character(0L))
+})
+
+test_that("a missing manifest with no usable database is still the wipe state", {
+  out <- withr::local_tempdir()
+  expect_identical(ensure_prior_baseline(out), character(0L))
+  expect_false(file.exists(file.path(out, "prev-code-manifest.json")))
+
+  # An empty database is exactly what a lost download leaves, so it is not a
+  # baseline either.
+  con <- open_or_init_db(file.path(out, DB_FILENAME))
+  DBI::dbDisconnect(con)
+  expect_identical(ensure_prior_baseline(out), character(0L))
+  expect_false(file.exists(file.path(out, "prev-code-manifest.json")))
+
+  expect_true(length(retention_violations(
+    "code", .code_manifest_wiped(), NULL, prior_tag = "metrics-2026-08-14")) > 0L)
+})
+
+test_that("a published manifest is never replaced by a derived one", {
+  out <- withr::local_tempdir()
+  con <- open_or_init_db(file.path(out, DB_FILENAME))
+  DBI::dbWriteTable(con, "cran_code_summary", data.frame(
+    package = "a", version = "1.0", stringsAsFactors = FALSE), append = TRUE)
+  DBI::dbDisconnect(con)
+  write_manifest(file.path(out, "prev-code-manifest.json"), .code_manifest_0814())
+
+  expect_identical(ensure_prior_baseline(out), character(0L))
+  expect_equal(as.numeric(read_manifest_file(
+    file.path(out, "prev-code-manifest.json"))$n_versions), 207464)
+})
+
+# ---------------------------------------------------------------------------
+# The message is part of the mechanism
+# ---------------------------------------------------------------------------
+
+test_that("the refusal names a repair and does not offer force_full as one", {
+  env <- environment(run_update)
+  old <- .ret_stub_analyze(env)
+  on.exit(assign("analyze_package", old, envir = env), add = TRUE)
+
+  out <- withr::local_tempdir()
+  write_manifest(file.path(out, "prev-code-manifest.json"), .code_manifest_0814())
+  write_manifest(file.path(out, "prev-data-manifest.json"), .data_manifest_0814())
+
+  msg <- tryCatch({ run_update(.ret_io(), out, shard_size = 10L); "" },
+                  error = function(e) conditionMessage(e))
+  expect_true(nzchar(msg))
+  # force_full IS the wipe: it DELETEs cran_code_summary, cran_code_churn and
+  # cran_api_history and republishes 400 packages as latest, and the exemption
+  # then covers every later shard and every re-dispatch.
+  expect_false(grepl("re-run with force_full", msg, fixed = TRUE))
+  expect_true(grepl("force_full is not the repair", msg, fixed = TRUE))
+  # An operator following the message has to end up somewhere better.
+  expect_true(grepl("re-upload", msg, fixed = TRUE))
+  expect_true(grepl("delete", msg, fixed = TRUE))
+})
+
+test_that("update.yml does not reach for a manifest preflight cannot read", {
+  yml <- paste(readLines(file.path("..", "..", ".github", "workflows",
+                                   "update.yml")), collapse = "\n")
+  # The pre-split manifest.json carries no series and its n_versions is one
+  # shard's row count, so preflight refused it on sight. A tag whose manifest
+  # cannot be read now gets its baseline measured from the database instead.
+  expect_false(grepl('have_asset "$CODE_SRC" manifest.json', yml, fixed = TRUE))
+  expect_false(grepl("mv out/manifest.json", yml, fixed = TRUE))
+})
+
+test_that("the refusal survives R's error-printing limit", {
+  # R prints at most getOption("warning.length") bytes of an error and drops
+  # the rest. At the default 1000 the advice was cut off mid-sentence, which
+  # leaves the operator with the refusal and none of the repair.
+  expect_true(nchar(retention_repair_advice()) > 500L)
+  for (f in c("update.R", "preflight.R")) {
+    src <- paste(readLines(file.path("..", "..", "scripts", f)), collapse = "\n")
+    expect_true(grepl("options(warning.length", src, fixed = TRUE))
+  }
 })

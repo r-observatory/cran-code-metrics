@@ -14,15 +14,23 @@
 #' a compact catalog summary. The same body is written to both notes files,
 #' since both the code and dataset releases describe the same run.
 #'
-#' prev_code_tag/prev_data_tag/title_prefix are accepted for call-site
-#' compatibility (the workflow still passes them) but no longer affect the
-#' rendered content: the new format has no delta-from-previous section and
-#' no top-level title heading (the GitHub release title already carries it).
+#' Three optional files in the same directory make the notes say more, and
+#' their absence costs nothing but the sentences they would have carried:
+#' prev-code-manifest.json and prev-data-manifest.json (what the workflow
+#' downloaded from the release this run started from) supply the change since
+#' that release, and run-status.json supplies the shard's failure count.
+#'
+#' prev_code_tag names the release the deltas are measured against.
+#' prev_data_tag/title_prefix are accepted for call-site compatibility (the
+#' workflow still passes them) but do not affect the rendered content: the
+#' body has no top-level title heading, since the GitHub release title
+#' already carries it.
 #'
 #' @param out_dir Directory holding the manifests, changed-packages.txt,
 #'   seed-packages.txt, and the two databases; also where the two
 #'   release-notes-*.md files are written.
-#' @param prev_code_tag Unused; retained for signature compatibility.
+#' @param prev_code_tag Tag of the release this run started from; labels the
+#'   deltas. NULL/"" leaves them labelled generically.
 #' @param prev_data_tag Unused; retained for signature compatibility.
 #' @param title_prefix Unused; retained for signature compatibility.
 #' @return Invisibly NULL.
@@ -36,6 +44,19 @@ render_notes <- function(out_dir, prev_code_tag = NULL, prev_data_tag = NULL,
 
   code_manifest <- jsonlite::fromJSON(file.path(out_dir, "code-manifest.json"))
   data_manifest <- jsonlite::fromJSON(file.path(out_dir, "data-manifest.json"))
+
+  # Optional inputs: a cold start has no previous release, and a caller other
+  # than the workflow may not write a run status. A file that is present but
+  # unreadable is treated the same as absent, since notes are not worth failing
+  # a publish over.
+  read_optional <- function(name) {
+    path <- file.path(out_dir, name)
+    if (!file.exists(path)) return(NULL)
+    tryCatch(jsonlite::fromJSON(path), error = function(e) NULL)
+  }
+  prev_code  <- read_optional("prev-code-manifest.json")
+  prev_data  <- read_optional("prev-data-manifest.json")
+  run_status <- read_optional("run-status.json")
 
   code_path <- file.path(out_dir, DB_FILENAME)
   data_path <- file.path(out_dir, DATA_DB_FILENAME)
@@ -54,7 +75,11 @@ render_notes <- function(out_dir, prev_code_tag = NULL, prev_data_tag = NULL,
   }, add = TRUE)
 
   notes <- build_release_notes(code_manifest, data_manifest, changed, seed,
-                               code_con, data_con)
+                               code_con, data_con,
+                               prev_code_manifest = prev_code,
+                               prev_data_manifest = prev_data,
+                               run_status = run_status,
+                               baseline = prev_code_tag)
 
   writeLines(notes, file.path(out_dir, "release-notes-code.md"))
   writeLines(notes, file.path(out_dir, "release-notes-data.md"))

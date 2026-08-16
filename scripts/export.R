@@ -1251,81 +1251,96 @@ format_bytes <- function(n) {
 #' rowid_ column (expected to be selected as `rowid AS rowid_, *`) when
 #' present.
 #'
+#' Selected with one order() over the whole slice rather than split()/rbind()
+#' per package. Same winner, and the difference is not academic: the notes are
+#' rendered from every changed package, so a --recollect run put 33,282
+#' packages and 207,465 rows through this function, where the per-package
+#' split-and-rebind cost three minutes of the shard's clock.
+#'
 #' @param rows data.frame from .fetch_by_package() for cran_code_summary;
 #'   may have zero rows.
-#' @return data.frame, one row per distinct package present in `rows`.
+#' @return data.frame, one row per distinct package present in `rows`,
+#'   ordered by package name.
 .pick_latest_rows <- function(rows) {
-  if (nrow(rows) == 0L) return(rows)
-  has_lrd <- "latest_release_date" %in% names(rows)
-  has_rid <- "rowid_" %in% names(rows)
-  chosen <- lapply(split(rows, rows$package), function(pr) {
-    if (has_lrd) {
-      marked <- pr[!is.na(pr$latest_release_date), , drop = FALSE]
-      if (nrow(marked) > 0L) {
-        marked <- marked[order(marked$version, decreasing = TRUE), , drop = FALSE]
-        return(marked[1L, , drop = FALSE])
-      }
-    }
-    if (has_rid) {
-      pr <- pr[order(pr$rowid_, decreasing = TRUE), , drop = FALSE]
-    }
-    pr[1L, , drop = FALSE]
-  })
-  do.call(rbind, chosen)
+  n <- nrow(rows)
+  if (n == 0L) return(rows)
+  marked <- if ("latest_release_date" %in% names(rows)) {
+    !is.na(rows$latest_release_date)
+  } else {
+    rep(FALSE, n)
+  }
+  # Version only breaks ties among marked rows, matching the per-package rule:
+  # an unmarked group is decided by rowid, not by version.
+  vkey <- ifelse(marked, as.character(rows$version), "")
+  rid  <- if ("rowid_" %in% names(rows)) as.numeric(rows$rowid_) else rep(0, n)
+  ord  <- order(rows$package, !marked, -xtfrm(vkey), -rid, seq_len(n))
+  keep <- ord[!duplicated(rows$package[ord])]
+  rows[keep, , drop = FALSE]
 }
 
-#' Derive the notes table's four numeric metrics from one latest-version row
-#' of cran_code_summary, binding to the real schema with the documented
-#' fallbacks. A column absent from the row's schema, or NA for this specific
+#' Derive the notes table's numeric metrics from latest-version rows of
+#' cran_code_summary, binding to the real schema with the documented
+#' fallbacks. A column absent from the frame's schema, or NA for a specific
 #' package, yields NA (rendered "n/a" downstream) -- never a fabricated 0.
 #'
-#' @param row One-row data.frame (as returned by .pick_latest_rows()).
-#' @return list(loc_r, functions, exports, deps); each a scalar or NA.
-.row_metrics <- function(row) {
-  g   <- function(col) row[[col]] %||% NA
-  has <- function(col) col %in% names(row)
+#' Vectorised over rows: one call covers the whole changed set, because a
+#' catch-up run hands this function tens of thousands of packages.
+#'
+#' @param rows data.frame of one row per package (as returned by
+#'   .pick_latest_rows()); may have zero rows.
+#' @return list(loc_r, functions, exports, deps, api_added, api_removed,
+#'   bump); each a vector as long as nrow(rows).
+.row_metrics <- function(rows) {
+  n   <- nrow(rows)
+  has <- function(col) col %in% names(rows)
+  num <- function(col) {
+    if (!has(col)) return(rep(NA_real_, n))
+    suppressWarnings(as.numeric(rows[[col]]))
+  }
+  chr <- function(col) {
+    if (!has(col)) return(rep(NA_character_, n))
+    as.character(rows[[col]])
+  }
 
-  loc_r <- g("loc_r")
+  loc_r <- num("loc_r")
 
   # Functions: n_exports + n_internal when the schema carries the split
   # columns; the fused rpkg-analyzer field n_fns_r only when it does not.
+  ne <- num("n_exports"); ni <- num("n_internal")
   functions <- if (has("n_exports") || has("n_internal")) {
-    ne <- g("n_exports"); ni <- g("n_internal")
-    if (is.na(ne) && is.na(ni)) {
-      NA_integer_
-    } else {
-      (if (is.na(ne)) 0L else as.integer(ne)) + (if (is.na(ni)) 0L else as.integer(ni))
-    }
-  } else if (has("n_fns_r")) {
-    g("n_fns_r")
+    ifelse(is.na(ne) & is.na(ni), NA_real_,
+           ifelse(is.na(ne), 0, ne) + ifelse(is.na(ni), 0, ni))
   } else {
-    NA_integer_
+    num("n_fns_r")
   }
 
-  exports <- g("n_exports")
+  exports <- ne
 
   # Deps: n_deps_direct when available; else a best-effort count parsed out
-  # of the raw Depends/Imports DESCRIPTION text (excluding R itself).
-  deps <- {
-    d <- g("n_deps_direct")
-    if (!is.na(d)) {
-      as.integer(d)
-    } else {
-      parts_present <- c(g("depends"), g("imports"))
-      parts_present <- parts_present[!is.na(parts_present)]
-      dep_txt <- paste(parts_present, collapse = ",")
-      if (!nzchar(trimws(dep_txt))) {
-        NA_integer_
-      } else {
-        pkg_names <- strsplit(dep_txt, ",", fixed = TRUE)[[1L]]
-        pkg_names <- trimws(sub("\\s*\\(.*", "", pkg_names, perl = TRUE))
-        pkg_names <- pkg_names[nzchar(pkg_names) & !grepl("^R$", pkg_names, perl = TRUE)]
-        length(pkg_names)
-      }
-    }
+  # of the raw Depends/Imports DESCRIPTION text (excluding R itself). The
+  # parse runs only for the rows that need it, which is normally none.
+  deps <- num("n_deps_direct")
+  gap  <- which(is.na(deps))
+  if (length(gap) > 0L && (has("depends") || has("imports"))) {
+    dep_txt <- chr("depends")[gap]
+    imp_txt <- chr("imports")[gap]
+    deps[gap] <- vapply(seq_along(gap), function(i) {
+      parts <- c(dep_txt[i], imp_txt[i])
+      parts <- parts[!is.na(parts)]
+      txt   <- paste(parts, collapse = ",")
+      if (!nzchar(trimws(txt))) return(NA_real_)
+      pkg_names <- strsplit(txt, ",", fixed = TRUE)[[1L]]
+      pkg_names <- trimws(sub("\\s*\\(.*", "", pkg_names, perl = TRUE))
+      pkg_names <- pkg_names[nzchar(pkg_names) & !grepl("^R$", pkg_names, perl = TRUE)]
+      as.numeric(length(pkg_names))
+    }, numeric(1L))
   }
 
-  list(loc_r = loc_r, functions = functions, exports = exports, deps = deps)
+  # What the release actually did to the package's API, which the summary row
+  # already carries per version and nothing downstream of the manifest reads.
+  list(loc_r = loc_r, functions = functions, exports = exports, deps = deps,
+       api_added = num("exports_added_n"), api_removed = num("exports_removed_n"),
+       bump = chr("bump_type"))
 }
 
 #' Count each package's rows in the dataset database's identity table.
@@ -1355,6 +1370,54 @@ format_bytes <- function(n) {
   format(round(as.numeric(x)), big.mark = ",", trim = TRUE, scientific = FALSE)
 }
 
+#' Size of a rendered notes body in bytes, counted the way GitHub receives it.
+#'
+#' writeLines() terminates every line, so each line costs its own bytes plus a
+#' newline. Bytes rather than characters because the body is compared against a
+#' limit on what is sent, and a package or maintainer name can be multi-byte.
+#'
+#' @param lines Character vector of markdown lines.
+#' @return Integer byte count.
+.notes_bytes <- function(lines) {
+  if (length(lines) == 0L) return(0L)
+  as.integer(sum(nchar(lines, type = "bytes")) + length(lines))
+}
+
+#' A parenthesised, signed change against the previous release, or "" when
+#' there is nothing to compare against.
+#'
+#' Zero prints as "(+0)" rather than vanishing: a bullet with no parenthesis
+#' means no baseline, and a reader has to be able to tell that apart from a
+#' figure that did not move.
+#'
+#' @param cur  Current figure (numeric-ish scalar), or NULL.
+#' @param prev Previous release's figure (numeric-ish scalar), or NULL.
+#' @return "" or a string like " (+1,204)".
+.fmt_delta <- function(cur, prev) {
+  if (is.null(cur) || is.null(prev)) return("")
+  a <- suppressWarnings(as.numeric(cur))
+  b <- suppressWarnings(as.numeric(prev))
+  if (length(a) != 1L || length(b) != 1L || is.na(a) || is.na(b)) return("")
+  d <- a - b
+  sprintf(" (%s%s)", if (d >= 0) "+" else "-", .fmt_n(abs(d)))
+}
+
+#' Fetch a nested manifest field (e.g. "tables.cran_datasets") without
+#' erroring on a manifest that predates the field.
+#'
+#' @param manifest Parsed manifest (list), or NULL.
+#' @param ...      Path components.
+#' @return The value, or NULL when any component is absent.
+.manifest_at <- function(manifest, ...) {
+  path <- c(...)
+  cur <- manifest
+  for (p in path) {
+    if (is.null(cur) || !is.list(cur) || !(p %in% names(cur))) return(NULL)
+    cur <- cur[[p]]
+  }
+  if (length(cur) == 0L) NULL else cur
+}
+
 #' Build the one-paragraph headline: new/updated counts, catalog size, and
 #' the bootstrap clause.
 #'
@@ -1362,8 +1425,12 @@ format_bytes <- function(n) {
 #' @param changed_pkgs  Character vector, this run's changed packages.
 #' @param seed_pkgs     Character vector, the prior release's package set
 #'   ("new to the catalog" = not present here).
-#' @return A single-line string.
-.build_headline <- function(code_manifest, changed_pkgs, seed_pkgs) {
+#' @param run_status    Parsed run-status.json (list), or NULL. Used only to
+#'   report the shard's failures, which are otherwise visible nowhere but the
+#'   CI log.
+#' @return Character vector of one or two lines (one markdown paragraph).
+.build_headline <- function(code_manifest, changed_pkgs, seed_pkgs,
+                            run_status = NULL) {
   n_changed <- length(changed_pkgs)
   n_new     <- sum(!changed_pkgs %in% seed_pkgs)
   n_updated <- n_changed - n_new
@@ -1397,119 +1464,326 @@ format_bytes <- function(n) {
   new_word <- if (isTRUE(n_new == 1L)) "package" else "packages"
   pkg_word <- if (isTRUE(as.numeric(code_manifest$n_packages) == 1)) "package" else "packages"
   ver_word <- if (isTRUE(as.numeric(code_manifest$n_versions) == 1)) "version" else "versions"
-  sprintf(
+  headline <- sprintf(
     "%s %s new to the catalog, %s updated. Now tracking %s %s across %s %s.%s",
     .fmt_n(n_new), new_word, .fmt_n(n_updated),
     .fmt_n(code_manifest$n_packages), pkg_word,
     .fmt_n(code_manifest$n_versions), ver_word,
     bootstrap_clause)
+
+  # A package that failed to analyze is not in the table, not in the counts, and
+  # until now not in the notes either: the only trace was a line in a CI log
+  # nobody opens on a green run. Said here, with the shard it came from, so the
+  # number is comparable run to run.
+  n_fail <- suppressWarnings(as.numeric(.manifest_at(run_status, "shard_failures") %||% 0))
+  fail_line <- if (length(n_fail) == 1L && !is.na(n_fail) && n_fail > 0) {
+    sprintf(
+      "%s of the %s packages in the most recent shard failed to analyze and are retried until %d consecutive failures retire them.",
+      .fmt_n(n_fail), .fmt_n(.manifest_at(run_status, "n_shard")), MAX_CLONE_FAILURES)
+  } else {
+    character(0L)
+  }
+
+  c(headline, fail_line)
 }
 
 #' Build the "Updated this release" table's rows: one row per changed
-#' package that has a row in the code DB, sorted alphabetically, with its
-#' latest-version metrics and dataset count.
+#' package that has a row in the code DB, with its latest-version metrics,
+#' what the release did to its API, and its dataset count.
+#'
+#' Row order is decided here, and it is not the alphabet. A release that
+#' removed an export sorts first, because that is the change that can break a
+#' package downstream; then by how many exports moved at all; then by code
+#' size; then by name, so the order is stable between runs. The point is the
+#' cap: when the table cannot show everything, what it drops should be the
+#' quietest changes, not everything after the letter B. The bootstrap's
+#' 33,282-package listing showed a11yShiny through ABHgenotypeR.
 #'
 #' @param code_con     Open DBI connection to the code database, or NULL.
 #' @param data_con     Open DBI connection to the dataset database, or NULL.
 #' @param changed_pkgs Character vector, this run's changed packages.
 #' @param seed_pkgs    Character vector, the prior release's package set.
-#' @return data.frame: package, version (tagged " (new)" as appropriate),
-#'   loc_r, functions, exports, deps, datasets. Zero rows when there is
-#'   nothing to show.
+#' @return data.frame: package, version (tagged " (new)" or with its bump
+#'   type), loc_r, functions, exports, api_added, api_removed, deps,
+#'   datasets, most consequential first. Zero rows when there is nothing to
+#'   show.
 .build_package_rows <- function(code_con, data_con, changed_pkgs, seed_pkgs) {
   empty <- data.frame(package = character(0L), version = character(0L),
-                      loc_r = integer(0L), functions = integer(0L),
-                      exports = integer(0L), deps = integer(0L),
-                      datasets = integer(0L), stringsAsFactors = FALSE)
+                      loc_r = numeric(0L), functions = numeric(0L),
+                      exports = numeric(0L), api_added = numeric(0L),
+                      api_removed = numeric(0L), deps = numeric(0L),
+                      datasets = numeric(0L), stringsAsFactors = FALSE)
   if (is.null(code_con) || length(changed_pkgs) == 0L) return(empty)
+  if (!"cran_code_summary" %in% DBI::dbListTables(code_con)) return(empty)
 
-  raw <- .fetch_by_package(code_con, "cran_code_summary", changed_pkgs,
-                           select = "rowid AS rowid_, *")
+  # Name the columns instead of SELECT *: cran_code_summary is 233 columns
+  # wide, and the notes read every version of every changed package, so a
+  # catch-up run pulled hundreds of megabytes across to print forty rows.
+  # Intersected with the live schema so an older database simply reports n/a
+  # for what it never stored.
+  wanted <- c("package", "version", "loc_r", "n_exports", "n_internal",
+              "n_fns_r", "n_deps_direct", "depends", "imports",
+              "latest_release_date", "bump_type", "exports_added_n",
+              "exports_removed_n")
+  present <- intersect(wanted, DBI::dbListFields(code_con, "cran_code_summary"))
+  select  <- paste(c("rowid AS rowid_", sprintf('"%s"', present)), collapse = ", ")
+
+  raw <- .fetch_by_package(code_con, "cran_code_summary", changed_pkgs, select = select)
   if (nrow(raw) == 0L) return(empty)
 
-  latest <- .pick_latest_rows(raw)
-  latest <- latest[order(latest$package), , drop = FALSE]
+  latest    <- .pick_latest_rows(raw)
+  m         <- .row_metrics(latest)
   ds_counts <- .count_datasets(data_con, latest$package)
 
-  out <- lapply(seq_len(nrow(latest)), function(i) {
-    r   <- latest[i, , drop = FALSE]
-    m   <- .row_metrics(r)
-    ver <- as.character(r$version)
-    if (!(r$package %in% seed_pkgs)) ver <- paste0(ver, " (new)")
-    data.frame(package = r$package, version = ver,
-               loc_r = m$loc_r, functions = m$functions,
-               exports = m$exports, deps = m$deps,
-               datasets = unname(ds_counts[[r$package]]),
-               stringsAsFactors = FALSE)
-  })
-  do.call(rbind, out)
+  pkg    <- as.character(latest$package)
+  is_new <- !(pkg %in% seed_pkgs)
+  # "(new)" for a first appearance; otherwise the bump the maintainer declared,
+  # which says whether this is a typo fix or a rewrite before any number does.
+  tag <- ifelse(is_new, "new",
+                ifelse(is.na(m$bump) | m$bump %in% c("", "initial"), NA_character_, m$bump))
+  ver <- as.character(latest$version)
+  ver <- ifelse(is.na(tag), ver, paste0(ver, " (", tag, ")"))
+
+  out <- data.frame(package = pkg, version = ver,
+                    loc_r = m$loc_r, functions = m$functions,
+                    exports = m$exports,
+                    api_added = m$api_added, api_removed = m$api_removed,
+                    deps = m$deps,
+                    datasets = as.numeric(unname(ds_counts[pkg])),
+                    stringsAsFactors = FALSE)
+
+  z       <- function(x) ifelse(is.na(x), 0, x)
+  removed <- z(out$api_removed)
+  moved   <- removed + z(out$api_added)
+  out[order(-(removed > 0L), -moved, -z(out$loc_r), out$package), , drop = FALSE]
 }
 
-#' Render the "## Updated this release" section: a markdown table capped at
-#' `cap` rows (with a summary row for the remainder), or an honest "no
-#' changes" / empty-shell fallback.
+#' Format one package's API change for the table: exports gained and lost.
 #'
-#' @param rows      data.frame from .build_package_rows().
+#' @param added   Exports added this version (numeric, may be NA).
+#' @param removed Exports removed this version (numeric, may be NA).
+#' @return "n/a" when the database never recorded it, "-" when the API stood
+#'   still, else "+12", "-3" or "+12/-3".
+.fmt_api <- function(added, removed) {
+  if (is.na(added) && is.na(removed)) return("n/a")
+  a <- if (is.na(added)) 0 else added
+  r <- if (is.na(removed)) 0 else removed
+  if (a == 0 && r == 0) return("-")
+  paste(c(if (a > 0) sprintf("+%s", .fmt_n(a)),
+          if (r > 0) sprintf("-%s", .fmt_n(r))), collapse = "/")
+}
+
+#' Render the "## Updated this release" section: a markdown table bounded by
+#' both a row cap and a byte budget, with an explicit count of what it left
+#' out, or an honest "no changes" / empty-shell fallback.
+#'
+#' Nothing is dropped quietly. Rows the table did not print are counted in a
+#' closing row, and changed packages with no row in the database at all are
+#' counted in a sentence under it, because a number a reader cannot see is
+#' worse than one they can.
+#'
+#' @param rows      data.frame from .build_package_rows(), most consequential
+#'   first.
 #' @param n_changed Total changed-package count for this run (from
 #'   changed-packages.txt, independent of DB presence).
-#' @param cap       Max rows to show before collapsing into a summary row.
+#' @param cap       Max rows to print before collapsing into a summary row.
+#' @param budget    Bytes this section may occupy, including its closing
+#'   lines. Rows are added only while they fit.
 #' @return Character vector of markdown lines (no trailing blank line).
-.build_table_section <- function(rows, n_changed, cap = 40L) {
+.build_table_section <- function(rows, n_changed, cap = NOTES_TABLE_MAX_ROWS,
+                                 budget = Inf) {
   if (n_changed == 0L) {
     return(c("## Updated this release", "", "No package changes in this release."))
   }
-  header <- c("| Package | Version | R LOC | Functions | Exports | Deps | Datasets |",
-              "|---|---|--:|--:|--:|--:|--:|")
+  header <- c("| Package | Version | R LOC | Functions | Exports | API | Deps | Datasets |",
+              "|---|---|--:|--:|--:|--:|--:|--:|")
+
+  # Changed packages the code database has no row for: they were in
+  # changed-packages.txt, so something did happen to them, and they are not in
+  # the table. Say so rather than letting them evaporate between the two.
+  n_missing <- max(0L, n_changed - nrow(rows))
+  missing_lines <- if (n_missing > 0L) {
+    c("", sprintf(
+      "%s of the %s changed packages have no row in the code database and are not listed.",
+      .fmt_n(n_missing), .fmt_n(n_changed)))
+  } else {
+    character(0L)
+  }
+
   if (nrow(rows) == 0L) {
     # Every changed package was absent from the code DB (edge case): changes
     # did happen this run, so do not claim otherwise -- show the empty shell.
-    return(c("## Updated this release", "", header))
+    return(c("## Updated this release", "", header, missing_lines))
   }
-  shown <- utils::head(rows, cap)
-  body  <- vapply(seq_len(nrow(shown)), function(i) {
-    r <- shown[i, , drop = FALSE]
-    sprintf("| %s | %s | %s | %s | %s | %s | %s |",
-            r$package, r$version, .fmt_n(r$loc_r), .fmt_n(r$functions),
-            .fmt_n(r$exports), .fmt_n(r$deps), .fmt_n(r$datasets))
-  }, character(1L))
-  extra <- nrow(rows) - nrow(shown)
-  if (extra > 0L) {
-    body <- c(body, sprintf("| ...and %s more updated packages | | | | | | |",
-                            format(extra, big.mark = ",", trim = TRUE)))
+
+  measured_api <- any(!is.na(rows$api_added) | !is.na(rows$api_removed))
+  caption <- if (nrow(rows) > 1L) {
+    if (measured_api) {
+      c("Most consequential first: releases that removed an export, then by how much of the API moved.", "")
+    } else {
+      c("Largest first by R code size; this database records no API history to rank by.", "")
+    }
+  } else {
+    character(0L)
   }
-  c("## Updated this release", "", header, body)
+
+  fixed <- c("## Updated this release", "", caption, header)
+  # The closing row is written for the largest number it could carry, so the
+  # space it needs is reserved before any row is admitted.
+  omit_line <- function(n) sprintf("| ...and %s more changed packages | | | | | | | |", .fmt_n(n))
+  reserved  <- .notes_bytes(c(omit_line(nrow(rows)), missing_lines))
+  room      <- budget - .notes_bytes(fixed) - reserved
+
+  candidates <- utils::head(rows, cap)
+  body <- sprintf("| %s | %s | %s | %s | %s | %s | %s | %s |",
+                  candidates$package, candidates$version,
+                  .vfmt_n(candidates$loc_r), .vfmt_n(candidates$functions),
+                  .vfmt_n(candidates$exports),
+                  mapply(.fmt_api, candidates$api_added, candidates$api_removed),
+                  .vfmt_n(candidates$deps), .vfmt_n(candidates$datasets))
+
+  # Admit rows only while the running total stays inside the budget. This is
+  # what makes the bound a bound: names and versions vary in width, so a fixed
+  # number of rows is not a number of bytes.
+  fits  <- cumsum(nchar(body, type = "bytes") + 1L) <= room
+  shown <- body[fits]
+  n_omitted <- nrow(rows) - length(shown)
+  if (n_omitted > 0L) shown <- c(shown, omit_line(n_omitted))
+
+  c(fixed, shown, missing_lines)
 }
 
-#' Render the "## Catalog at a glance" section straight from the two
-#' already-read manifests; nothing here is recomputed from the databases.
-#' The code and data DB sizes are shown human-readable via format_bytes()
-#' (never as raw byte counts).
+#' .fmt_n over a vector.
+#'
+#' @param x Numeric-ish vector.
+#' @return Character vector of the same length.
+.vfmt_n <- function(x) vapply(x, .fmt_n, character(1L), USE.NAMES = FALSE)
+
+#' Render the "## Catalog at a glance" section straight from the manifests
+#' already read; nothing here is recomputed from the databases. The code and
+#' data DB sizes are shown human-readable via format_bytes() (never as raw
+#' byte counts).
+#'
+#' Every figure that the previous release also published is followed by the
+#' change since then, so the notes say how far the catalog moved and not only
+#' where it landed. The previous manifests are the ones the workflow already
+#' downloads before the shard loop; no extra fetch, and no delta at all when
+#' they are absent, which is the honest answer on a cold start.
 #'
 #' @param code_manifest Parsed code-manifest.json (list).
 #' @param data_manifest Parsed data-manifest.json (list).
+#' @param prev_code     Parsed prev-code-manifest.json (list), or NULL.
+#' @param prev_data     Parsed prev-data-manifest.json (list), or NULL.
+#' @param baseline      Tag the deltas are measured against, or NULL/"".
 #' @return Character vector of markdown lines (no trailing blank line).
-.build_catalog_section <- function(code_manifest, data_manifest) {
-  f          <- code_manifest$tables[["cran_functions"]]
-  median_loc <- code_manifest$stats[["loc_r_median"]]
+.build_catalog_section <- function(code_manifest, data_manifest,
+                                   prev_code = NULL, prev_data = NULL,
+                                   baseline = NULL) {
+  f          <- .manifest_at(code_manifest, "tables", "cran_functions")
+  median_loc <- .manifest_at(code_manifest, "stats", "loc_r_median")
+  mean_loc   <- .manifest_at(code_manifest, "stats", "loc_r_mean")
+  median_fns <- .manifest_at(code_manifest, "stats", "n_fns_r_median")
   # Count distinct datasets (the cran_datasets table), not dataset *versions*
   # (n_versions counts cran_dataset_versions). Fall back to n_versions only if
   # the table count is somehow absent.
-  d          <- data_manifest$tables[["cran_datasets"]] %||% data_manifest$n_versions
+  d      <- .manifest_at(data_manifest, "tables", "cran_datasets") %||% data_manifest$n_versions
+  d_prev <- if (is.null(prev_data)) NULL else
+    .manifest_at(prev_data, "tables", "cran_datasets") %||% prev_data$n_versions
+  contents      <- .manifest_at(data_manifest, "tables", "cran_dataset_contents")
+  median_rows   <- .manifest_at(data_manifest, "stats", "nrow_median")
+  median_cols   <- .manifest_at(data_manifest, "stats", "ncol_median")
 
-  c("## Catalog at a glance", "",
-    sprintf("- %s packages, %s versions, %s functions",
-            .fmt_n(code_manifest$n_packages), .fmt_n(code_manifest$n_versions), .fmt_n(f)),
-    sprintf("- R code: median %s LOC per package", .fmt_n(median_loc)),
-    sprintf("- %s datasets across %s packages", .fmt_n(d), .fmt_n(data_manifest$n_packages)),
+  catalog_line <- sprintf("- %s packages%s, %s versions%s, %s functions%s",
+    .fmt_n(code_manifest$n_packages),
+    .fmt_delta(code_manifest$n_packages, .manifest_at(prev_code, "n_packages")),
+    .fmt_n(code_manifest$n_versions),
+    .fmt_delta(code_manifest$n_versions, .manifest_at(prev_code, "n_versions")),
+    .fmt_n(f),
+    .fmt_delta(f, .manifest_at(prev_code, "tables", "cran_functions")))
+
+  # Both halves of the shape of a typical package, from statistics the manifest
+  # already computes every run and nothing has ever read.
+  code_line <- if (is.null(median_fns)) {
+    sprintf("- R code: median %s LOC per package", .fmt_n(median_loc))
+  } else {
+    sprintf("- R code: median %s LOC and %s functions per package",
+            .fmt_n(median_loc), .fmt_n(median_fns))
+  }
+  if (!is.null(mean_loc)) {
+    code_line <- sprintf("%s, mean %s LOC", code_line, .fmt_n(mean_loc))
+  }
+
+  # The dataset series ships its own database and used to get one line of the
+  # notes. It has its own totals, its own movement and its own typical shape.
+  data_line <- sprintf("- Datasets: %s%s across %s packages%s, %s dataset versions%s",
+    .fmt_n(d), .fmt_delta(d, d_prev),
+    .fmt_n(data_manifest$n_packages),
+    .fmt_delta(data_manifest$n_packages, .manifest_at(prev_data, "n_packages")),
+    .fmt_n(data_manifest$n_versions),
+    .fmt_delta(data_manifest$n_versions, .manifest_at(prev_data, "n_versions")))
+
+  shape_line <- if (is.null(median_rows) || is.null(median_cols)) {
+    character(0L)
+  } else if (is.null(contents)) {
+    sprintf("- Typical dataset: %s rows by %s columns",
+            .fmt_n(median_rows), .fmt_n(median_cols))
+  } else {
+    sprintf("- Typical dataset: %s rows by %s columns (median over %s measured)",
+            .fmt_n(median_rows), .fmt_n(median_cols), .fmt_n(contents))
+  }
+
+  db_line <- sprintf(
     # The code and dataset databases ship as two separate releases, so state
     # both sizes and say so -- the same notes body is attached to each release.
-    sprintf("- Databases: code metrics %s and dataset metrics %s (published as separate code and data releases)",
-            format_bytes(code_manifest$db_bytes), format_bytes(data_manifest$db_bytes)))
+    "- Databases: code metrics %s and dataset metrics %s (published as separate code and data releases)",
+    format_bytes(code_manifest$db_bytes), format_bytes(data_manifest$db_bytes))
+
+  baseline_line <- if (is.null(prev_code) && is.null(prev_data)) {
+    character(0L)
+  } else if (is.null(baseline) || !nzchar(baseline)) {
+    "- Figures in parentheses are the change since the release this run started from."
+  } else {
+    sprintf("- Figures in parentheses are the change since %s, the release this run started from.",
+            baseline)
+  }
+
+  c("## Catalog at a glance", "",
+    catalog_line, code_line, data_line, shape_line, db_line, baseline_line)
+}
+
+#' Last-resort clamp: hand back at most `budget` bytes, and say when that
+#' happened.
+#'
+#' The table is fitted to the budget before it is assembled, so this only
+#' fires if the parts that are not the table overrun on their own. It drops
+#' whole lines from the end rather than cutting one in half, and always leaves
+#' a marker: a body that was shortened has to look shortened.
+#'
+#' @param lines  Character vector of markdown lines.
+#' @param budget Maximum bytes, newlines included.
+#' @return Character vector whose .notes_bytes() is <= budget.
+.fit_notes <- function(lines, budget) {
+  if (.notes_bytes(lines) <= budget) return(lines)
+  marker <- "<sub>notes truncated to stay inside GitHub's release body limit</sub>"
+  room   <- budget - .notes_bytes(marker)
+  keep   <- if (room <= 0L) character(0L)
+            else lines[cumsum(nchar(lines, type = "bytes") + 1L) <= room]
+  out <- c(keep, marker)
+  if (.notes_bytes(out) > budget) {
+    # Not even the marker fits. Whatever is published then, it is not a body
+    # that claims to be complete.
+    out <- substr(marker, 1L, max(0L, budget - 1L))
+  }
+  out
 }
 
 #' Build the full release notes body: headline paragraph, per-package
 #' metrics table, catalog summary, and a plumbing footer. No top-level "# "
 #' heading is emitted -- the GitHub release title already carries that.
+#'
+#' The whole body is held to `budget` bytes. The sections that are not the
+#' table are built first and measured, and the table is given what is left, so
+#' the guarantee does not depend on how long package names happen to be.
 #'
 #' @param code_manifest Parsed code-manifest.json (list).
 #' @param data_manifest Parsed data-manifest.json (list).
@@ -1520,19 +1794,42 @@ format_bytes <- function(n) {
 #' @param code_con      Open DBI connection to the code database, or NULL.
 #' @param data_con      Open DBI connection to the dataset database, or NULL.
 #' @param cap           Max table rows before collapsing into a summary row.
+#' @param prev_code_manifest Parsed prev-code-manifest.json (list), or NULL.
+#' @param prev_data_manifest Parsed prev-data-manifest.json (list), or NULL.
+#' @param run_status    Parsed run-status.json (list), or NULL.
+#' @param baseline      Tag the deltas are measured against, or NULL.
+#' @param budget        Maximum body size in bytes.
 #' @return Character vector of markdown lines.
 build_release_notes <- function(code_manifest, data_manifest, changed_pkgs,
-                                seed_pkgs, code_con, data_con, cap = 40L) {
-  headline        <- .build_headline(code_manifest, changed_pkgs, seed_pkgs)
+                                seed_pkgs, code_con, data_con,
+                                cap = NOTES_TABLE_MAX_ROWS,
+                                prev_code_manifest = NULL,
+                                prev_data_manifest = NULL,
+                                run_status = NULL,
+                                baseline = NULL,
+                                budget = NOTES_BODY_MAX_BYTES) {
+  headline        <- .build_headline(code_manifest, changed_pkgs, seed_pkgs, run_status)
   rows            <- .build_package_rows(code_con, data_con, changed_pkgs, seed_pkgs)
-  table_section   <- .build_table_section(rows, length(changed_pkgs), cap = cap)
-  catalog_section <- .build_catalog_section(code_manifest, data_manifest)
+  catalog_section <- .build_catalog_section(code_manifest, data_manifest,
+                                            prev_code_manifest, prev_data_manifest,
+                                            baseline)
 
   short_fp <- substr(code_manifest$fingerprint %||% "", 1L, 8L)
-  footer   <- sprintf("<sub>fingerprint %s - full manifest in the release assets</sub>",
-                      short_fp)
+  prev_fp  <- substr(.manifest_at(prev_code_manifest, "fingerprint") %||% "", 1L, 8L)
+  footer   <- if (nzchar(prev_fp)) {
+    sprintf("<sub>fingerprint %s (was %s) - full manifest in the release assets</sub>",
+            short_fp, prev_fp)
+  } else {
+    sprintf("<sub>fingerprint %s - full manifest in the release assets</sub>", short_fp)
+  }
 
-  c(headline, "", table_section, "", catalog_section, "", footer)
+  # Three blank lines separate the four blocks below; they cost a byte each.
+  fixed_bytes <- .notes_bytes(headline) + .notes_bytes(catalog_section) +
+    .notes_bytes(footer) + 3L
+  table_section <- .build_table_section(rows, length(changed_pkgs), cap = cap,
+                                        budget = budget - fixed_bytes)
+
+  .fit_notes(c(headline, "", table_section, "", catalog_section, "", footer), budget)
 }
 
 # ---- metric coverage -------------------------------------------------------

@@ -9,6 +9,35 @@ SHARD_SIZE         <- 400L
 MAX_CLONE_FAILURES <- 5L
 WORK_DIR           <- "work"
 
+# Release notes: what GitHub refuses, and how much of it we allow ourselves.
+#
+# GitHub rejects a release body over 125,000 characters. The workflow publishes
+# with `publish_metrics || exit 1`, so an oversized body does not cost us a
+# shortened list, it stops the run, and the run it stops is the one with the
+# most to report: a --recollect pass, or a catch-up after an outage, marks
+# thousands of packages changed and the bootstrap marked 33,282.
+#
+# Bytes, not characters, because the limit applies to what GitHub receives and a
+# package name, a version string or a maintainer's name can be multi-byte UTF-8,
+# where one character costs up to four. Counting characters would under-measure
+# such a body by up to a factor of four, which is exactly the case a bound is
+# for.
+#
+# 60,000 is under half the limit. Published bodies in this series measured 267
+# to 2,729 bytes, so the budget is already more than twenty times the largest
+# one ever published, and the remaining 65,000 bytes are headroom for a section
+# someone adds later without re-reading this comment. A budget set just under
+# the limit would spend that headroom on rows nobody reads and leave nothing for
+# the mistake.
+NOTES_BODY_GITHUB_LIMIT <- 125000L
+NOTES_BODY_MAX_BYTES    <- 60000L
+
+# Rows of the changed-package table. Editorial, not the safety bound: the byte
+# budget above is what makes the body safe whatever the names look like. Forty
+# rows is about a screen, and the rows that survive are the ones with the
+# largest API change (see .build_package_rows), not the front of the alphabet.
+NOTES_TABLE_MAX_ROWS <- 40L
+
 # Per-git-subprocess timeout in seconds. A hard cap so a pathological repo
 # cannot stall a parallel shard. Overridable via GIT_TIMEOUT env var.
 GIT_TIMEOUT <- as.integer(Sys.getenv("GIT_TIMEOUT", unset = "300"))

@@ -206,6 +206,7 @@ metrics_fingerprint <- function(summary_df) {
   class = "TEXT", kind = "TEXT", nrow = "INTEGER", ncol = "INTEGER",
   length = "INTEGER", n_cols = "INTEGER", n_unique = "INTEGER",
   n_missing_total = "INTEGER", columns = "TEXT", has_rownames = "INTEGER",
+  shape_fp = "TEXT",
   dim = "TEXT", n_dim = "INTEGER", has_dimnames = "INTEGER",
   n_stored = "INTEGER", n_cells = "INTEGER", density = "REAL",
   matrix_value_type = "TEXT", matrix_shape = "TEXT", matrix_storage = "TEXT",
@@ -217,6 +218,14 @@ metrics_fingerprint <- function(summary_df) {
   crs_input = "TEXT", crs_epsg = "INTEGER", crs_wkt = "TEXT", bbox = "TEXT",
   n_layers = "INTEGER", object_system = "TEXT", s4_package = "TEXT",
   label = "TEXT", comment = "TEXT", units = "TEXT", attrs_other = "TEXT"
+)
+
+# How one file happened to store the data, which is not a property of the data.
+# The same table saved twice can differ in all of these: R's serialization
+# format has versions, and version 3 cannot be read by R before 3.5.0, so this
+# is the difference between a dataset a reader can open and one they cannot.
+.DATASET_VERSION_COLS <- c(
+  format_version = "INTEGER", compressed_bytes = "INTEGER", notes = "TEXT"
 )
 
 # Where a dataset was found. Not a property of its contents: the same data can
@@ -238,6 +247,7 @@ metrics_fingerprint <- function(summary_df) {
     invisible(NULL)
   }
   add("cran_dataset_contents", .DATASET_CONTENT_COLS)
+  add("cran_dataset_versions", .DATASET_VERSION_COLS)
   add("cran_datasets", .DATASET_IDENTITY_COLS)
   invisible(NULL)
 }
@@ -376,7 +386,10 @@ metrics_fingerprint <- function(summary_df) {
   }
 
   # 3. Version links (package was wiped above, so a plain append is idempotent).
-  ver <- df[, c("package", "name", "version", "content_id", "format", "compression", "confidence", "is_current"), drop = FALSE]
+  ver_cols <- c("package", "name", "version", "content_id", "format",
+                "compression", "confidence", "is_current",
+                intersect(names(.DATASET_VERSION_COLS), names(df)))
+  ver <- df[, ver_cols, drop = FALSE]
   DBI::dbAppendTable(con, "cran_dataset_versions", ver)
 
   # 4. Identity, one per (package, name), stamped with the current version's content.

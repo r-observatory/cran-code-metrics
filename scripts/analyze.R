@@ -748,6 +748,13 @@ analyze_package <- function(repo_dir, package) {
       metrics <- analyze_with_binary(tmp)
       if (is.null(metrics)) {
         metrics <- analyze_version(ctx)
+      } else if (is.null(metrics[["analyzer_version"]])) {
+        # Which build produced this row is what lets a later run tell data it
+        # already holds from data a newer build would describe differently.
+        # Taken from the binary rather than from its output, so a build that
+        # does not report itself still leaves the column behind and the
+        # re-scan queue can still settle.
+        metrics[["analyzer_version"]] <- rpkg_analyzer_version()
       }
 
       # Capture per-function / per-call-edge detail before metrics is mutated.
@@ -929,11 +936,7 @@ analyze_package <- function(repo_dir, package) {
     .empty_edges_df()
   }
 
-  datasets_df <- if (length(datasets_rows) > 0L) {
-    do.call(rbind, datasets_rows)
-  } else {
-    .empty_datasets_df()
-  }
+  datasets_df <- .rbind_datasets(datasets_rows) %||% .empty_datasets_df()
 
   vignettes_df <- if (length(vignettes_rows) > 0L) {
     do.call(rbind, vignettes_rows)

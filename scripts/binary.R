@@ -88,6 +88,23 @@ rpkg_analyzer_version <- function() {
   columns = character(0L), row_sketch = character(0L)
 )
 
+# Row-bind dataset frames whose columns need not match.
+#
+# .datasets_frame carries whatever fields the records in front of it happened to
+# have, so two versions of one package produce frames of different widths as
+# soon as they differ in what they hold: a version shipping a data.frame emits
+# has_rownames and one shipping only an S4 object does not. Plain rbind stops on
+# that, and the caller treats the error as the whole package failing.
+.rbind_datasets <- function(dfs) {
+  dfs <- Filter(function(d) !is.null(d) && nrow(d) > 0L, dfs)
+  if (!length(dfs)) return(NULL)
+  all_cols <- unique(unlist(lapply(dfs, names), use.names = FALSE))
+  do.call(rbind, lapply(dfs, function(d) {
+    for (col in setdiff(all_cols, names(d))) d[[col]] <- NA
+    d[, all_cols, drop = FALSE]
+  }))
+}
+
 .datasets_frame <- function(recs) {
   # Carry whatever the analyzer emits rather than a fixed list of names. The
   # list version silently dropped every field added since it was written, so a

@@ -332,3 +332,41 @@ test_that("a settled archive is not re-queued on every run", {
   expect_equal(.invalidate_stale_dataset_scans(con, "0.3.1"), 0L)
   expect_equal(.invalidate_stale_dataset_scans(con, "0.3.1"), 0L)
 })
+
+test_that("versions describing different things still bind into one frame", {
+  # .datasets_frame carries the fields its records actually had, so two versions
+  # of one package differ in width as soon as they differ in what they hold.
+  # Plain rbind stops on that, and the caller reads the error as the whole
+  # package failing: it loses its summary, functions and edges too, and five
+  # consecutive failures exclude it from the pipeline for good.
+  v1 <- .datasets_frame(list(list(rec = "dataset", name = "s", class = "S4:X", nrow = 1L)))
+  v2 <- .datasets_frame(list(list(rec = "dataset", name = "d", class = "data.frame",
+                                  nrow = 3L, has_rownames = TRUE)))
+  expect_false(ncol(v1) == ncol(v2))
+  bound <- .rbind_datasets(list(v1, v2))
+  expect_equal(nrow(bound), 2L)
+  expect_true("has_rownames" %in% names(bound))
+  expect_true(is.na(bound$has_rownames[bound$name == "s"]))
+  expect_null(.rbind_datasets(list()))
+})
+
+test_that("the re-scan queue settles instead of clearing every marker forever", {
+  # If the version column never appears, the column-absent branch fires on every
+  # run: the whole archive is queued, the shard truncates to its alphabetical
+  # prefix, and packages later in the alphabet are never reached again.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  .mk_summary_tbl(con, data.frame(
+    package = c("a", "b"), datasets_scanned = c(TRUE, TRUE),
+    stringsAsFactors = FALSE))
+
+  # First run: nothing records which build produced these, so both are queued.
+  expect_equal(.invalidate_stale_dataset_scans(con, "0.3.1"), 2L)
+  # That run re-analyses them, and the write leaves the version behind.
+  DBI::dbExecute(con, "ALTER TABLE cran_code_summary ADD COLUMN analyzer_version TEXT")
+  DBI::dbExecute(con, "UPDATE cran_code_summary SET datasets_scanned = 1, analyzer_version = '0.3.1'")
+  # Every run after that clears nothing.
+  expect_equal(.invalidate_stale_dataset_scans(con, "0.3.1"), 0L)
+  expect_equal(.invalidate_stale_dataset_scans(con, "0.3.1"), 0L)
+  expect_equal(.invalidate_stale_dataset_scans(con, "0.3.1"), 0L)
+})

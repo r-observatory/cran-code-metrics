@@ -192,6 +192,56 @@ metrics_fingerprint <- function(summary_df) {
 # (content_fp, schema_fp, fp_algo_version) shared across versions AND packages.
 # The heavy row_sketch lives in its own table (kept out of the merge allowlist).
 
+# Columns of a dataset record that describe the data itself, and so belong on
+# the content-addressed row shared by every copy of it. Anything that can differ
+# between two files holding identical bytes is deliberately absent: which file
+# it came from, how it was compressed, which directory it sat in. Putting one of
+# those here would give two identical datasets two content rows and break the
+# dedup the table exists for.
+#
+# Types are declared rather than inferred from whatever a shard happens to
+# carry. A shard whose every density is missing would otherwise fix that column
+# as text for good, and the column would then read back as text forever.
+.DATASET_CONTENT_COLS <- c(
+  class = "TEXT", kind = "TEXT", nrow = "INTEGER", ncol = "INTEGER",
+  length = "INTEGER", n_cols = "INTEGER", n_unique = "INTEGER",
+  n_missing_total = "INTEGER", columns = "TEXT", has_rownames = "INTEGER",
+  dim = "TEXT", n_dim = "INTEGER", has_dimnames = "INTEGER",
+  n_stored = "INTEGER", n_cells = "INTEGER", density = "REAL",
+  matrix_value_type = "TEXT", matrix_shape = "TEXT", matrix_storage = "TEXT",
+  matrix_uplo = "TEXT", matrix_diag = "TEXT",
+  ts_start = "REAL", ts_end = "REAL", ts_frequency = "REAL", frequency = "REAL",
+  index_start = "TEXT", index_end = "TEXT", index_n = "INTEGER", index_class = "TEXT",
+  geom_type = "TEXT", is_geometry = "INTEGER", n_geometries = "INTEGER",
+  is_spatial = "INTEGER",
+  crs_input = "TEXT", crs_epsg = "INTEGER", crs_wkt = "TEXT", bbox = "TEXT",
+  n_layers = "INTEGER", object_system = "TEXT", s4_package = "TEXT",
+  label = "TEXT", comment = "TEXT", units = "TEXT", attrs_other = "TEXT"
+)
+
+# Where a dataset was found. Not a property of its contents: the same data can
+# sit under data/ in one package and inst/extdata in another, and only the first
+# is loadable by name.
+.DATASET_IDENTITY_COLS <- c(origin_dir = "TEXT")
+
+#' Add any dataset column the analyzer now emits that the table has not seen.
+#' Mirrors what cran_code_summary already does for its own new columns; without
+#' it the widened CREATE only ever applies to a database built from nothing.
+.ensure_dataset_columns <- function(con) {
+  add <- function(table, spec) {
+    if (!table %in% DBI::dbListTables(con)) return(invisible(NULL))
+    existing <- DBI::dbListFields(con, table)
+    for (col in setdiff(names(spec), existing)) {
+      DBI::dbExecute(con, sprintf('ALTER TABLE %s ADD COLUMN "%s" %s',
+                                  table, col, spec[[col]]))
+    }
+    invisible(NULL)
+  }
+  add("cran_dataset_contents", .DATASET_CONTENT_COLS)
+  add("cran_datasets", .DATASET_IDENTITY_COLS)
+  invisible(NULL)
+}
+
 .ensure_dataset_tables <- function(con) {
   tables <- DBI::dbListTables(con)
   if (!"cran_datasets" %in% tables) {
@@ -218,6 +268,11 @@ metrics_fingerprint <- function(summary_df) {
     DBI::dbExecute(con, "CREATE TABLE cran_dataset_sketches (
       content_id INTEGER PRIMARY KEY, row_sketch TEXT)")
   }
+  # The analyzer describes more of a dataset over time, and those fields arrive
+  # as columns that do not exist yet. Without this the widened CREATE above only
+  # applies to a database being built from nothing, and every incremental run
+  # against a downloaded one silently drops them.
+  .ensure_dataset_columns(con)
   DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_cran_dsv_content ON cran_dataset_versions(content_id)")
   DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_cran_dsc_schema ON cran_dataset_contents(schema_fp)")
   invisible(NULL)
@@ -293,12 +348,16 @@ metrics_fingerprint <- function(summary_df) {
   # 1. Content-addressed profiles: one INSERT OR IGNORE per distinct fingerprint.
   ck  <- paste(df$content_fp, df$schema_fp, df$fp_algo_version, sep = "\x1f")
   cts <- df[!duplicated(ck), , drop = FALSE]
+  content_cols <- intersect(names(.DATASET_CONTENT_COLS), names(cts))
+  ins_cols <- c("content_fp", "schema_fp", "fp_algo_version", content_cols)
   DBI::dbExecute(con,
-    "INSERT OR IGNORE INTO cran_dataset_contents
-       (content_fp, schema_fp, fp_algo_version, class, kind, nrow, ncol, n_missing_total, columns)
-     VALUES (?,?,?,?,?,?,?,?,?)",
-    params = list(cts$content_fp, cts$schema_fp, cts$fp_algo_version, cts$class,
-                  cts$kind, cts$nrow, cts$ncol, cts$n_missing_total, cts$columns))
+    sprintf("INSERT OR IGNORE INTO cran_dataset_contents (%s) VALUES (%s)",
+            paste(sprintf('"%s"', ins_cols), collapse = ", "),
+            paste(rep("?", length(ins_cols)), collapse = ", ")),
+    params = lapply(ins_cols, function(k) {
+      v <- cts[[k]]
+      if (is.logical(v)) as.integer(v) else v
+    }))
 
   # Resolve content_id for the fingerprints in this shard and attach to every row.
   ids <- DBI::dbGetQuery(con,
@@ -327,6 +386,9 @@ metrics_fingerprint <- function(summary_df) {
     idn <- data.frame(package = cur$package, name = cur$name, file = cur$file,
                       internal = cur$internal, current_version = cur$version,
                       current_content_id = cur$content_id, stringsAsFactors = FALSE)
+    for (k in intersect(names(.DATASET_IDENTITY_COLS), names(cur))) {
+      idn[[k]] <- cur[[k]]
+    }
     DBI::dbAppendTable(con, "cran_datasets", idn)
   }
   invisible(NULL)

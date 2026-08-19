@@ -178,3 +178,157 @@ test_that(".gc_dataset_contents reclaims content orphaned by a data change", {
   expect_equal(count("cran_dataset_contents"), 1L)   # C1 reclaimed
   expect_equal(count("cran_dataset_sketches"), 1L)   # its sketch reclaimed too
 })
+
+# --- carrying what a newer analyzer describes --------------------------------
+# A scan of the whole archive is expensive, and every one of these is a way for
+# it to cost that and change nothing in the database.
+
+.mk_wide_row <- function(package = "p", version = "1.0", content_fp = "C1",
+                         origin_dir = "data", name = "d") {
+  row <- .mk_ds_row(package, version, TRUE, content_fp, name = name)
+  row$fp_algo_version <- 2L
+  # Fields the analyzer describes that the tables have never seen.
+  row$matrix_shape  <- "symmetric"
+  row$matrix_uplo   <- "L"
+  row$density       <- 0.125
+  row$n_stored      <- 3L
+  row$object_system <- "S4"
+  row$is_spatial    <- TRUE
+  row$origin_dir    <- origin_dir
+  row
+}
+
+test_that("fields a newer analyzer describes reach the contents table", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_wide_row(), "p"))
+
+  got <- DBI::dbGetQuery(con, "SELECT * FROM cran_dataset_contents")
+  expect_equal(got$matrix_shape, "symmetric")
+  expect_equal(got$matrix_uplo, "L")
+  expect_equal(got$density, 0.125)
+  expect_equal(got$n_stored, 3L)
+  expect_equal(got$object_system, "S4")
+  expect_equal(got$is_spatial, 1L)         # logicals store as integers
+})
+
+test_that("where a dataset was found is identity, not content", {
+  # origin_dir differs between two files holding the same bytes, so putting it
+  # on the content row would give them two rows and break the dedup.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_wide_row(), "p"))
+  DBI::dbWithTransaction(con, .write_datasets_normalized(
+    con, .mk_wide_row(package = "q", origin_dir = "extdata"), "q"))
+
+  expect_equal(DBI::dbGetQuery(con, "SELECT count(*) n FROM cran_dataset_contents")$n, 1L)
+  expect_false("origin_dir" %in% DBI::dbListFields(con, "cran_dataset_contents"))
+  ids <- DBI::dbGetQuery(con, "SELECT package, origin_dir FROM cran_datasets ORDER BY package")
+  expect_equal(ids$origin_dir, c("data", "extdata"))
+})
+
+test_that("a table created before these fields existed is widened, not skipped", {
+  # The incremental path runs against a database downloaded from the last
+  # release, so a widened CREATE never applies to it. Without an ALTER the new
+  # columns are dropped in silence and the scan that produced them is wasted.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbExecute(con, "CREATE TABLE cran_dataset_contents (
+    content_id INTEGER PRIMARY KEY,
+    content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
+    class TEXT, kind TEXT, nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
+    UNIQUE (content_fp, schema_fp, fp_algo_version))")
+  expect_false("matrix_shape" %in% DBI::dbListFields(con, "cran_dataset_contents"))
+
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_wide_row(), "p"))
+
+  expect_true("matrix_shape" %in% DBI::dbListFields(con, "cran_dataset_contents"))
+  expect_equal(DBI::dbGetQuery(con, "SELECT matrix_shape FROM cran_dataset_contents")$matrix_shape,
+               "symmetric")
+})
+
+test_that("a re-scan under a new generation is stored rather than ignored", {
+  # Same bytes, so the same content_fp: INSERT OR IGNORE drops the row unless
+  # the generation is part of what makes it distinct. That is the whole reason
+  # re-scanning with a better reader can reach the table at all.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  old <- .mk_ds_row("p", "1.0", TRUE, "C1")          # fp_algo_version 1
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, old, "p"))
+  expect_true(is.na(DBI::dbGetQuery(con, "SELECT matrix_shape FROM cran_dataset_contents")$matrix_shape[[1]]) ||
+              !("matrix_shape" %in% DBI::dbListFields(con, "cran_dataset_contents")))
+
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_wide_row(), "p"))
+  got <- DBI::dbGetQuery(con,
+    "SELECT fp_algo_version, matrix_shape FROM cran_dataset_contents ORDER BY fp_algo_version")
+  expect_equal(got$fp_algo_version, c(1L, 2L))
+  expect_equal(got$matrix_shape[[2]], "symmetric")
+  # The version link points at the new generation, so the old row is
+  # unreferenced and the contents GC reclaims it.
+  .gc_dataset_contents(con)
+  left <- DBI::dbGetQuery(con, "SELECT fp_algo_version FROM cran_dataset_contents")$fp_algo_version
+  expect_equal(left, 2L)
+})
+
+# --- noticing that a scan is out of date -------------------------------------
+
+.mk_summary_tbl <- function(con, rows) {
+  DBI::dbWriteTable(con, "cran_code_summary", rows)
+}
+
+test_that("an analyzer upgrade puts the packages it already scanned back in the queue", {
+  # The marker records that a package was scanned, not what scanned it, so
+  # without this every package looks done after an upgrade and nothing re-runs.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  .mk_summary_tbl(con, data.frame(
+    package = c("current", "older", "unknown"),
+    datasets_scanned = c(TRUE, TRUE, TRUE),
+    analyzer_version = c("0.3.1", "0.2.0", NA_character_),
+    stringsAsFactors = FALSE))
+
+  n <- .invalidate_stale_dataset_scans(con, "0.3.1")
+  expect_equal(n, 2L)
+  got <- DBI::dbGetQuery(con,
+    "SELECT package, datasets_scanned FROM cran_code_summary ORDER BY package")
+  # Only the row produced by the running build keeps its marker.
+  expect_equal(got$package[!is.na(got$datasets_scanned)], "current")
+})
+
+test_that("nothing is invalidated when the running version cannot be determined", {
+  # Clearing on a guess would re-scan the archive every run and never settle.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  .mk_summary_tbl(con, data.frame(
+    package = "p", datasets_scanned = TRUE, analyzer_version = "0.2.0",
+    stringsAsFactors = FALSE))
+
+  expect_equal(.invalidate_stale_dataset_scans(con, NA_character_), 0L)
+  expect_equal(.invalidate_stale_dataset_scans(con, ""), 0L)
+  expect_true(DBI::dbGetQuery(con, "SELECT datasets_scanned FROM cran_code_summary")[[1]][[1]] == 1L)
+})
+
+test_that("rows from before the version was recorded are all invalidated once", {
+  # Nothing on them says which build produced them, so none can be shown to
+  # match. The column appears on this run's write, so the branch is taken once.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  .mk_summary_tbl(con, data.frame(
+    package = c("a", "b"), datasets_scanned = c(TRUE, NA),
+    stringsAsFactors = FALSE))
+
+  expect_equal(.invalidate_stale_dataset_scans(con, "0.3.1"), 1L)  # only the marked one
+  left <- DBI::dbGetQuery(con, "SELECT datasets_scanned FROM cran_code_summary")[[1]]
+  expect_true(all(is.na(left)))
+})
+
+test_that("a settled archive is not re-queued on every run", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  .mk_summary_tbl(con, data.frame(
+    package = c("a", "b"), datasets_scanned = c(TRUE, TRUE),
+    analyzer_version = c("0.3.1", "0.3.1"), stringsAsFactors = FALSE))
+
+  expect_equal(.invalidate_stale_dataset_scans(con, "0.3.1"), 0L)
+  expect_equal(.invalidate_stale_dataset_scans(con, "0.3.1"), 0L)
+})

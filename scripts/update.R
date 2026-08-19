@@ -91,6 +91,36 @@
 #'   When TRUE, the NULL check is confined to the package's latest-version row
 #'   (the row carrying a non-NULL latest_release_date). This is required for a
 #'   marker written only on the latest row (e.g. detail_scanned): checking any
+#' Clear the dataset-scan marker on rows produced by a different analyzer build.
+#'
+#' The marker records that a package was scanned, not what scanned it, so after
+#' an upgrade every package looks done and nothing re-runs. Comparing against the
+#' version the binary reports puts the stale ones back in the queue.
+#'
+#' Does nothing when the running version cannot be determined: clearing on a
+#' guess would re-scan the archive on every run and never settle.
+.invalidate_stale_dataset_scans <- function(con, current_version) {
+  if (!"cran_code_summary" %in% DBI::dbListTables(con)) return(0L)
+  fields <- DBI::dbListFields(con, "cran_code_summary")
+  if (!"datasets_scanned" %in% fields) return(0L)
+  if (is.null(current_version) || is.na(current_version) || !nzchar(current_version)) {
+    return(0L)
+  }
+  if (!"analyzer_version" %in% fields) {
+    # Nothing on these rows says which build produced them, so none of them can
+    # be shown to match the one running now. The column appears on this run's
+    # write, so this branch is taken once.
+    return(DBI::dbExecute(con,
+      "UPDATE cran_code_summary SET datasets_scanned = NULL
+        WHERE datasets_scanned IS NOT NULL"))
+  }
+  DBI::dbExecute(con,
+    "UPDATE cran_code_summary SET datasets_scanned = NULL
+      WHERE datasets_scanned IS NOT NULL
+        AND (analyzer_version IS NULL OR analyzer_version <> ?)",
+    params = list(current_version))
+}
+
 #'   row would re-flag every multi-version package forever, so the backfill would
 #'   never converge. Packages with no latest_release_date row are not flagged.
 .recollect_todo <- function(con, universe_pkgs, perm_fail_pkgs,
@@ -299,6 +329,14 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     detail_backfill <- .recollect_todo(con, universe$package, perm_fail_pkgs,
                                         sentinel = "detail_scanned",
                                         latest_only = TRUE)
+    # An analyzer upgrade changes what a scan finds, so rows produced by an older
+    # build are stale even though they are marked scanned. Clearing the marker on
+    # those puts them back in the queue below, which drains a shard at a time and
+    # settles once every row carries the running build's version.
+    n_stale <- .invalidate_stale_dataset_scans(con, rpkg_analyzer_version())
+    if (n_stale > 0L) {
+      message(sprintf("dataset scans invalidated by analyzer change: %d", n_stale))
+    }
     # And drain any package whose latest-version row predates the dataset reader
     # (datasets_scanned IS NULL), so cran_datasets fills in without a manual
     # recollect. Also latest-row-scoped, so it converges once re-analyzed.

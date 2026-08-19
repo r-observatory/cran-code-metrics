@@ -3,6 +3,17 @@
 # Load order: config.R -> git.R -> context.R -> metrics/structure.R -> analyze.R
 # This file does NOT auto-source its dependencies so the caller controls order.
 
+# The fingerprint algorithm's generation. It is part of the uniqueness key on
+# cran_dataset_contents, which is written with INSERT OR IGNORE, so a re-scan of
+# data whose bytes have not changed produces the same content_fp and is silently
+# dropped. Anything that changes what a profile records, rather than what the
+# data is, has to be a new generation or it never reaches the table. Superseded
+# rows are left unreferenced and reclaimed by the contents GC.
+#
+# 2: reads compiled objects, describes sparse matrices, rasters and the object
+#    systems, and follows data()'s own rules for delimited text.
+FP_ALGO_VERSION <- 2L
+
 #' Registry of metric group functions.
 #' Each value is a function(ctx) -> named list of scalar metric values.
 #' Add more groups here when new metric modules are implemented.
@@ -828,7 +839,7 @@ analyze_package <- function(repo_dir, package) {
       # fingerprint canonicalization so a future change is a planned rebuild.
       datasets_row <- if (!is.null(detail_ds) && nrow(detail_ds) > 0L) {
         cbind(package = package, version = v,
-              is_current = as.integer(is_latest), fp_algo_version = 1L,
+              is_current = as.integer(is_latest), fp_algo_version = FP_ALGO_VERSION,
               detail_ds, stringsAsFactors = FALSE)
       } else {
         .empty_datasets_df()

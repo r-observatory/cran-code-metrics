@@ -370,3 +370,41 @@ test_that("the re-scan queue settles instead of clearing every marker forever", 
   expect_equal(.invalidate_stale_dataset_scans(con, "0.3.1"), 0L)
   expect_equal(.invalidate_stale_dataset_scans(con, "0.3.1"), 0L)
 })
+
+test_that("how a file stores its data is recorded, not just what it holds", {
+  # R's serialization format has versions, and a version 3 file cannot be read
+  # by R before 3.5.0, so this is the difference between a dataset a reader can
+  # open and one they cannot. It was being parsed and then dropped, along with
+  # the on-disk size and the note saying how the file was read.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  row <- .mk_wide_row()
+  row$format_version   <- 3L
+  row$compressed_bytes <- 4096L
+  row$notes            <- "s4-dim-slot"
+  row$shape_fp         <- "SHP1"
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, row, "p"))
+
+  v <- DBI::dbGetQuery(con, "SELECT format_version, compressed_bytes, notes FROM cran_dataset_versions")
+  expect_equal(v$format_version, 3L)
+  expect_equal(v$compressed_bytes, 4096L)
+  expect_equal(v$notes, "s4-dim-slot")
+  # The shape fingerprint describes the data, so it sits with the data.
+  expect_equal(DBI::dbGetQuery(con, "SELECT shape_fp FROM cran_dataset_contents")$shape_fp, "SHP1")
+  expect_false("format_version" %in% DBI::dbListFields(con, "cran_dataset_contents"))
+})
+
+test_that("two versions of one dataset can differ in how they were stored", {
+  # The same data saved twice under different serialization versions is one
+  # content row and two version rows, so this has to live on the version.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  a <- .mk_ds_row("p", "1.0", FALSE, "C1"); a$format_version <- 2L; a$fp_algo_version <- 2L
+  b <- .mk_ds_row("p", "1.1", TRUE,  "C1"); b$format_version <- 3L; b$fp_algo_version <- 2L
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, rbind(a, b), "p"))
+
+  expect_equal(DBI::dbGetQuery(con, "SELECT count(*) n FROM cran_dataset_contents")$n, 1L)
+  got <- DBI::dbGetQuery(con,
+    "SELECT version, format_version FROM cran_dataset_versions ORDER BY version")
+  expect_equal(got$format_version, c(2L, 3L))
+})

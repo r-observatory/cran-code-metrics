@@ -84,3 +84,54 @@ README_SOURCES <- c("README.md", "README.Rmd", "README.qmd", "README.markdown")
 # has always accepted had its functions counted and was then skipped by every
 # security and health metric, silently, with the row still looking populated.
 R_SOURCE_RE <- "^R/.*\\.[Rr]$"
+
+# Wall-clock cap for one package's whole citation pass, in seconds. A package
+# with hundreds of versions still gets one bounded run: the cost is dominated by
+# starting the reader, not by evaluating any one file.
+CITATION_TIMEOUT <- as.integer(Sys.getenv("CITATION_TIMEOUT", unset = "180"))
+
+# Resource ceilings for the citation reader, applied by the shell that launches
+# it and so inherited by anything it starts (scripts/citation.R).
+#
+# The wall clock above bounds elapsed time and nothing else. It does not notice
+# a file that allocates until the machine swaps, or one that writes until the
+# disk fills, and both of those hurt the sibling workers rather than only the
+# package being read.
+#
+# There is deliberately no cap on processes. RLIMIT_NPROC is counted per uid,
+# not per process tree, so a value low enough to stop a fork bomb would be
+# reached by the pipeline's own parallel workers first and would fail the run it
+# was meant to protect.
+
+# CPU seconds. Kept below CITATION_TIMEOUT so a file that spins is stopped by
+# the CPU limit and reported as a crash, rather than holding the wall clock open
+# for the whole package. Evaluating a citation file is parsing a few dozen lines
+# and formatting the result; a whole package's pass is dominated by R's own
+# startup, so this is orders of magnitude of headroom.
+CITATION_CPU_SECONDS <- as.integer(Sys.getenv("CITATION_CPU_SECONDS", unset = "120"))
+
+# Address space in kilobytes (ulimit -v). R starts and reads citations inside a
+# few hundred megabytes, so 4 GiB leaves room for an honest but large bibentry
+# while still refusing an allocation that would push the runner into swap.
+# macOS rejects this limit outright, so it is applied on its own line and its
+# failure does not prevent the other two from taking effect.
+CITATION_ADDRESS_SPACE_KB <- as.integer(
+  Sys.getenv("CITATION_ADDRESS_SPACE_KB", unset = "4194304"))
+
+# Largest single file the reader may write (ulimit -f), in blocks. Its own
+# output is one NDJSON record per version plus one per entry, a few megabytes
+# for the largest package on CRAN.
+#
+# The block size ulimit -f counts in depends on which shell is running as
+# /bin/sh, not on the OS as such - measured directly, on this machine: macOS's
+# own /bin/sh is bash under the hood (`/bin/sh -c 'echo $BASH_VERSION'` prints
+# a version), and bash's ulimit -f counts 1024-byte blocks, so 262144 caps a
+# write at 268,435,456 bytes (256 MiB); /bin/dash counts 512-byte blocks, so
+# the same number caps a write at 134,217,728 bytes (128 MiB) under a /bin/sh
+# that resolves to dash, as it does by default on Debian- and Ubuntu-based
+# systems including this project's CI. Both sit in the same wide gap between
+# what the reader writes and a size that would matter. It caps one file, not
+# the total written, so it bounds a runaway write rather than preventing a
+# deliberate one.
+CITATION_FILE_SIZE_KB <- as.integer(
+  Sys.getenv("CITATION_FILE_SIZE_KB", unset = "262144"))

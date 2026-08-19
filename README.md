@@ -46,7 +46,8 @@ that are new or have a new release, and writes the updated code and dataset
 databases plus their manifests. The bootstrap fills the full catalog over
 several runs: each shard is published so progress survives a restart, and the
 workflow keeps starting shards until the catalog is complete or a time budget
-is reached. Set `GITHUB_TOKEN` so git fetches are authenticated.
+is reached. No credential is needed or read: the mirror it clones from is
+public, and nothing under `scripts/` looks at `GITHUB_TOKEN` or `GH_TOKEN`.
 
 ## Notes
 
@@ -54,6 +55,14 @@ Each package is cloned, analyzed across all its versions, and deleted before the
 next one, so peak disk stays small. Repositories that no longer exist are skipped
 and recorded in the manifest. All metrics are computed from git and the package
 source; there is no external `cloc` dependency.
+
+`inst/CITATION` files are evaluated to record what `citation()` renders for a
+package. That file is R code a CRAN package author wrote, so it runs in its own
+subprocess under a wall clock plus CPU, address-space and file-size ceilings
+(`scripts/config.R`, `scripts/citation.R`). The address-space ceiling is applied
+with `ulimit -v`, which macOS's `/bin/sh` refuses outright; on macOS that one
+ceiling is silently not in force, while the CPU-time and file-size ceilings
+still apply. CI runs Linux, where all three apply.
 
 ## Feedback
 

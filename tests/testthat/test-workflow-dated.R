@@ -11,3 +11,9 @@ test_that("update.yml publishes dated code and data releases, not rolling curren
   expect_true(grepl("prune.R", yml, fixed = TRUE))
   expect_true(grepl("render_notes.R", yml, fixed = TRUE))
 })
+
+test_that("the checkout does not leave a credential in the workspace", {
+  y <- readLines(file.path("..", "..", ".github", "workflows", "update.yml"),
+                 warn = FALSE)
+  expect_true(any(grepl("persist-credentials:\\s*false", y)))
+})

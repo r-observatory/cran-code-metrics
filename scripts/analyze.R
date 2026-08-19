@@ -417,6 +417,7 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
     summary_df$deprecation_infrastructure_maturity <- integer(0L)
     summary_df$detail_scanned       <- logical(0L)
     summary_df$datasets_scanned     <- logical(0L)
+    summary_df$citation_scanned     <- logical(0L)
     return(summary_df)
   }
 
@@ -573,6 +574,11 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
   # detail_scanned so packages scanned before the dataset reader existed (their
   # latest row has detail_scanned set but no dataset rows) still get re-flagged.
   summary_df$datasets_scanned     <- NA
+  # citation_scanned: convergence marker for the citation backfill, distinct
+  # from the other two so packages analysed before citation reading existed
+  # (their latest row has detail_scanned/datasets_scanned set but no citation
+  # pass) still get re-flagged, exactly once.
+  summary_df$citation_scanned     <- NA
 
   summary_df$n_versions[n]           <- n
   summary_df$first_release_date[n]   <- first_date
@@ -586,6 +592,7 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
   # for data-only packages with zero functions, so the backfill converges.
   summary_df$detail_scanned[n]       <- TRUE
   summary_df$datasets_scanned[n]     <- TRUE
+  summary_df$citation_scanned[n]     <- TRUE
 
   summary_df
 }
@@ -651,6 +658,14 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
 #'             file, line, loc, n_params, cyclocomp), latest version only
 #'   $edges    per-call-edge detail (package, version, graph, from, to),
 #'             latest version only
+#'   $citation_inputs  one row per version shipping inst/CITATION, carrying the
+#'             staging directory the reader will be given
+#'   $citations        one row per staged version's citation read status (see
+#'             parse_citation_records()'s `citations` frame)
+#'   $citation_payloads content-addressed citation payloads this package
+#'             contributed (see parse_citation_records()'s `payloads` frame)
+#'   $citation_entries  per-payload citation entries this package contributed
+#'             (see parse_citation_records()'s `entries` frame)
 #'
 #' Per-function and per-call-edge detail is emitted only by the analyzer binary
 #' and only for the package's latest version (the last row of versions_df, which
@@ -664,12 +679,20 @@ analyze_package <- function(repo_dir, package) {
   versions_df <- list_versions(repo_dir)
   churn_all   <- package_churn(repo_dir)
 
+  # One staging root per package. The reader is pointed at subdirectories of
+  # this and nothing else, so it is created here and removed when the package
+  # is done.
+  cit_stage <- tempfile(pattern = paste0("ccm_cit_", package, "_"))
+  dir.create(cit_stage, recursive = TRUE)
+  on.exit(unlink(cit_stage, recursive = TRUE, force = TRUE), add = TRUE)
+
   summary_rows       <- vector("list", nrow(versions_df))
   api_rows           <- vector("list", nrow(versions_df))
   functions_rows     <- vector("list", nrow(versions_df))
   edges_rows         <- vector("list", nrow(versions_df))
   datasets_rows      <- vector("list", nrow(versions_df))
   vignettes_rows     <- vector("list", nrow(versions_df))
+  citation_inputs    <- vector("list", nrow(versions_df))
   prev_exports       <- NULL
   deprecation_series <- vector("list", nrow(versions_df))
   # Time-gated per-version heartbeat. A single package with thousands of versions
@@ -780,6 +803,12 @@ analyze_package <- function(repo_dir, package) {
       typed_deps <- meta_typed_deps(ctx$desc)
       for (fld in names(typed_deps)) metrics[[fld]] <- typed_deps[[fld]]
 
+      # Whether this version ships the file utils::citation() reads. Stamped
+      # here rather than in a metric group because the metric groups only run
+      # when the analyzer binary is absent, which never happens in CI, so a
+      # group-computed field never becomes a column at all.
+      metrics[["has_citation"]] <- citation_shipped(ctx$files)
+
       # Coerce each metric to a length-1 scalar (guard against bad group output)
       safe_metrics <- lapply(metrics, function(x) {
         if (is.null(x) || length(x) != 1L) NA else x
@@ -863,9 +892,18 @@ analyze_package <- function(repo_dir, package) {
         .empty_vignettes_rows()
       }
 
+      # Two files per citation-bearing version, staged for the reader. Nothing
+      # is evaluated here; this only decides what the reader will be handed.
+      citation_input <- tryCatch(
+        stage_citation_inputs(tmp, cit_stage, package, v,
+                              as.integer(is_latest), date),
+        error = function(e) .empty_citation_inputs_df()
+      )
+
       list(safe_metrics = safe_metrics, api_row = api_row, prev_exports = curr_exports,
            dep_sig = dep_sig, functions_row = functions_row, edges_row = edges_row,
-           datasets_row = datasets_row, vignettes_row = vignettes_row)
+           datasets_row = datasets_row, vignettes_row = vignettes_row,
+           citation_input = citation_input)
     })
 
     summary_rows[[i]]       <- iter$safe_metrics
@@ -874,6 +912,7 @@ analyze_package <- function(repo_dir, package) {
     edges_rows[[i]]         <- iter$edges_row
     datasets_rows[[i]]      <- iter$datasets_row
     vignettes_rows[[i]]     <- iter$vignettes_row
+    citation_inputs[[i]]    <- iter$citation_input
     prev_exports            <- iter$prev_exports
     deprecation_series[[i]] <- iter$dep_sig
   }
@@ -944,6 +983,33 @@ analyze_package <- function(repo_dir, package) {
     .empty_vignettes_rows()
   }
 
+  citation_inputs_df <- if (length(citation_inputs) > 0L) {
+    do.call(rbind, citation_inputs)
+  } else {
+    .empty_citation_inputs_df()
+  }
+
+  # One reader process for this package's whole citation history. The worker's own
+  # elapsed-time limit is cleared across the call and restored after it: the
+  # limit does not fire during a blocking system2 but does as soon as one
+  # returns, and an error there would cost this package every metric above.
+  # Restored against the worker's own published deadline (scripts/update.R),
+  # not against a freshly-started clock here: setTimeLimit() restarts its
+  # clock on every call, so timing from this call's own start rather than the
+  # worker's would silently grant the package a second WORKER_TIMEOUT on top
+  # of whatever it had already spent before the citation pass ran. Falls back
+  # to a fresh WORKER_TIMEOUT-from-now when called outside the worker (direct
+  # test calls), where no such deadline has been published.
+  setTimeLimit()
+  citation_out <- citation_pass(citation_inputs_df, citation_reader_path())
+  .cit_deadline <- if (exists(".worker_deadline", inherits = TRUE)) {
+    get(".worker_deadline", inherits = TRUE)
+  } else {
+    Sys.time() + WORKER_TIMEOUT
+  }
+  setTimeLimit(elapsed = max(30, as.numeric(difftime(.cit_deadline, Sys.time(), units = "secs"))),
+               transient = TRUE)
+
   summary_df <- add_cross_version_metrics(summary_df, api_df, deprecation_series)
 
   list(
@@ -953,6 +1019,10 @@ analyze_package <- function(repo_dir, package) {
     functions = functions_df,
     edges     = edges_df,
     datasets  = datasets_df,
-    vignettes = vignettes_df
+    vignettes = vignettes_df,
+    citation_inputs = citation_inputs_df,
+    citations         = citation_out$citations,
+    citation_payloads = citation_out$payloads,
+    citation_entries  = citation_out$entries
   )
 }

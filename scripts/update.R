@@ -139,26 +139,34 @@
 # analysed carries neither, so each queue hands it straight back, every run,
 # for good. `changed` never goes false and the workflow publishes a dated
 # release for a database that has not moved.
+#
+# Recorded per version, because the queues do not ask the same question of the
+# same row. The n_fns_r queue flags a package when ANY of its stored rows has
+# no count, so one old version the analyzer cannot read holds the package in it
+# whatever happens to the newest one. A count kept per package is cleared by
+# the read that succeeded on the newest version, so nothing was ever counted
+# against the row that keeps the package there.
 
-# Did the analyzer read this package? datasets_scanned is the answer: the
-# dataset reader runs exactly when the binary produced the version's metrics,
-# and the marker is written on the latest-version row, so any row carrying it
-# says the binary read the version this package's queue position is about.
-# Tolerant of the column being absent, NA, logical or integer, because it
-# crosses SQLite in both directions.
-.analyzer_read_package <- function(summary_df) {
+# Which of a package's versions the analyzer did not produce metrics for.
+# analyze_package returns the versions the binary produced, which is the only
+# thing that tells those summary rows from the ones the pure-R fallback wrote
+# once they are in one frame. A caller that names none of them answers for none
+# of them, exactly as .stamp_analyzer_version refuses to: claiming a read
+# nobody reported would retire the row from its queue on a guess.
+.analyzer_unread_versions <- function(summary_df, binary_versions) {
   if (is.null(summary_df) || !is.data.frame(summary_df) ||
-      nrow(summary_df) == 0L || !"datasets_scanned" %in% names(summary_df)) {
-    return(FALSE)
+      nrow(summary_df) == 0L || !"version" %in% names(summary_df)) {
+    return(character(0L))
   }
-  v <- suppressWarnings(as.logical(summary_df$datasets_scanned))
-  any(!is.na(v) & v)
+  stored <- unique(as.character(summary_df$version))
+  stored[!stored %in% as.character(binary_versions %||% character(0L))]
 }
 
-# Count one attempt that did not read the package, against the build that made
+# Count one attempt that did not read this version, against the build that made
 # it. The build is part of the record: an attempt says nothing about a reader
 # other than the one that made it.
-.record_analyzer_read_attempt <- function(con, pkg, analyzer_version = NA_character_) {
+.record_analyzer_read_attempt <- function(con, pkg, version,
+                                          analyzer_version = NA_character_) {
   if (!"cran_analyzer_read_attempts" %in% DBI::dbListTables(con)) return(invisible(NULL))
   ver <- if (is.null(analyzer_version) || length(analyzer_version) != 1L ||
              is.na(analyzer_version) || !nzchar(analyzer_version)) {
@@ -168,32 +176,48 @@
   }
   now_str  <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
   existing <- DBI::dbGetQuery(con,
-    "SELECT attempts FROM cran_analyzer_read_attempts WHERE package = ?",
-    params = list(pkg))
+    "SELECT attempts FROM cran_analyzer_read_attempts
+      WHERE package = ? AND version = ?",
+    params = list(pkg, version))
   if (nrow(existing) == 0L) {
     DBI::dbExecute(con,
       "INSERT INTO cran_analyzer_read_attempts
-         (package, attempts, analyzer_version, last_attempt)
-       VALUES (?, 1, ?, ?)",
-      params = list(pkg, ver, now_str))
+         (package, version, attempts, analyzer_version, last_attempt)
+       VALUES (?, ?, 1, ?, ?)",
+      params = list(pkg, version, ver, now_str))
   } else {
     DBI::dbExecute(con,
       "UPDATE cran_analyzer_read_attempts
        SET attempts = attempts + 1, analyzer_version = ?, last_attempt = ?
-       WHERE package = ?",
-      params = list(ver, now_str, pkg))
+       WHERE package = ? AND version = ?",
+      params = list(ver, now_str, pkg, version))
   }
   invisible(NULL)
 }
 
-# Forget a package's attempts, because something read it. A count that survived
-# a successful read would retire a package that failed once on a bad day sooner
-# than the cap says.
-.clear_analyzer_read_attempts <- function(con, pkg) {
+# Forget a package's attempts, keeping only the versions named.
+#
+# A count that survived a successful read would retire a version that failed
+# once on a bad day sooner than the cap says, so every version this run read is
+# forgotten. So is every version the run did not see at all: a tag that is no
+# longer in the repository leaves a record nothing can ever answer, and the
+# package would sit outside both queues on the strength of a version it does
+# not have. `keep` is therefore what this run could not read, not what it
+# could, and everything else goes.
+.clear_analyzer_read_attempts <- function(con, pkg, keep = character(0L)) {
   if (!"cran_analyzer_read_attempts" %in% DBI::dbListTables(con)) return(invisible(NULL))
-  DBI::dbExecute(con,
-    "DELETE FROM cran_analyzer_read_attempts WHERE package = ?",
-    params = list(pkg))
+  keep <- as.character(keep)
+  if (length(keep) == 0L) {
+    DBI::dbExecute(con,
+      "DELETE FROM cran_analyzer_read_attempts WHERE package = ?",
+      params = list(pkg))
+    return(invisible(NULL))
+  }
+  DBI::dbExecute(con, sprintf(
+    "DELETE FROM cran_analyzer_read_attempts
+      WHERE package = ? AND version NOT IN (%s)",
+    paste(rep("?", length(keep)), collapse = ",")),
+    params = c(list(pkg), as.list(keep)))
   invisible(NULL)
 }
 
@@ -222,10 +246,14 @@
 }
 
 # Packages the backfill queues have stopped asking about.
+#
+# One version at the cap is enough, because the queues ask for packages: a
+# version that will never be read is a package that will never leave the queue
+# waiting on it, however many of its other versions were read on the first try.
 .analyzer_read_exhausted <- function(con) {
   if (!"cran_analyzer_read_attempts" %in% DBI::dbListTables(con)) return(character(0L))
   as.character(DBI::dbGetQuery(con,
-    "SELECT package FROM cran_analyzer_read_attempts WHERE attempts >= ?",
+    "SELECT DISTINCT package FROM cran_analyzer_read_attempts WHERE attempts >= ?",
     params = list(MAX_ANALYZER_READ_ATTEMPTS))$package)
 }
 
@@ -751,15 +779,14 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       shard_binary_keys <- c(shard_binary_keys,
                              .analyzer_row_keys(pkg, r$binary_versions))
       .reset_failure(con, pkg)
-      # Analysed, but was it read? A package the analyzer did not read carries
-      # none of the fields the backfill queues wait on, and that attempt is
-      # what eventually takes it out of them. A package that was read starts
-      # over from nothing, so one bad run does not count against the next.
-      if (.analyzer_read_package(r$summary)) {
-        .clear_analyzer_read_attempts(con, pkg)
-      } else {
-        .record_analyzer_read_attempt(con, pkg, analyzer_version)
-      }
+      # Analysed, but which versions were read? A version the analyzer did not
+      # read carries none of the fields the backfill queues wait on, and that
+      # attempt is what eventually takes its package out of them. Every other
+      # version starts over from nothing, so one bad run does not count against
+      # the next, and so does a version this package no longer has.
+      unread <- .analyzer_unread_versions(r$summary, r$binary_versions)
+      .clear_analyzer_read_attempts(con, pkg, keep = unread)
+      for (v in unread) .record_analyzer_read_attempt(con, pkg, v, analyzer_version)
     }
   }
 

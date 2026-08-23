@@ -678,6 +678,41 @@ open_or_init_data_db <- function(path) {
   con
 }
 
+.create_read_attempts <- function(con) {
+  DBI::dbExecute(con, "
+    CREATE TABLE cran_analyzer_read_attempts (
+      package          TEXT NOT NULL,
+      version          TEXT NOT NULL,
+      attempts         INTEGER NOT NULL DEFAULT 0,
+      analyzer_version TEXT,
+      last_attempt     TEXT,
+      PRIMARY KEY (package, version)
+    )")
+  invisible(NULL)
+}
+
+#' Replace the per-package attempt table with the per-version one.
+#'
+#' A count taken over a whole package belongs to no version of it, so there is
+#' nothing to carry across: a package that was read at one version and not at
+#' another produced exactly one row, and which version it was about is the fact
+#' the old shape did not hold. The rows are dropped and the packages asked
+#' again, which costs MAX_ANALYZER_READ_ATTEMPTS runs and is the same cost a new
+#' analyzer build already imposes on every one of them.
+#'
+#' A one-time no-op once the table carries a version.
+.migrate_read_attempts_by_version <- function(con) {
+  if (!"cran_analyzer_read_attempts" %in% DBI::dbListTables(con)) {
+    return(invisible(NULL))
+  }
+  if ("version" %in% DBI::dbListFields(con, "cran_analyzer_read_attempts")) {
+    return(invisible(NULL))
+  }
+  DBI::dbExecute(con, "DROP TABLE cran_analyzer_read_attempts")
+  .create_read_attempts(con)
+  invisible(NULL)
+}
+
 #' Open (or create) the pipeline SQLite database.
 #'
 #' If the file does not yet exist it is created. The four non-summary tables
@@ -725,19 +760,21 @@ open_or_init_db <- function(path) {
       )")
   }
 
-  # Packages handed to the analyzer that it did not read. The fields the
-  # backfill queues wait on (n_fns_r, the dataset rows) come from the binary
-  # alone, so a package the pure-R fallback analysed carries none of them and
-  # both queues hand it back on every run for good. analyzer_version is the
-  # build that could not read it, so a later build can ask again.
+  # Package versions handed to the analyzer that it did not read. The fields
+  # the backfill queues wait on (n_fns_r, the dataset rows) come from the
+  # binary alone, so a version the pure-R fallback analysed carries none of
+  # them and the queue hands its package back on every run for good.
+  # analyzer_version is the build that could not read it, so a later build can
+  # ask again.
+  #
+  # Per version rather than per package, because the n_fns_r queue reads every
+  # stored row: a package whose newest version the analyzer reads and whose
+  # older one it cannot is a package the queue holds forever, and a record
+  # taken over the whole package is cleared by the read that succeeded.
   if (!"cran_analyzer_read_attempts" %in% tables) {
-    DBI::dbExecute(con, "
-      CREATE TABLE cran_analyzer_read_attempts (
-        package          TEXT PRIMARY KEY,
-        attempts         INTEGER NOT NULL DEFAULT 0,
-        analyzer_version TEXT,
-        last_attempt     TEXT
-      )")
+    .create_read_attempts(con)
+  } else {
+    .migrate_read_attempts_by_version(con)
   }
 
   DBI::dbExecute(con,

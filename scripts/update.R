@@ -164,6 +164,42 @@
     params = list(current_version))
 }
 
+#' Record the analyzer build a shard was collected under.
+#'
+#' The clearing above only settles because the write that follows leaves the
+#' build behind: a row that names none is one the next run cannot show to be
+#' current, so it is cleared again, re-queued, re-analysed, and the run reports
+#' a change on a universe where nothing changed. analyze_package stamps the
+#' build on the rows the analyzer binary produced and on no others, so a row
+#' from any other path (the pure-R fallback, or an injected analyzer in a test)
+#' arrives without one and the queue never settles.
+#'
+#' The gap is filled here, where the run knows which build it is running,
+#' rather than being asked of every producer. A build the analyzer already
+#' named is left alone: overwriting it would erase the one signal that tells a
+#' row collected by an older build from one collected by this one.
+#'
+#' @param version The build about to run, from rpkg_analyzer_version(). NA when
+#'   there is no binary to ask, in which case nothing is written: a guess would
+#'   make every row look current and stop the queue noticing an upgrade at all.
+#' @return summary_df, with analyzer_version filled where it was missing.
+.stamp_analyzer_version <- function(summary_df, version) {
+  if (is.null(summary_df) || nrow(summary_df) == 0L) return(summary_df)
+  if (is.null(version) || length(version) != 1L || is.na(version) ||
+      !nzchar(version)) {
+    return(summary_df)
+  }
+  if (!"analyzer_version" %in% names(summary_df)) {
+    summary_df$analyzer_version <- as.character(version)
+    return(summary_df)
+  }
+  have <- as.character(summary_df$analyzer_version)
+  gap  <- is.na(have) | !nzchar(have)
+  have[gap] <- as.character(version)
+  summary_df$analyzer_version <- have
+  summary_df
+}
+
 #' How many packages the dataset scan has never reached.
 #'
 #' The marker lives on the latest-version row, beside latest_release_date, so
@@ -328,6 +364,12 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
             call. = FALSE, immediate. = TRUE)
   }
 
+  # Read once, and use the same answer for both halves of the re-scan queue:
+  # the build the stored rows are compared against, and the build stamped on
+  # the rows this shard writes. Asking twice would let a binary swapped
+  # mid-run clear markers it then never restores.
+  analyzer_version <- rpkg_analyzer_version()
+
   if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
   db_path      <- file.path(out_dir, DB_FILENAME)
@@ -405,7 +447,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # build are stale even though they are marked scanned. Clearing the marker on
     # those puts them back in the queue below, which drains a shard at a time and
     # settles once every row carries the running build's version.
-    n_stale <- .invalidate_stale_dataset_scans(con, rpkg_analyzer_version())
+    n_stale <- .invalidate_stale_dataset_scans(con, analyzer_version)
     if (n_stale > 0L) {
       message(sprintf("dataset scans invalidated by analyzer change: %d", n_stale))
     }
@@ -540,7 +582,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
 
   # ---- 7. Upsert shard into DB in-place (O(shard) memory) ------------------
   fresh_pkgs      <- names(shard_summary_list)
-  fresh_summary   <- .rbind_union_all(shard_summary_list)   %||% .empty_summary()
+  fresh_summary   <- .stamp_analyzer_version(
+    .rbind_union_all(shard_summary_list) %||% .empty_summary(), analyzer_version)
   fresh_churn     <- .rbind_union_all(shard_churn_list)     %||% .empty_churn()
   fresh_api       <- .rbind_union_all(shard_api_list)       %||% .empty_api()
   fresh_functions <- .rbind_union_all(shard_functions_list) %||% .empty_functions_df()

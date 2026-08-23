@@ -577,3 +577,114 @@ test_that("a columns profile within the bound is stored untouched", {
   # that is NULL for every healthy row reads to the coverage canary as dead.
   expect_equal(got$columns_refused_bytes, 0L)
 })
+
+# --- the build a shard was collected under, recorded on every row it writes ---
+# The re-scan queue clears the dataset marker on rows produced by a build other
+# than the running one, and reads a row that names no build as one it cannot
+# show to be current. That only settles because the run that follows leaves the
+# build behind. analyze_package leaves it behind on the rows the analyzer binary
+# produced and on no others, so a row from any other path arrives without one,
+# is cleared again on the next run, and the package is re-analysed forever.
+
+.mk_versioned_analyzer <- function(dir, version) {
+  stub <- file.path(dir, "stub-analyzer.sh")
+  writeLines(c(
+    "#!/bin/sh",
+    'if [ "$1" = "--version" ]; then',
+    sprintf('  echo "rpkg-analyzer %s"', version),
+    "  exit 0",
+    "fi",
+    "exit 1"), stub)
+  Sys.chmod(stub, mode = "0755")
+  stub
+}
+
+.ds_run_io <- function() list(
+  package_list = function() data.frame(package = "pkgA", latest_version = "1.0",
+                                       stringsAsFactors = FALSE),
+  clone = function(pkg, dest) { dir.create(dest, showWarnings = FALSE); TRUE })
+
+# A package analysed without the analyzer having produced its summary, which is
+# what the pure-R fallback writes and what every stored row predating the stamp
+# looks like.
+.ds_stub_analyze <- function() {
+  env <- environment(run_update)
+  old <- get("analyze_package", envir = env)
+  assign("analyze_package", function(dest, pkg) list(
+    summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
+      latest_release_date = "2026-01-01", datasets_scanned = 1L, detail_scanned = 1L,
+      stringsAsFactors = FALSE),
+    api = data.frame(package = pkg, version = "1.0", exports_added = "[]",
+      exports_removed = "[]", n_exports = 1L, stringsAsFactors = FALSE),
+    churn = NULL, functions = NULL, edges = NULL, datasets = NULL), envir = env)
+  old
+}
+
+test_that("a run records the analyzer build on rows that arrived without one", {
+  skip_on_os("windows")
+  stub_dir <- withr::local_tempdir()
+  withr::local_envvar(
+    RPKG_ANALYZER_BIN = .mk_versioned_analyzer(stub_dir, "0.4.0-test"))
+  withr::local_envvar(c(PREV_CODE_TAG = "", PREV_DATA_TAG = ""))
+
+  old <- .ds_stub_analyze()
+  on.exit(assign("analyze_package", old, envir = environment(run_update)), add = TRUE)
+
+  out <- withr::local_tempdir()
+  run_update(.ds_run_io(), out, shard_size = 10L)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_true("analyzer_version" %in% DBI::dbListFields(con, "cran_code_summary"))
+  expect_equal(
+    DBI::dbGetQuery(con, "SELECT analyzer_version FROM cran_code_summary")[[1L]],
+    "0.4.0-test")
+})
+
+test_that("the scan marker survives a second run over the same universe", {
+  # The failure this pins down is not a lost marker, it is a pipeline that
+  # never reports itself finished: the package returns to the queue every run,
+  # is re-analysed, and the run publishes a dated release for nothing.
+  skip_on_os("windows")
+  stub_dir <- withr::local_tempdir()
+  withr::local_envvar(
+    RPKG_ANALYZER_BIN = .mk_versioned_analyzer(stub_dir, "0.4.0-test"))
+  withr::local_envvar(c(PREV_CODE_TAG = "", PREV_DATA_TAG = ""))
+
+  old <- .ds_stub_analyze()
+  on.exit(assign("analyze_package", old, envir = environment(run_update)), add = TRUE)
+
+  out <- withr::local_tempdir()
+  io  <- .ds_run_io()
+  run_update(io, out, shard_size = 10L)
+  m2 <- run_update(io, out, shard_size = 10L)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_equal(
+    DBI::dbGetQuery(con, "SELECT datasets_scanned FROM cran_code_summary")[[1L]], 1L)
+  expect_equal(m2$n_fresh, 0L)
+  expect_false(m2$changed)
+})
+
+test_that("a row the analyzer stamped keeps the build it names", {
+  # The run fills a gap; it does not restate what the analyzer already said.
+  # Overwriting would erase the one signal that tells a row collected by an
+  # older build from one collected by this one.
+  df <- data.frame(package = c("a", "b"), version = c("1.0", "1.0"),
+                   analyzer_version = c("0.2.0", NA_character_),
+                   stringsAsFactors = FALSE)
+  got <- .stamp_analyzer_version(df, "0.4.0-test")
+  expect_equal(got$analyzer_version, c("0.2.0", "0.4.0-test"))
+})
+
+test_that("a run that cannot name its analyzer stamps nothing", {
+  # Writing a guess would make every row look current and stop the re-scan
+  # queue from ever noticing an upgrade.
+  df <- data.frame(package = "a", version = "1.0",
+                   analyzer_version = NA_character_, stringsAsFactors = FALSE)
+  expect_true(is.na(.stamp_analyzer_version(df, NA_character_)$analyzer_version))
+  expect_false("analyzer_version" %in%
+                 names(.stamp_analyzer_version(
+                   data.frame(package = "a", stringsAsFactors = FALSE), NA_character_)))
+})

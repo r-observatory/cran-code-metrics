@@ -144,6 +144,10 @@ if (requireNamespace("raster", quietly = TRUE)) {
   sv(bb, "named_brick")
 }
 if (requireNamespace("igraph", quietly = TRUE)) {
+  # The one fixture that does not come back byte for byte: an igraph object
+  # carries state that differs between sessions. Re-running this script will
+  # show it as changed with nothing about the graph having changed, so leave it
+  # alone unless the graph itself needs to be different.
   sv(igraph::make_ring(5, directed = TRUE), "ring_graph")
 }
 setClass("FixtureThing", representation(x = "numeric"))

@@ -2269,8 +2269,8 @@ dataset_column_coverage <- function(con) {
     if (!tbl %in% present) next
     cols <- intersect(names(specs[[tbl]]), DBI::dbListFields(con, tbl))
     if (!length(cols)) next
-    # One scan per table: SQLite's COUNT(col) skips NULLs, so the whole
-    # coverage of a 148-column table is a single aggregate query.
+    # One scan per table: SQLite's COUNT(col) skips NULLs, so the coverage of
+    # every column at once is a single aggregate query.
     sel <- paste(c('COUNT(*) AS "n_rows"',
                    sprintf('COUNT("%s") AS "c%d"', cols, seq_along(cols))),
                  collapse = ", ")

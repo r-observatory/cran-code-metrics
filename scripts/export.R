@@ -298,7 +298,18 @@ metrics_fingerprint <- function(summary_df) {
   row_mean_sd = "REAL",
   col_mean_min = "REAL", col_mean_q1 = "REAL", col_mean_median = "REAL",
   col_mean_mean = "REAL", col_mean_q3 = "REAL", col_mean_max = "REAL",
-  col_mean_sd = "REAL"
+  col_mean_sd = "REAL",
+
+  # Slots of a list that hold nothing at all. They count towards its length and
+  # they draw as nothing, so a list of ten with four of them empty is not the
+  # list its length says it is.
+  n_empty_slots = "INTEGER",
+  # The time zone an instant is stored in. It belongs to the object rather than
+  # to the file: the same moment written in two zones reads as two different
+  # local times. index_tz above it is the zone of a series' index, which is a
+  # different field on a different kind of object, and declaring one was not
+  # declaring the other.
+  tz = "TEXT"
 )
 
 # How one file happened to store the data, which is not a property of the data.

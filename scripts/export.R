@@ -723,6 +723,21 @@ open_or_init_db <- function(path) {
       )")
   }
 
+  # Packages handed to the analyzer that it did not read. The fields the
+  # backfill queues wait on (n_fns_r, the dataset rows) come from the binary
+  # alone, so a package the pure-R fallback analysed carries none of them and
+  # both queues hand it back on every run for good. analyzer_version is the
+  # build that could not read it, so a later build can ask again.
+  if (!"cran_analyzer_read_attempts" %in% tables) {
+    DBI::dbExecute(con, "
+      CREATE TABLE cran_analyzer_read_attempts (
+        package          TEXT PRIMARY KEY,
+        attempts         INTEGER NOT NULL DEFAULT 0,
+        analyzer_version TEXT,
+        last_attempt     TEXT
+      )")
+  }
+
   DBI::dbExecute(con,
     "CREATE INDEX IF NOT EXISTS idx_churn_pkg_ver ON cran_code_churn(package, version)")
   DBI::dbExecute(con,
@@ -930,8 +945,9 @@ upsert_datasets <- function(data_con, datasets_df, pkgs) {
 #' @param stat_table  Table to probe for stat_cols.
 #' @param stat_cols   Character vector of numeric columns to summarise.
 #' @param bootstrap   list(n_analyzed, n_universe, n_remaining,
-#'   bootstrap_complete, n_datasets_unscanned). n_universe/n_remaining and
-#'   n_datasets_unscanned may be NULL, in which case they are left out.
+#'   bootstrap_complete, n_datasets_unscanned, n_datasets_unreadable).
+#'   n_universe/n_remaining, n_datasets_unscanned and n_datasets_unreadable may
+#'   be NULL, in which case they are left out.
 #' @param coverage    Optional frame from dataset_column_coverage(). When given,
 #'   the manifest carries how many declared columns hold nothing for anybody,
 #'   so the finding outlives the run that made it. NULL leaves the block out,
@@ -1023,7 +1039,13 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
       # completion is measured against the code analysis, so it reads true
       # while packages sit with no dataset scan at all and no queue that will
       # ever pick them up.
-      n_datasets_unscanned = bootstrap$n_datasets_unscanned
+      n_datasets_unscanned = bootstrap$n_datasets_unscanned,
+      # How many of those the pipeline has stopped asking about: asked to the
+      # cap under this analyzer build and never read. The count above comes
+      # down as the backfill drains and this one does not, so it is the one
+      # that says what the corpus is missing for good, until a build that can
+      # read them arrives.
+      n_datasets_unreadable = bootstrap$n_datasets_unreadable
     )
   )
 

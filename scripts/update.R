@@ -71,18 +71,21 @@
 #'   still fits in one pipe write.
 #' @return A single string ending in one newline.
 .worker_line <- function(idx, n, ok, pkg, stage, nver, elapsed, reason = NULL) {
-  head <- sprintf("[%d/%d] %s %s: %s in %.1fs",
+  stem <- sprintf("[%d/%d] %s %s: %s in %.1fs",
                   idx, n,
                   if (isTRUE(ok)) "ok" else "FAIL", pkg,
                   if (isTRUE(ok)) sprintf("%d versions", nver)
                   else paste0(stage, " failed"),
                   elapsed)
   if (is.null(reason) || !nzchar(trimws(as.character(reason)))) {
-    return(paste0(head, "\n"))
+    return(paste0(stem, "\n"))
   }
-  # Two for the ": " that joins them, one for the newline.
-  room <- WORKER_LINE_MAX_BYTES - nchar(head, type = "bytes") - 3L
-  paste0(head, ": ", .clip_bytes(reason, room), "\n")
+  # Two for the ": " that joins them, one for the newline. A package name long
+  # enough to leave no room takes the line it already had rather than a colon
+  # with nothing after it.
+  room <- WORKER_LINE_MAX_BYTES - nchar(stem, type = "bytes") - 3L
+  if (room <= 3L) return(paste0(stem, "\n"))
+  paste0(stem, ": ", .clip_bytes(reason, room), "\n")
 }
 
 # Increment consecutive_failures for a package in cran_metrics_failures.

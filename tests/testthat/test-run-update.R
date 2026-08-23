@@ -385,7 +385,7 @@ test_that(".worker_line carries the reason a package failed", {
   expect_true(grepl("[3/400] FAIL pkgX: analyze failed in 12.3s", line, fixed = TRUE))
   expect_true(grepl("cannot open file 'DESCRIPTION'", line, fixed = TRUE))
   # One write, one line: two would let another fork's output land between them.
-  expect_equal(length(gregexpr("\n", line, fixed = TRUE)[[1L]]), 1L)
+  expect_identical(nchar(gsub("[^\n]", "", line)), 1L)
 })
 
 test_that(".worker_line says nothing extra when there is no reason", {
@@ -401,7 +401,7 @@ test_that(".worker_line keeps one fork's line inside one pipe write", {
   reason <- paste(rep("a deparsed call that went on and on", 200L), collapse = "\n")
   line <- .worker_line(1L, 1L, FALSE, "pkgZ", "analyze", 0L, 0.5, reason)
   expect_lte(nchar(line, type = "bytes"), WORKER_LINE_MAX_BYTES)
-  expect_equal(length(gregexpr("\n", line, fixed = TRUE)[[1L]]), 1L)
+  expect_identical(nchar(gsub("[^\n]", "", line)), 1L)
   expect_true(grepl("a deparsed call", line, fixed = TRUE))
 })
 

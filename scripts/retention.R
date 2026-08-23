@@ -201,6 +201,9 @@ retention_violations <- function(series, current, prior, prior_tag = "",
     was <- .ret_at(prior, chk$path)
     if (is.null(was)) next          # the prior manifest predates this field
     now <- .ret_at(current, chk$path) %||% 0
+    # A check carries a floor, a ceiling, or one day both. Each is read on its
+    # own so adding the second to an existing entry cannot quietly disable the
+    # first.
     if (!is.null(chk$max_gain)) {
       ceiling_v <- was + chk$max_gain
       if (now > ceiling_v) {
@@ -208,13 +211,14 @@ retention_violations <- function(series, current, prior, prior_tag = "",
                               series, chk$path, .ret_fmt(now), .ret_fmt(was),
                               .ret_fmt(ceiling_v)))
       }
-      next
     }
-    floor_v <- min(was * chk$min_ratio, was - chk$max_loss)
-    if (now < floor_v) {
-      out <- c(out, sprintf("%s %s fell to %s from %s (floor %s)",
-                            series, chk$path, .ret_fmt(now), .ret_fmt(was),
-                            .ret_fmt(floor_v)))
+    if (!is.null(chk$min_ratio)) {
+      floor_v <- min(was * chk$min_ratio, was - chk$max_loss)
+      if (now < floor_v) {
+        out <- c(out, sprintf("%s %s fell to %s from %s (floor %s)",
+                              series, chk$path, .ret_fmt(now), .ret_fmt(was),
+                              .ret_fmt(floor_v)))
+      }
     }
   }
   out

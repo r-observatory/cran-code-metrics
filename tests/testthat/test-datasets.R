@@ -270,6 +270,99 @@ test_that("a re-scan under a new generation is stored rather than ignored", {
   expect_equal(left, 2L)
 })
 
+# The generation the published database was written under. Every content row in
+# it carries this number, so a re-scan that stamps the same number can never
+# reach the table for data whose bytes have not changed.
+.PUBLISHED_FP_ALGO_VERSION <- 2L
+
+# The narrow profile an older reader produced, as the published rows hold it.
+.mk_published_row <- function(package = "p", version = "1.0", content_fp = "C1") {
+  row <- .mk_ds_row(package, version, TRUE, content_fp)
+  row$fp_algo_version <- .PUBLISHED_FP_ALGO_VERSION
+  row
+}
+
+# The same bytes read again by a reader that describes more of them, stamped the
+# way analyze.R stamps a real scan. Every field here is one the published rows
+# left NULL.
+.mk_rescanned_row <- function(package = "p", version = "1.0", content_fp = "C1") {
+  row <- .mk_ds_row(package, version, TRUE, content_fp)
+  row$fp_algo_version <- FP_ALGO_VERSION
+  row$matrix_diag     <- "unit"
+  row$frequency       <- 12
+  row$row_mean_mean   <- 1.5
+  row$col_mean_mean   <- 2.5
+  row$n_nan           <- 4L
+  row$n_infinite_pos  <- 7L
+  row$is_rowwise      <- TRUE
+  row
+}
+
+test_that("the generation in the constant is ahead of the one already published", {
+  # If it is not, the re-scan below is a no-op and roughly a hundred columns the
+  # reader now fills stay NULL for as long as the bytes stay unchanged, which for
+  # an archived package is forever.
+  expect_gt(FP_ALGO_VERSION, .PUBLISHED_FP_ALGO_VERSION)
+})
+
+test_that("a published profile does not suppress the re-scan that widens it", {
+  # The failure this guards is silent. INSERT OR IGNORE against
+  # UNIQUE(content_fp, schema_fp, fp_algo_version) drops the second write when
+  # the generation matches, so the fields the newer reader computed are
+  # discarded without an error and the run reports success.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_published_row(), "p"))
+  published <- DBI::dbGetQuery(con, "SELECT * FROM cran_dataset_contents")
+  expect_equal(nrow(published), 1L)
+  expect_true(is.na(published$matrix_diag[[1]]))
+  expect_true(is.na(published$row_mean_mean[[1]]))
+
+  # Same package, same dataset, same bytes: only the reader changed.
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_rescanned_row(), "p"))
+
+  # Two rows now: the profile that was published and the one the re-scan wrote.
+  expect_equal(DBI::dbGetQuery(con, "SELECT count(*) n FROM cran_dataset_contents")$n, 2L)
+
+  got <- DBI::dbGetQuery(con, sprintf(
+    "SELECT * FROM cran_dataset_contents WHERE fp_algo_version = %d", FP_ALGO_VERSION))
+  expect_equal(nrow(got), 1L)
+  expect_equal(got$matrix_diag[[1]], "unit")
+  expect_equal(got$frequency[[1]], 12)
+  expect_equal(got$row_mean_mean[[1]], 1.5)
+  expect_equal(got$col_mean_mean[[1]], 2.5)
+  expect_equal(got$n_nan[[1]], 4L)
+  expect_equal(got$n_infinite_pos[[1]], 7L)
+  expect_equal(got$is_rowwise[[1]], 1L)          # logicals store as integers
+
+  # A profile nobody can read is not a fix: the version link has to move onto the
+  # new row, or readers keep seeing the narrow one.
+  linked <- DBI::dbGetQuery(con,
+    "SELECT c.fp_algo_version fp, c.matrix_diag md
+       FROM cran_dataset_versions v JOIN cran_dataset_contents c USING (content_id)")
+  expect_equal(linked$fp, FP_ALGO_VERSION)
+  expect_equal(linked$md, "unit")
+
+  # The published row is now unreferenced, so the GC reclaims the space it held.
+  .gc_dataset_contents(con)
+  left <- DBI::dbGetQuery(con, "SELECT fp_algo_version FROM cran_dataset_contents")$fp_algo_version
+  expect_equal(left, FP_ALGO_VERSION)
+})
+
+test_that("two packages shipping the same bytes still share one profile", {
+  # The generation bump must not cost the dedup the content table exists for:
+  # one content row for both packages, not one each.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_rescanned_row(), "p"))
+  DBI::dbWithTransaction(con, .write_datasets_normalized(
+    con, .mk_rescanned_row(package = "q"), "q"))
+
+  expect_equal(DBI::dbGetQuery(con, "SELECT count(*) n FROM cran_dataset_contents")$n, 1L)
+  expect_equal(DBI::dbGetQuery(con, "SELECT count(*) n FROM cran_dataset_versions")$n, 2L)
+})
+
 # --- noticing that a scan is out of date -------------------------------------
 
 .mk_summary_tbl <- function(con, rows) {

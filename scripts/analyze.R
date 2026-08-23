@@ -12,7 +12,12 @@
 #
 # 2: reads compiled objects, describes sparse matrices, rasters and the object
 #    systems, and follows data()'s own rules for delimited text.
-FP_ALGO_VERSION <- 2L
+# 3: profiles every column and every list element on the terms summary() uses
+#    (spread, outliers, sort order, runs of missing values), summarises a grid
+#    along both of its margins rather than over every cell at once, separates
+#    NaN from NA and records which end an infinity runs to, and reads a
+#    broken-down time's fields and the years it spans.
+FP_ALGO_VERSION <- 3L
 
 #' Registry of metric group functions.
 #' Each value is a function(ctx) -> named list of scalar metric values.

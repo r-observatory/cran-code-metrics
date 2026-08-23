@@ -680,10 +680,12 @@ open_or_init_data_db <- function(path) {
 
 #' Open (or create) the pipeline SQLite database.
 #'
-#' If the file does not yet exist it is created. The three non-summary tables
-#' (cran_code_churn, cran_api_history, cran_metrics_failures) are created with
-#' fixed schemas and indexes on first open. cran_code_summary is created lazily
-#' by upsert_shard the first time data is written (its schema is dynamic).
+#' If the file does not yet exist it is created. The four non-summary tables
+#' (cran_code_churn, cran_api_history, cran_metrics_failures,
+#' cran_analyzer_read_attempts) are created with fixed schemas and indexes on
+#' first open, so a database downloaded from an older release gains the ones it
+#' does not have yet. cran_code_summary is created lazily by upsert_shard the
+#' first time data is written (its schema is dynamic).
 #'
 #' @param path File path for the SQLite database.
 #' @return An open DBI connection. The caller is responsible for calling

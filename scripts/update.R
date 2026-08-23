@@ -495,6 +495,9 @@ default_io <- function() {
 #' @param recollect When TRUE, re-analyzes only packages whose stored rows
 #'   predate the binary metrics (a sentinel column is NULL). Nothing is wiped:
 #'   rows are upserted in place, so the served DB stays complete throughout.
+#'   Not filtered by the analyzer read attempts, unlike the scheduled path: an
+#'   operator asking for a backfill by name is asking for the packages the
+#'   scheduled run has given up on as well.
 #' @return Manifest list (invisibly).
 run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                        recollect = FALSE) {

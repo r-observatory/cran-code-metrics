@@ -207,8 +207,14 @@ default_io <- function() {
       combined[order(combined$package), ]
     },
 
+    # Unauthenticated, because github.com/cran is a public mirror and nothing
+    # here needs a credential to read it. Passing one put the token on git's
+    # command line, where every process on the machine could read it out of ps
+    # or /proc/<pid>/cmdline - including a citation file being evaluated by a
+    # sibling worker while this clone was in flight. The token had been here
+    # since the first commit without ever answering a measured rate limit.
     clone = function(pkg, dest) {
-      clone_package(pkg, dest, token = Sys.getenv("GITHUB_TOKEN", ""))
+      clone_package(pkg, dest)
     }
   )
 }
@@ -343,7 +349,15 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     dataset_backfill <- .recollect_todo(con, universe$package, perm_fail_pkgs,
                                         sentinel = "datasets_scanned",
                                         latest_only = TRUE)
-    todo_pkgs <- sort(unique(c(changed, backfill, detail_backfill, dataset_backfill)))
+    # And drain any package whose latest-version row predates citation reading
+    # (citation_scanned IS NULL), so a package analysed before citations existed
+    # gets re-read once. Latest-row-scoped, so it converges instead of
+    # re-selecting the whole corpus on every run.
+    citation_backfill <- .recollect_todo(con, universe$package, perm_fail_pkgs,
+                                         sentinel = "citation_scanned",
+                                         latest_only = TRUE)
+    todo_pkgs <- sort(unique(c(changed, backfill, detail_backfill, dataset_backfill,
+                               citation_backfill)))
   }
 
   # Take the first shard_size packages from the to-do list (deterministic order).
@@ -360,12 +374,13 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # and exist only on the scheduled path; guard with exists() so --bootstrap and
   # --recollect runs still print (they show 0/0/0).
   t_shard0   <- Sys.time()
-  n_changed  <- if (exists("changed",         inherits = FALSE)) length(changed)         else 0L
-  n_backfill <- if (exists("backfill",        inherits = FALSE)) length(backfill)        else 0L
-  n_detail   <- if (exists("detail_backfill", inherits = FALSE)) length(detail_backfill) else 0L
+  n_changed  <- if (exists("changed",           inherits = FALSE)) length(changed)           else 0L
+  n_backfill <- if (exists("backfill",          inherits = FALSE)) length(backfill)          else 0L
+  n_detail   <- if (exists("detail_backfill",   inherits = FALSE)) length(detail_backfill)   else 0L
+  n_citation <- if (exists("citation_backfill", inherits = FALSE)) length(citation_backfill) else 0L
   cat(sprintf(
-    "shard plan: %d pkgs this shard; to-do pool %d (changed %d / backfill %d / detail %d, overlapping), %d will remain; %d cores, %ds/pkg timeout\n",
-    length(shard_pkgs), length(todo_pkgs), n_changed, n_backfill, n_detail,
+    "shard plan: %d pkgs this shard; to-do pool %d (changed %d / backfill %d / detail %d / citation %d, overlapping), %d will remain; %d cores, %ds/pkg timeout\n",
+    length(shard_pkgs), length(todo_pkgs), n_changed, n_backfill, n_detail, n_citation,
     length(todo_pkgs) - length(shard_pkgs), ANALYSIS_CORES, WORKER_TIMEOUT),
     file = stdout())
   flush(stdout())
@@ -378,6 +393,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   shard_edges_list     <- list()
   shard_datasets_list  <- list()
   shard_vignettes_list <- list()
+  shard_citations_list <- list()
+  shard_cit_payloads_list <- list()
+  shard_cit_entries_list  <- list()
   shard_failures       <- character(0L)
 
   if (!dir.exists(WORK_DIR)) dir.create(WORK_DIR, recursive = TRUE)
@@ -416,6 +434,12 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     on.exit(unlink(dest, recursive = TRUE, force = TRUE), add = TRUE)
     on.exit(setTimeLimit(), add = TRUE)
     setTimeLimit(elapsed = WORKER_TIMEOUT, transient = TRUE)
+    # Published so analyze_package()'s citation pass can restore the elapsed
+    # limit against this package's real deadline rather than starting a fresh
+    # clock of its own: setTimeLimit() restarts its clock on every call, so
+    # timing from the citation call's own start would silently grant the
+    # package a second WORKER_TIMEOUT on top of whatever it had already spent.
+    .worker_deadline <<- Sys.time() + WORKER_TIMEOUT
     ok <- tryCatch(io$clone(pkg, dest), error = function(e) FALSE)
     if (!isTRUE(ok)) {
       .done(FALSE, "clone", 0L)
@@ -437,7 +461,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     list(package = pkg, ok = TRUE,
          summary = res$summary, churn = res$churn, api = res$api,
          functions = res$functions, edges = res$edges, datasets = res$datasets,
-         vignettes = res$vignettes)
+         vignettes = res$vignettes, citations = res$citations,
+         citation_payloads = res$citation_payloads,
+         citation_entries = res$citation_entries)
   }
 
   results <- parallel::mclapply(shard_pkgs, .pkg_worker,
@@ -461,6 +487,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       shard_edges_list[[pkg]]     <- r$edges
       shard_datasets_list[[pkg]]  <- r$datasets
       shard_vignettes_list[[pkg]] <- r$vignettes
+      shard_citations_list[[pkg]]    <- r$citations
+      shard_cit_payloads_list[[pkg]] <- r$citation_payloads
+      shard_cit_entries_list[[pkg]]  <- r$citation_entries
       .reset_failure(con, pkg)
     }
   }
@@ -474,6 +503,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   fresh_edges     <- .rbind_union_all(shard_edges_list)     %||% .empty_edges_df()
   fresh_datasets  <- .rbind_union_all(shard_datasets_list)  %||% .empty_datasets_df()
   fresh_vignettes <- .rbind_union_all(shard_vignettes_list) %||% .empty_vignettes_rows()
+  fresh_citations    <- .rbind_union_all(shard_citations_list)    %||% .empty_citations_df()
+  fresh_cit_payloads <- .rbind_union_all(shard_cit_payloads_list) %||% .empty_citation_payloads_df()
+  fresh_cit_entries  <- .rbind_union_all(shard_cit_entries_list)  %||% .empty_citation_entries_df()
 
   if (length(fresh_pkgs) > 0L) {
     # Write dataset rows before the code summary stamps datasets_scanned = TRUE,
@@ -483,7 +515,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # redoes both cleanly, rather than being marked done with datasets missing.
     upsert_datasets(data_con, fresh_datasets, fresh_pkgs)
     upsert_shard(con, fresh_summary, fresh_churn, fresh_api,
-                 fresh_functions, fresh_edges, fresh_vignettes)
+                 fresh_functions, fresh_edges, fresh_vignettes,
+                 fresh_citations, fresh_cit_payloads, fresh_cit_entries)
   }
 
   # ---- 7b. Project archived-package metadata into the narrow lookup table ----
@@ -937,6 +970,7 @@ if (identical(sys.nframe(), 0L)) {
   source(file.path(.script_dir, "config.R"))
   source(file.path(.script_dir, "git.R"))
   source(file.path(.script_dir, "context.R"))
+  source(file.path(.script_dir, "citation.R"))
   source(file.path(.script_dir, "binary.R"))
   for (.f in sort(list.files(file.path(.script_dir, "metrics"),
                              pattern = "[.]R$", full.names = TRUE))) source(.f)

@@ -42,6 +42,8 @@ jobs:
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: r-lib/actions/setup-r@v2
         with:
           r-version: "release"
@@ -184,10 +186,14 @@ jobs:
           echo "PREV_DATA_TAG=${DATA_SRC}" >> "$GITHUB_ENV"
           ls -la out || true
 
+      # GH_TOKEN is here for gh, which uploads the release at the end of each
+      # shard. It is stripped from every Rscript invocation below: the pipeline
+      # evaluates inst/CITATION files, which are code written by package
+      # authors, and a variable that is never in the environment cannot be read
+      # out of it. Nothing under scripts/ reads a token.
       - name: Analyze shards and publish after each
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NOTES_TITLE_PREFIX: CRAN
           # --bootstrap goes to the first shard only (a second one would wipe
           # what the first just collected), so the retention guard cannot key
@@ -206,7 +212,7 @@ jobs:
           # selection) and resumable, so a re-run continues where it left off.
           if [ "${{ inputs.harvest_descriptions }}" = "true" ]; then
             echo "=== harvest-descriptions (elapsed ${SECONDS}s) ==="
-            Rscript scripts/update.R out/ --harvest-descriptions
+            env -u GH_TOKEN Rscript scripts/update.R out/ --harvest-descriptions
             if gh release view "$METRICS_TAG" >/dev/null 2>&1; then
               gh release upload "$METRICS_TAG" out/cran-code-metrics.db --clobber
               echo "clobbered cran-code-metrics.db in ${METRICS_TAG}"
@@ -258,7 +264,7 @@ jobs:
           while :; do
             shard=$((shard + 1))
             echo "=== shard ${shard} (elapsed ${SECONDS}s) ==="
-            Rscript scripts/update.R out/ ${FORCE} ${RECOLLECT}
+            env -u GH_TOKEN Rscript scripts/update.R out/ ${FORCE} ${RECOLLECT}
             FORCE=""
 
             CHANGED=$(jq -r '.changed' out/run-status.json)
@@ -266,7 +272,7 @@ jobs:
             echo "shard ${shard}: changed=${CHANGED} complete=${COMPLETE} analyzed=$(jq -r .n_analyzed out/run-status.json)/$(jq -r .n_universe out/run-status.json)"
 
             if [ "$CHANGED" = "true" ]; then
-              Rscript scripts/render_notes.R out/
+              env -u GH_TOKEN Rscript scripts/render_notes.R out/
               publish_metrics || exit 1
             fi
 
@@ -277,6 +283,8 @@ jobs:
             [ "$SECONDS" -ge "$BUDGET" ] && { echo "Time budget reached."; break; }
           done
 
+      # GH_TOKEN is for gh; prune.R only reads tag names on stdin, and is run
+      # without it for the same reason as the shard step above.
       - name: Prune old dated releases
         if: ${{ github.event_name == 'schedule' }}
         env:
@@ -289,7 +297,7 @@ jobs:
           # scheme is confirmed.
           gh release list --limit 1000 --json tagName -q '.[].tagName' \
             | { grep "^metrics-" || true; } \
-            | Rscript scripts/prune.R \
+            | env -u GH_TOKEN Rscript scripts/prune.R \
             | while read -r tag; do
                 [ -n "$tag" ] || continue
                 echo "pruning $tag"

@@ -408,3 +408,41 @@ test_that("two versions of one dataset can differ in how they were stored", {
     "SELECT version, format_version FROM cran_dataset_versions ORDER BY version")
   expect_equal(got$format_version, c(2L, 3L))
 })
+
+test_that("what the analyzer describes reaches the tables that hold it", {
+  # Every one of these was read, carried through the frame, and then dropped at
+  # the write because the column list had not heard of it. A scan that costs
+  # eleven hours should not arrive and be discarded.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  row <- .mk_wide_row()
+  row$mean <- 2.5; row$sd <- 1.25; row$q1 <- 1.5; row$q3 <- 3.5
+  row$sort_order <- "ascending"; row$n_zero <- 0L; row$p_zero <- 0
+  row$levels <- '["a","b"]'; row$is_ordered <- TRUE
+  row$frame_class <- "tibble"; row$dt_key <- '["id"]'
+  row$inner_nrow_total <- 2000L; row$element_names <- '["train","test"]'
+  row$dimnames <- '[{"margin":1,"labels":["A","B"]}]'
+  row$index_delta <- 1; row$index_regular <- TRUE; row$ts_span <- 3.5
+  row$resolution <- "[0.5,0.5]"; row$nodata_value <- -9999; row$in_memory <- TRUE
+  row$n_nonzero <- 6L; row$skewness <- 1.5; row$n_outliers <- 2L
+  row$title <- "Readings from an instrument"
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, row, "p"))
+
+  got <- DBI::dbGetQuery(con, "SELECT * FROM cran_dataset_contents")
+  expect_equal(got$mean, 2.5)
+  expect_equal(got$sd, 1.25)
+  expect_equal(got$sort_order, "ascending")
+  expect_equal(got$inner_nrow_total, 2000L)
+  expect_equal(got$n_nonzero, 6L)
+  expect_equal(got$nodata_value, -9999)
+  expect_equal(got$skewness, 1.5)
+  expect_true(all(c("levels", "dimnames", "dt_key", "element_names", "resolution",
+                    "index_delta", "ts_span", "n_outliers", "frame_class")
+                  %in% names(got)))
+
+  # A title belongs to the package's documentation, not to the bytes: two
+  # packages carrying identical data may describe it differently.
+  ident <- DBI::dbGetQuery(con, "SELECT title FROM cran_datasets")
+  expect_equal(ident$title, "Readings from an instrument")
+  expect_false("title" %in% DBI::dbListFields(con, "cran_dataset_contents"))
+})

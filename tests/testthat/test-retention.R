@@ -306,14 +306,21 @@ test_that("preflight_prior_dbs reports a baseline manifest whose database never 
 .ret_stub_analyze <- function(env) {
   old <- get("analyze_package", envir = env)
   assign("analyze_package", function(dest, pkg) list(
+    # A package the analyzer read. The scan marker, the build that earned it
+    # and the version named as one the binary produced arrive together,
+    # because that is the only combination analyze_package can return: the
+    # reader that sets the marker is the producer that names the build. The
+    # build is whatever this machine's analyzer answers, so the row is one the
+    # re-scan queue reads as current rather than as collected by somebody else.
     summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
-      latest_release_date = "2026-01-01", datasets_scanned = 1L, detail_scanned = 1L,
-      stringsAsFactors = FALSE),
+      latest_release_date = "2026-01-01", datasets_scanned = TRUE, detail_scanned = TRUE,
+      analyzer_version = rpkg_analyzer_version(), stringsAsFactors = FALSE),
     # One api row per version row, as the real analyzer emits: a stub that
     # omitted it would trip the summary/api warning on every test here.
     api = data.frame(package = pkg, version = "1.0", exports_added = "[]",
       exports_removed = "[]", n_exports = 1L, stringsAsFactors = FALSE),
-    churn = NULL, functions = NULL, edges = NULL, datasets = NULL),
+    churn = NULL, functions = NULL, edges = NULL, datasets = NULL,
+    binary_versions = "1.0"),
     envir = env)
   old
 }

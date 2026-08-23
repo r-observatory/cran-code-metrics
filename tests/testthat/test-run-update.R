@@ -442,3 +442,49 @@ test_that("a package that failed to analyze says why in the run output", {
   expect_true(any(grepl("FAIL pkgBoom", logged, fixed = TRUE)))
   expect_true(any(grepl("no tags on this clone", logged, fixed = TRUE)))
 })
+
+# ---------------------------------------------------------------------------
+# The dataset marker is only earned by a run that actually read datasets
+# ---------------------------------------------------------------------------
+# Dataset rows come from the analyzer binary alone; analyze_package falls back
+# to the pure-R analyze_version() whenever analyze_with_binary() returns NULL.
+# Both tests stub that one call rather than depending on whether this machine
+# has the binary, so the assertion means the same thing on a laptop and in CI.
+
+.with_binary_returning <- function(value, expr) {
+  env <- environment(analyze_package)
+  old <- get("analyze_with_binary", envir = env)
+  assign("analyze_with_binary", function(dir) value, envir = env)
+  on.exit(assign("analyze_with_binary", old, envir = env), add = TRUE)
+  force(expr)
+}
+
+test_that("a package analyzed without the dataset reader is not marked scanned", {
+  repo <- tempfile("ccm_ds_")
+  on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
+  .make_fake_clone("pkgNoReader", repo, versions = c("1.0", "1.1"))
+
+  res <- .with_binary_returning(NULL, analyze_package(repo, "pkgNoReader"))
+
+  expect_equal(nrow(res$datasets), 0L)
+  expect_true(all(is.na(res$summary$datasets_scanned)))
+})
+
+test_that("a package the reader looked at is marked scanned even with nothing to report", {
+  repo <- tempfile("ccm_ds_")
+  on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
+  .make_fake_clone("pkgReader", repo, versions = c("1.0", "1.1"))
+
+  # A package that ships no data still gets a scan: the reader ran and found
+  # nothing, which is a different fact from never having looked.
+  metrics <- structure(list(loc_r = 1L),
+                       functions = .empty_functions_df()[, -(1:2), drop = FALSE],
+                       edges     = .empty_edges_df()[, -(1:2), drop = FALSE],
+                       datasets  = .datasets_frame(list()))
+  res <- .with_binary_returning(metrics, analyze_package(repo, "pkgReader"))
+
+  last <- nrow(res$summary)
+  expect_equal(nrow(res$datasets), 0L)
+  expect_true(isTRUE(res$summary$datasets_scanned[last]))
+  expect_true(all(is.na(res$summary$datasets_scanned[-last])))
+})

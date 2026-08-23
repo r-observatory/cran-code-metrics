@@ -388,6 +388,97 @@ test_that("run_update publishes a cold start and a deliberate rebuild", {
   expect_no_error(run_update(.ret_io(), out2, shard_size = 10L, force_full = TRUE))
 })
 
+test_that("a run that reclaims free pages is not read as a run that lost rows", {
+  env <- environment(run_update)
+  old <- .ret_stub_analyze(env)
+  on.exit(assign("analyze_package", old, envir = env), add = TRUE)
+
+  # The 64 MB threshold is a judgement about the wall clock of rewriting a
+  # 1.8 GB file. The mechanism it guards is the same at 4 MB, which is a test
+  # that finishes.
+  orig_min <- VACUUM_MIN_RECLAIM_BYTES
+  VACUUM_MIN_RECLAIM_BYTES <<- 1024^2
+  on.exit(VACUUM_MIN_RECLAIM_BYTES <<- orig_min, add = TRUE)
+
+  # Two packages, one per shard, because the reclaim only runs on a shard that
+  # is going to publish: a run with nothing to report ends the loop without
+  # uploading, and rewriting the database there would be work thrown away.
+  io <- list(
+    package_list = function() data.frame(
+      package = c("pkgA", "pkgB"), latest_version = c("1.0", "1.0"),
+      stringsAsFactors = FALSE),
+    clone = function(pkg, dest) { dir.create(dest, showWarnings = FALSE); TRUE })
+
+  withr::local_envvar(c(PREV_CODE_TAG = "", PREV_DATA_TAG = ""))
+  out <- withr::local_tempdir()
+  run_update(io, out, shard_size = 1L)   # cold start builds both DBs
+
+  # Put the code database in the state a month of delete-and-reinsert leaves
+  # it in: pages on the free list that the file is still paying for.
+  db  <- file.path(out, DB_FILENAME)
+  con <- DBI::dbConnect(RSQLite::SQLite(), db)
+  DBI::dbExecute(con, "CREATE TABLE junk (payload TEXT)")
+  DBI::dbAppendTable(con, "junk",
+                     data.frame(payload = rep(strrep("x", 4096L), 1024L),
+                                stringsAsFactors = FALSE))
+  DBI::dbExecute(con, "DROP TABLE junk")
+  DBI::dbDisconnect(con)
+  bloated <- as.numeric(file.info(db)$size)
+  expect_gt(bloated, 4 * 1024^2)
+
+  # The baseline the workflow would have downloaded: the manifest of the
+  # release that published this file, describing it at this size.
+  code <- read_manifest_file(file.path(out, "code-manifest.json"))
+  code$db_bytes <- bloated
+  write_manifest(file.path(out, "prev-code-manifest.json"), code)
+  write_manifest(file.path(out, "prev-data-manifest.json"),
+                 read_manifest_file(file.path(out, "data-manifest.json")))
+
+  expect_no_error(run_update(io, out, shard_size = 1L))
+
+  # The space is genuinely back, and the manifest this run publishes describes
+  # the file it publishes rather than the one it inherited.
+  reclaimed_size <- as.numeric(file.info(db)$size)
+  expect_lt(reclaimed_size, bloated / 2)
+  expect_equal(read_manifest_file(file.path(out, "code-manifest.json"))$db_bytes,
+               round(reclaimed_size))
+  # And the baseline every later shard of this run compares against was
+  # restated by exactly what came back.
+  expect_equal(read_manifest_file(file.path(out, "prev-code-manifest.json"))$db_bytes,
+               round(bloated - (bloated - reclaimed_size)))
+})
+
+test_that("a shard with nothing to publish does not rewrite the database", {
+  env <- environment(run_update)
+  old <- .ret_stub_analyze(env)
+  on.exit(assign("analyze_package", old, envir = env), add = TRUE)
+
+  orig_min <- VACUUM_MIN_RECLAIM_BYTES
+  VACUUM_MIN_RECLAIM_BYTES <<- 1024^2
+  on.exit(VACUUM_MIN_RECLAIM_BYTES <<- orig_min, add = TRUE)
+
+  withr::local_envvar(c(PREV_CODE_TAG = "", PREV_DATA_TAG = ""))
+  out <- withr::local_tempdir()
+  run_update(.ret_io(), out, shard_size = 10L)
+
+  db  <- file.path(out, DB_FILENAME)
+  con <- DBI::dbConnect(RSQLite::SQLite(), db)
+  DBI::dbExecute(con, "CREATE TABLE junk (payload TEXT)")
+  DBI::dbAppendTable(con, "junk",
+                     data.frame(payload = rep(strrep("x", 4096L), 1024L),
+                                stringsAsFactors = FALSE))
+  DBI::dbExecute(con, "DROP TABLE junk")
+  DBI::dbDisconnect(con)
+  bloated <- as.numeric(file.info(db)$size)
+
+  # The universe is already analysed, so this shard reports no change and the
+  # workflow ends its loop without uploading. Rewriting 1.8 GB for a file
+  # nobody will publish is minutes of a run's wall clock spent on nothing.
+  m <- run_update(.ret_io(), out, shard_size = 10L)
+  expect_false(m$changed)
+  expect_equal(as.numeric(file.info(db)$size), bloated)
+})
+
 # ---------------------------------------------------------------------------
 # The workflow half: the download that must not swallow its failure
 # ---------------------------------------------------------------------------

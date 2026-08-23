@@ -55,6 +55,31 @@ ANALYSIS_CORES <- {
 # Overridable via WORKER_TIMEOUT env var.
 WORKER_TIMEOUT <- as.integer(Sys.getenv("WORKER_TIMEOUT", unset = "600"))
 
+# The smallest reclaim worth rewriting a database for.
+#
+# SQLite gives a deleted page to the database's own free list, never back to
+# the filesystem, so both published databases sit at their high-water mark
+# whatever they currently hold. The dataset side deletes and re-inserts every
+# re-scanned package's rows: cran-data-metrics.db was published byte-identical
+# at 1,208,176,640 four days running while its contents changed every one of
+# them. The code side is the one with less room, at 1,837,748,224 bytes against
+# the workflow's 2,040,109,465-byte publish refusal, so pages nobody is using
+# are what stands between a run and a release it cannot upload.
+#
+# VACUUM rewrites the whole file, which on a 1.8 GB database is minutes of a
+# run's wall clock, so it is not something to do for a handful of pages. Below
+# this the free list is doing its job and the next inserts will take those
+# pages back.
+VACUUM_MIN_RECLAIM_BYTES <- 64 * 1024^2
+
+# VACUUM builds the compacted database beside the original and then copies it
+# back over it under a rollback journal, so at its peak the file exists about
+# twice over on top of itself. Ask for that much free space and skip the
+# reclaim when it is not there: a run that cannot reclaim still has a database
+# worth publishing, and failing over a full disk would throw away the day's
+# collection to save space nobody needed yet.
+VACUUM_DISK_FACTOR <- 2
+
 #' Null/empty coalescing operator.
 #' Returns b when a is NULL, length-0, or a scalar NA.
 `%||%` <- function(a, b) {

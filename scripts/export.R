@@ -512,6 +512,98 @@ metrics_fingerprint <- function(summary_df) {
   invisible(NULL)
 }
 
+#' Free space on the filesystem holding `path`, in bytes.
+#'
+#' R has no portable answer to this, so it asks df. -P is the POSIX output
+#' format, which guarantees one line per filesystem however long the device
+#' name is; -k fixes the block size at 1024 so the numbers mean the same thing
+#' on macOS (whose default is 512) and on Linux.
+#'
+#' The available column is read as the third all-digit field rather than the
+#' fourth field, because a device name can carry a space (autofs mounts on
+#' macOS are reported as "map auto_home") and shift every position after it.
+#'
+#' @param path A directory. Its filesystem is the one measured.
+#' @return Free bytes, or NA_real_ when df is unavailable or says something
+#'   this cannot read. NA means "not measured", never "none".
+free_disk_bytes <- function(path) {
+  if (!nzchar(path %||% "")) path <- "."
+  out <- tryCatch(
+    suppressWarnings(system2("df", c("-Pk", shQuote(path)),
+                             stdout = TRUE, stderr = FALSE)),
+    error = function(e) character(0L))
+  if (length(out) < 2L) return(NA_real_)
+  fields <- strsplit(trimws(out[length(out)]), "[[:space:]]+")[[1L]]
+  nums <- suppressWarnings(as.numeric(fields[grepl("^[0-9]+$", fields)]))
+  if (length(nums) < 3L) return(NA_real_)
+  nums[3L] * 1024
+}
+
+#' Return the pages a delete freed to the filesystem.
+#'
+#' .gc_dataset_contents() and upsert_shard()'s per-package delete remove rows,
+#' and SQLite puts every page they release on the database's own free list
+#' rather than shrinking the file, so the published database only ever records
+#' the largest it has ever been. VACUUM is what actually hands the space back,
+#' and until this ran the only VACUUM in the tree was in export_metrics(),
+#' which the pipeline never calls.
+#'
+#' Skipping is a normal outcome and never an error. A free list too small to be
+#' worth a rewrite is the free list working, and a disk that cannot hold the
+#' copy is a reason to publish the database as it stands rather than to lose
+#' the run. Both say so in `reason`; the caller logs it.
+#'
+#' The caller must not be inside a transaction: SQLite refuses to VACUUM there.
+#'
+#' @param con        Open DBI connection to the database at `path`.
+#' @param path       The database file, needed to measure the file itself.
+#' @param min_reclaim Smallest free-list size worth rewriting the file for.
+#' @param free_bytes Free space on the filesystem holding `path`. NA means it
+#'   could not be measured, in which case the reclaim goes ahead: VACUUM is
+#'   atomic, so a disk that turns out to be too small costs the reclaim and
+#'   leaves the database exactly as it was.
+#' @return list(ran, before, after, reclaimed, reason). `reclaimed` is 0
+#'   whenever `ran` is FALSE, so a caller can credit it unconditionally.
+vacuum_db <- function(con, path, min_reclaim = VACUUM_MIN_RECLAIM_BYTES,
+                      free_bytes = free_disk_bytes(dirname(path))) {
+  before <- as.numeric(file.info(path)$size %||% 0)
+  skipped <- function(reason) {
+    list(ran = FALSE, before = before, after = before, reclaimed = 0,
+         reason = reason)
+  }
+
+  free_pages <- tryCatch({
+    page  <- as.numeric(DBI::dbGetQuery(con, "PRAGMA page_size")[[1L]])
+    count <- as.numeric(DBI::dbGetQuery(con, "PRAGMA freelist_count")[[1L]])
+    page * count
+  }, error = function(e) NA_real_)
+  if (is.na(free_pages)) {
+    return(skipped("the free list could not be measured"))
+  }
+  if (free_pages < min_reclaim) {
+    return(skipped(sprintf(
+      "its free list holds %s, below the %s worth rewriting the file for",
+      format_bytes(free_pages), format_bytes(min_reclaim))))
+  }
+
+  needed <- before * VACUUM_DISK_FACTOR
+  if (!is.na(free_bytes) && free_bytes < needed) {
+    return(skipped(sprintf(
+      "the disk has %s free and the rewrite needs about %s",
+      format_bytes(free_bytes), format_bytes(needed))))
+  }
+
+  err <- tryCatch({
+    DBI::dbExecute(con, "VACUUM")
+    NULL
+  }, error = function(e) conditionMessage(e))
+  if (!is.null(err)) return(skipped(sprintf("the rewrite failed: %s", err)))
+
+  after <- as.numeric(file.info(path)$size %||% 0)
+  list(ran = TRUE, before = before, after = after,
+       reclaimed = max(0, before - after), reason = "")
+}
+
 #' Open (or create) the dataset SQLite database, ensuring the four normalized
 #' dataset tables exist. Mirrors open_or_init_db() but for the data series.
 #'

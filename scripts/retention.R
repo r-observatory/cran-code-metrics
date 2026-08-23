@@ -58,10 +58,12 @@
     list(path = "tables.cran_call_edges",    min_ratio = 0.98,  max_loss = 0),
     list(path = "tables.cran_code_churn",    min_ratio = 0.98,  max_loss = 0),
     # Monotone by construction on the scheduled path: SQLite does not shrink a
-    # file on DELETE, and the only VACUUM in the tree is in export_metrics(),
-    # which nothing under scripts/ or .github/ calls. Never fell across 30
+    # file on DELETE, it moves the page to the free list. Never fell across 30
     # releases (1.163 GB -> 1.256 GB). It is also what tolerates force_full,
-    # whose DELETEs leave the file size where it was.
+    # whose DELETEs leave the file size where it was. The one legitimate
+    # shrink is the reclaim on the publish path, and that one does not arrive
+    # here as a fall: credit_reclaim_to_baseline() takes the bytes it returned
+    # off `was` first, so both sides are measured the same way.
     list(path = "db_bytes",                  min_ratio = 0.90,  max_loss = 0),
     # n_universe is network-derived and degrades silently: package_list()
     # returns an empty frame with only a warning when a fetch fails, and it is
@@ -450,6 +452,41 @@ ensure_prior_baseline <- function(out_dir) {
       .RETENTION_KEY_TABLES[[spec$series]]$ver_table))
   }
   notes
+}
+
+#' Restate a baseline in the units the reclaimed database is now measured in.
+#'
+#' The db_bytes check reads a smaller file as history that went missing, and
+#' that is right for every cause but one: a VACUUM makes the file smaller while
+#' changing nothing that is in it. The pages it hands back were free pages in
+#' the file this run inherited, so the previous release's database, vacuumed,
+#' would have been exactly that much smaller too. Subtracting the measured
+#' reclaim from the baseline is therefore not an exemption, it is the same
+#' number expressed the same way on both sides, and it excuses precisely the
+#' shrink the run caused and not one byte more: a run that reclaims 630 MB and
+#' also loses half its rows is still refused.
+#'
+#' It is written to the downloaded prev-*-manifest.json rather than held in
+#' memory because the check runs once per shard and the reclaim happens on the
+#' first one. Later shards of the same run re-read that file, and a run only
+#' ever sees a baseline it downloaded itself, so the credit expires when the
+#' run does. Nothing else reads db_bytes out of it: prior_db_violations()
+#' compares rows.
+#'
+#' @param path      Path to a prev-<series>-manifest.json. An absent file is
+#'   the cold-start case and is not an error.
+#' @param reclaimed Bytes the vacuum actually returned to the filesystem.
+#' @return TRUE when the baseline was rewritten, FALSE when there was nothing
+#'   to credit.
+credit_reclaim_to_baseline <- function(path, reclaimed) {
+  reclaimed <- as.numeric(reclaimed %||% 0)
+  if (!is.finite(reclaimed) || reclaimed <= 0) return(invisible(FALSE))
+  prior <- read_manifest_file(path)
+  was <- .ret_at(prior, "db_bytes")
+  if (is.null(was)) return(invisible(FALSE))
+  prior$db_bytes <- max(0, round(was - reclaimed))
+  jsonlite::write_json(prior, path, auto_unbox = TRUE, pretty = TRUE)
+  invisible(TRUE)
 }
 
 #' Check both downloaded prior databases against their manifests.

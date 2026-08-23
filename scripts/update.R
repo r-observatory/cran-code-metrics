@@ -566,6 +566,47 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     file = stdout())
   flush(stdout())
 
+  # ---- 8c. Reclaim the space the deletes did not give back ------------------
+  # Every re-scanned package is a delete followed by an insert, on both sides,
+  # and SQLite keeps the pages a delete frees on the database's own free list
+  # rather than returning them to the filesystem. A database that rewrites the
+  # same rows for months therefore stays at its high-water mark whatever it
+  # currently holds: cran-data-metrics.db was published byte-identical four
+  # days running while its contents changed every one of them, and the code
+  # database reached 90% of the size at which the workflow refuses to publish
+  # at all.
+  #
+  # Only on a run that is going to publish. VACUUM rewrites the whole file, and
+  # a shard with nothing to report ends the loop without uploading anything, so
+  # reclaiming there would spend minutes on a database that is then thrown
+  # away. It runs before the manifests are built so they describe the file that
+  # is actually published, and before the retention guard so a shard that is
+  # about to be refused does not pay for it either. It is allowed to decline:
+  # see vacuum_db().
+  if (isTRUE(changed)) {
+    for (spec in list(
+      list(con = con,      path = db_path,
+           baseline = file.path(out_dir, "prev-code-manifest.json")),
+      list(con = data_con, path = data_db_path,
+           baseline = file.path(out_dir, "prev-data-manifest.json")))) {
+      vac <- vacuum_db(spec$con, spec$path)
+      if (isTRUE(vac$ran)) {
+        # The retention guard reads a smaller file as history that went
+        # missing. Restate the baseline by what came back, so it compares like
+        # with like and still refuses a run that lost more than it reclaimed.
+        credit_reclaim_to_baseline(spec$baseline, vac$reclaimed)
+        cat(sprintf("reclaimed %s from %s (%s -> %s)\n",
+                    format_bytes(vac$reclaimed), basename(spec$path),
+                    format_bytes(vac$before), format_bytes(vac$after)),
+            file = stdout())
+      } else {
+        cat(sprintf("left %s as it is: %s\n", basename(spec$path), vac$reason),
+            file = stdout())
+      }
+      flush(stdout())
+    }
+  }
+
   bootstrap <- list(n_analyzed = n_analyzed_pkgs, n_universe = n_universe,
                     n_remaining = length(remaining_after),
                     bootstrap_complete = bootstrap_complete)
@@ -601,7 +642,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       n_versions = nrow(fresh_summary),
                       shard_failures = length(shard_failures)))
 
-  # ---- 8c. Retention guard --------------------------------------------------
+  # ---- 8d. Retention guard --------------------------------------------------
   # The published database is the pipeline's accumulated state, so publishing a
   # smaller one overwrites collection nobody can recover except from an older
   # release. The check belongs here rather than in the workflow's

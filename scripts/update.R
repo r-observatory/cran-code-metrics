@@ -121,6 +121,35 @@
     params = list(current_version))
 }
 
+#' How many packages the dataset scan has never reached.
+#'
+#' The marker lives on the latest-version row, beside latest_release_date, so
+#' the question is scoped the same way .recollect_todo scopes the backfill it
+#' feeds: a package counts when its latest row has no marker.
+#'
+#' Deliberately NOT filtered by permanent failures or by the current universe,
+#' unlike the to-do pool. Those are exactly the packages that will never be
+#' scanned and so never appear in a queue, which is what makes them invisible:
+#' bootstrap_complete goes true and stays true with them still unscanned. This
+#' is the number that says how many.
+#'
+#' @return Package count. Zero when there is nothing to measure yet; every
+#'   package when the marker column does not exist, because before the first
+#'   write that carries it nothing has been scanned.
+.n_datasets_unscanned <- function(con) {
+  if (!"cran_code_summary" %in% DBI::dbListTables(con)) return(0L)
+  fields <- DBI::dbListFields(con, "cran_code_summary")
+  if (!"latest_release_date" %in% fields) return(0L)
+  sql <- if ("datasets_scanned" %in% fields) {
+    "SELECT COUNT(DISTINCT package) n FROM cran_code_summary
+      WHERE latest_release_date IS NOT NULL AND datasets_scanned IS NULL"
+  } else {
+    "SELECT COUNT(DISTINCT package) n FROM cran_code_summary
+      WHERE latest_release_date IS NOT NULL"
+  }
+  as.integer(DBI::dbGetQuery(con, sql)$n %||% 0L)
+}
+
 #'   row would re-flag every multi-version package forever, so the backfill would
 #'   never converge. Packages with no latest_release_date row are not flagged.
 .recollect_todo <- function(con, universe_pkgs, perm_fail_pkgs,
@@ -609,7 +638,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
 
   bootstrap <- list(n_analyzed = n_analyzed_pkgs, n_universe = n_universe,
                     n_remaining = length(remaining_after),
-                    bootstrap_complete = bootstrap_complete)
+                    bootstrap_complete = bootstrap_complete,
+                    n_datasets_unscanned = .n_datasets_unscanned(con))
   code_db_bytes <- as.numeric(file.info(db_path)$size %||% 0)
   data_db_bytes <- as.numeric(file.info(data_db_path)$size %||% 0)
 

@@ -929,8 +929,9 @@ upsert_datasets <- function(data_con, datasets_df, pkgs) {
 #' @param ver_table   Table to count rows from for n_versions.
 #' @param stat_table  Table to probe for stat_cols.
 #' @param stat_cols   Character vector of numeric columns to summarise.
-#' @param bootstrap   list(n_analyzed, n_universe, n_remaining, bootstrap_complete).
-#'   n_universe/n_remaining may be NULL.
+#' @param bootstrap   list(n_analyzed, n_universe, n_remaining,
+#'   bootstrap_complete, n_datasets_unscanned). n_universe/n_remaining and
+#'   n_datasets_unscanned may be NULL, in which case they are left out.
 #' @param coverage    Optional frame from dataset_column_coverage(). When given,
 #'   the manifest carries how many declared columns hold nothing for anybody,
 #'   so the finding outlives the run that made it. NULL leaves the block out,
@@ -1017,7 +1018,12 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
       n_analyzed         = bootstrap$n_analyzed,
       n_universe         = bootstrap$n_universe,
       n_remaining        = bootstrap$n_remaining,
-      bootstrap_complete = isTRUE(bootstrap$bootstrap_complete)
+      bootstrap_complete = isTRUE(bootstrap$bootstrap_complete),
+      # A different question from bootstrap_complete, and one it hides:
+      # completion is measured against the code analysis, so it reads true
+      # while packages sit with no dataset scan at all and no queue that will
+      # ever pick them up.
+      n_datasets_unscanned = bootstrap$n_datasets_unscanned
     )
   )
 

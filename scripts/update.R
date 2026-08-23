@@ -45,6 +45,46 @@
   )
 }
 
+# Collapse a message to one line and cut it to a byte budget.
+#
+# One line because the caller's write has to stay a single write. Bytes rather
+# than characters because the budget is a pipe's, and a path or a maintainer's
+# name costs up to four bytes a character. Whole characters because cutting a
+# multi-byte one in half leaves a string R cannot print.
+.clip_bytes <- function(s, max_bytes) {
+  s <- gsub("[[:space:]]+", " ", trimws(as.character(s)))
+  if (max_bytes <= 0L) return("")
+  if (nchar(s, type = "bytes") <= max_bytes) return(s)
+  chars <- strsplit(s, "")[[1L]]
+  keep  <- cumsum(nchar(chars, type = "bytes")) <= (max_bytes - 3L)
+  paste0(paste(chars[keep], collapse = ""), "...")
+}
+
+#' The one line a worker prints when it finishes a package.
+#'
+#' Built here rather than inside the fork so what a failure says can be checked
+#' without a subprocess, and so the byte bound that keeps the write atomic is
+#' applied in one place.
+#'
+#' @param reason Why it failed, when there is one. NULL leaves the line as it
+#'   was; anything else is appended after a colon, clipped so the whole line
+#'   still fits in one pipe write.
+#' @return A single string ending in one newline.
+.worker_line <- function(idx, n, ok, pkg, stage, nver, elapsed, reason = NULL) {
+  head <- sprintf("[%d/%d] %s %s: %s in %.1fs",
+                  idx, n,
+                  if (isTRUE(ok)) "ok" else "FAIL", pkg,
+                  if (isTRUE(ok)) sprintf("%d versions", nver)
+                  else paste0(stage, " failed"),
+                  elapsed)
+  if (is.null(reason) || !nzchar(trimws(as.character(reason)))) {
+    return(paste0(head, "\n"))
+  }
+  # Two for the ": " that joins them, one for the newline.
+  room <- WORKER_LINE_MAX_BYTES - nchar(head, type = "bytes") - 3L
+  paste0(head, ": ", .clip_bytes(reason, room), "\n")
+}
+
 # Increment consecutive_failures for a package in cran_metrics_failures.
 .record_failure <- function(con, pkg) {
   now_str  <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
@@ -424,18 +464,13 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # never byte-interleave, and fd 1 is disjoint from mclapply's result pipe. The
     # emit is wrapped in try() so a broken-stream write can never turn an ok
     # package into a recorded failure.
-    .done <- function(ok, stage, nver) {
+    .done <- function(ok, stage, nver, reason = NULL) {
       el <- as.numeric(difftime(Sys.time(), .t0, units = "secs"))
       if (isTRUE(ok) && .idx %% 25L != 0L && el < 30 && !identical(.idx, .n)) {
         return(invisible())
       }
       try({
-        cat(sprintf("[%d/%d] %s %s: %s in %.1fs\n",
-                    .idx, .n,
-                    if (isTRUE(ok)) "ok" else "FAIL", pkg,
-                    if (isTRUE(ok)) sprintf("%d versions", nver)
-                    else paste0(stage, " failed"),
-                    el),
+        cat(.worker_line(.idx, .n, ok, pkg, stage, nver, el, reason),
             file = stdout())
         flush(stdout())
       }, silent = TRUE)
@@ -450,16 +485,20 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       .done(FALSE, "clone", 0L)
       return(list(package = pkg, ok = FALSE))
     }
+    # The reason went to warning(), which inside an mclapply fork is collected
+    # by nothing and thrown away when the fork exits, so every failure in every
+    # run was a package name and no cause. It rides out on the same line the
+    # failure already prints: one write, on the fd the forks share.
+    reason <- NULL
     res <- tryCatch(
       analyze_package(dest, pkg),
       error = function(e) {
-        warning(sprintf("analyze_package failed for '%s': %s",
-                        pkg, conditionMessage(e)))
+        reason <<- conditionMessage(e)
         NULL
       }
     )
     if (is.null(res)) {
-      .done(FALSE, "analyze", 0L)
+      .done(FALSE, "analyze", 0L, reason)
       return(list(package = pkg, ok = FALSE))
     }
     .done(TRUE, "ok", nrow(res$summary))

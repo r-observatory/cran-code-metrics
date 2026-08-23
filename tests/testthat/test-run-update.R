@@ -374,3 +374,71 @@ test_that("transient failure that later succeeds resets the failure counter", {
   expect_true("pkgFlaky" %in% pkgs_db)      # package now in DB
   expect_equal(m2$permanent_failures, 0L)   # no permanent failures
 })
+
+# ---------------------------------------------------------------------------
+# The line a worker prints, and the reason it used to swallow
+# ---------------------------------------------------------------------------
+
+test_that(".worker_line carries the reason a package failed", {
+  line <- .worker_line(3L, 400L, FALSE, "pkgX", "analyze", 0L, 12.34,
+                       "cannot open file 'DESCRIPTION'")
+  expect_true(grepl("[3/400] FAIL pkgX: analyze failed in 12.3s", line, fixed = TRUE))
+  expect_true(grepl("cannot open file 'DESCRIPTION'", line, fixed = TRUE))
+  # One write, one line: two would let another fork's output land between them.
+  expect_equal(length(gregexpr("\n", line, fixed = TRUE)[[1L]]), 1L)
+})
+
+test_that(".worker_line says nothing extra when there is no reason", {
+  ok <- .worker_line(25L, 400L, TRUE, "pkgY", "ok", 7L, 1.5)
+  expect_identical(ok, "[25/400] ok pkgY: 7 versions in 1.5s\n")
+})
+
+test_that(".worker_line keeps one fork's line inside one pipe write", {
+  # Forks share fd 1. A write that fits in the pipe buffer arrives whole, so
+  # lines are reordered but never spliced; a longer one can be split down the
+  # middle and interleaved with another package's. An R condition message
+  # carries whatever the failure quoted, including a whole file.
+  reason <- paste(rep("a deparsed call that went on and on", 200L), collapse = "\n")
+  line <- .worker_line(1L, 1L, FALSE, "pkgZ", "analyze", 0L, 0.5, reason)
+  expect_lte(nchar(line, type = "bytes"), WORKER_LINE_MAX_BYTES)
+  expect_equal(length(gregexpr("\n", line, fixed = TRUE)[[1L]]), 1L)
+  expect_true(grepl("a deparsed call", line, fixed = TRUE))
+})
+
+test_that(".worker_line does not cut a multi-byte character in half", {
+  # Clipping by bytes on a message that is not ASCII, which a maintainer name
+  # or a file path routinely is not.
+  line <- .worker_line(1L, 1L, FALSE, "pkgZ", "analyze", 0L, 0.5,
+                       strrep("é中文", 500L))
+  expect_lte(nchar(line, type = "bytes"), WORKER_LINE_MAX_BYTES)
+  expect_true(validUTF8(line))
+})
+
+test_that("a package that failed to analyze says why in the run output", {
+  # The reason went to warning() inside an mclapply fork, where nothing
+  # collects it and the fork's exit discards it. Every failure in every run
+  # was therefore a package name and no cause.
+  out_dir <- tempfile(); dir.create(out_dir)
+  on.exit(unlink(out_dir, recursive = TRUE, force = TRUE), add = TRUE)
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+
+  # One core so the worker runs in this process and its output is capturable;
+  # the emit is identical either way.
+  orig_cores <- ANALYSIS_CORES
+  ANALYSIS_CORES <<- 1L
+  on.exit(ANALYSIS_CORES <<- orig_cores, add = TRUE)
+
+  old <- analyze_package
+  assign("analyze_package",
+         function(dest, pkg) stop("no tags on this clone"),
+         envir = environment(run_update))
+  on.exit(assign("analyze_package", old, envir = environment(run_update)), add = TRUE)
+
+  io <- .fake_io(data.frame(package = "pkgBoom", latest_version = "1.0",
+                            stringsAsFactors = FALSE))
+  logged <- capture.output(suppressWarnings(run_update(io, out_dir, shard_size = 1L)))
+
+  expect_true(any(grepl("FAIL pkgBoom", logged, fixed = TRUE)))
+  expect_true(any(grepl("no tags on this clone", logged, fixed = TRUE)))
+})

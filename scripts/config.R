@@ -55,6 +55,19 @@ ANALYSIS_CORES <- {
 # Overridable via WORKER_TIMEOUT env var.
 WORKER_TIMEOUT <- as.integer(Sys.getenv("WORKER_TIMEOUT", unset = "600"))
 
+# The most one worker's progress line may be, in bytes.
+#
+# The workers are mclapply forks, all writing to the same inherited fd 1. A
+# write that fits in one pipe buffer arrives whole, so two forks' lines are
+# reordered but never spliced into each other; a longer write can be split and
+# leave half of one package's line inside another's. POSIX guarantees PIPE_BUF
+# is at least 512 bytes, which is what macOS uses where Linux uses 4096, so 512
+# is the bound that holds wherever this runs.
+#
+# It matters because the line now carries the reason a package failed, and a
+# condition message is as long as whatever it quoted.
+WORKER_LINE_MAX_BYTES <- 512L
+
 # The smallest reclaim worth rewriting a database for.
 #
 # SQLite gives a deleted page to the database's own free list, never back to

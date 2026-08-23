@@ -642,6 +642,10 @@ test_that("the refusal survives R's error-printing limit", {
   # the rest. At the default 1000 the advice was cut off mid-sentence, which
   # leaves the operator with the refusal and none of the repair.
   expect_true(nchar(retention_repair_advice()) > 500L)
+  expect_true(nchar(retention_failure_advice()) > 500L)
+  # A run that trips both guards carries both texts, and that whole message
+  # still has to arrive intact.
+  expect_true(nchar(retention_refusal(c(floor = "a", ceiling = "b"))) < 8000L)
   for (f in c("update.R", "preflight.R")) {
     src <- paste(readLines(file.path("..", "..", "scripts", f)), collapse = "\n")
     expect_true(grepl("options(warning.length", src, fixed = TRUE))
@@ -713,4 +717,87 @@ test_that("a handful of failures on a small corpus says nothing", {
   cur$bootstrap$n_universe <- 5L
   cur$tables$cran_metrics_failures <- 1L
   expect_identical(retention_warnings("code", cur), character(0L))
+})
+
+test_that("a floor and a ceiling violation say which guard produced them", {
+  # The two are opposite failures reported through one vector, and the refusal
+  # has to word itself for the cause. Reading them apart from the message text
+  # would be guessing, so each one carries its guard kind as its name.
+  prev <- .code_manifest_0814()
+  prev$tables$cran_metrics_failures <- 3L
+
+  burst <- prev
+  burst$tables$cran_metrics_failures <- 250L
+  expect_identical(names(retention_violations("code", burst, prev)), "ceiling")
+
+  shrunk <- prev
+  shrunk$n_packages <- 100L
+  expect_identical(names(retention_violations("code", shrunk, prev)), "floor")
+
+  # A release we could not read is the lost-download state, which is the floor
+  # family however it is spelled.
+  expect_identical(
+    names(retention_violations("code", prev, NULL,
+                               prior_tag = "metrics-2026-08-14")),
+    "floor")
+
+  expect_null(names(retention_violations("code", prev, prev)))
+})
+
+test_that("a burst of failures is not reported as history being dropped", {
+  # A mirror outage in the middle of a shard fails 250 packages and drops
+  # nothing: their stored rows are all still there. Told that this run "would
+  # drop history the previous release carried" and handed the release-level
+  # repair, an operator deletes a release that is fine while the real cause
+  # goes unnamed.
+  prev <- .code_manifest_0814()
+  prev$tables$cran_metrics_failures <- 3L
+  cur  <- prev
+  cur$tables$cran_metrics_failures <- 250L
+
+  msg <- retention_refusal(retention_violations("code", cur, prev))
+  expect_false(grepl("drop history", msg, fixed = TRUE))
+  expect_false(grepl("delete that release", msg, fixed = TRUE))
+  expect_true(grepl("rose to 250 from 3", msg, fixed = TRUE))
+  expect_true(grepl("cran_metrics_failures", msg, fixed = TRUE))
+  # And it has to send the operator somewhere useful.
+  expect_true(grepl("Nothing was dropped", msg, fixed = TRUE))
+  expect_true(grepl("re-run", msg, fixed = TRUE))
+})
+
+test_that("a lost download still gets the headline and repair written for it", {
+  prev <- .code_manifest_0814()
+  cur  <- prev
+  cur$n_packages <- 100L
+
+  msg <- retention_refusal(retention_violations("code", cur, prev))
+  expect_true(grepl("drop history the previous release carried", msg,
+                    fixed = TRUE))
+  expect_true(grepl("delete that release", msg, fixed = TRUE))
+  expect_false(grepl("Nothing was dropped", msg, fixed = TRUE))
+})
+
+test_that("a run that both lost rows and failed a shard is told both", {
+  prev <- .code_manifest_0814()
+  prev$tables$cran_metrics_failures <- 3L
+  cur  <- prev
+  cur$n_packages <- 100L
+  cur$tables$cran_metrics_failures <- 250L
+
+  msg <- retention_refusal(retention_violations("code", cur, prev))
+  expect_true(grepl("drop history the previous release carried", msg,
+                    fixed = TRUE))
+  expect_true(grepl("failed far more packages", msg, fixed = TRUE))
+  expect_true(grepl("delete that release", msg, fixed = TRUE))
+  expect_true(grepl("Nothing was dropped", msg, fixed = TRUE))
+})
+
+test_that("update.R refuses through the wording built for the violations", {
+  # The refusal is assembled in one place so a new guard kind cannot be
+  # published under the previous one's headline.
+  src <- paste(readLines(file.path("..", "..", "scripts", "update.R")),
+               collapse = "\n")
+  expect_true(grepl("retention_refusal(violations)", src, fixed = TRUE))
+  expect_false(grepl("this run would drop history the previous ", src,
+                     fixed = TRUE))
 })

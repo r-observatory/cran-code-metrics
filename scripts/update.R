@@ -768,9 +768,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       read_manifest_file(file.path(out_dir, "prev-data-manifest.json")),
       prior_tag = Sys.getenv("PREV_DATA_TAG", ""), force_full = rebuilding))
   if (length(violations) > 0L) {
-    stop("refusing to publish: this run would drop history the previous ",
-         "release carried.\n  ", paste(violations, collapse = "\n  "),
-         retention_repair_advice(), call. = FALSE)
+    stop(retention_refusal(violations), call. = FALSE)
   }
 
   if (length(fresh_pkgs) > 0L) {

@@ -26,7 +26,10 @@
 # one-sided, why a release that published no manifest gets a baseline measured
 # from its database rather than a refusal that repeats every run, and why
 # retention_repair_advice() names the release-level repair and rules force_full
-# out.
+# out. It is also why a refusal is assembled by retention_refusal() from the
+# kind of guard that tripped rather than from one fixed wording: this file
+# holds one check that fires when nothing was lost at all, and telling that
+# operator to delete a release would be worse than saying nothing.
 
 # The floor for a field is the MORE PERMISSIVE of a ratio and a flat row
 # allowance: max_loss = 0 means "ratio only". A flat allowance matters on a
@@ -170,7 +173,10 @@ read_manifest_file <- function(path) {
 #'   and is not.
 #' @param force_full TRUE for an operator-requested full rebuild, which is the
 #'   one path that legitimately empties tables.
-#' @return Character vector of violations, empty when the run may publish.
+#' @return Character vector of violations, empty when the run may publish. Each
+#'   element is NAMED with the kind of guard that produced it, "floor" or
+#'   "ceiling", because the two are opposite failures with opposite repairs and
+#'   retention_refusal() has to tell them apart without reading the text.
 retention_violations <- function(series, current, prior, prior_tag = "",
                                  force_full = FALSE) {
   # --bootstrap wipes three code tables before re-analysing, so its first shard
@@ -187,11 +193,13 @@ retention_violations <- function(series, current, prior, prior_tag = "",
 
   if (is.null(prior) || length(prior) == 0L) {
     if (nzchar(prior_tag)) {
-      return(sprintf(
+      # A release whose manifest we cannot read is the lost-download state, so
+      # it belongs to the floor family however differently it is worded.
+      return(c(floor = sprintf(
         paste0("no %s baseline to compare against: release %s exists but its ",
                "manifest was not read, which is the state a lost download ",
                "leaves behind"),
-        series, prior_tag))
+        series, prior_tag)))
     }
     return(character(0L))  # genuinely the first release
   }
@@ -207,17 +215,17 @@ retention_violations <- function(series, current, prior, prior_tag = "",
     if (!is.null(chk$max_gain)) {
       ceiling_v <- was + chk$max_gain
       if (now > ceiling_v) {
-        out <- c(out, sprintf("%s %s rose to %s from %s (ceiling %s)",
-                              series, chk$path, .ret_fmt(now), .ret_fmt(was),
-                              .ret_fmt(ceiling_v)))
+        out <- c(out, ceiling = sprintf("%s %s rose to %s from %s (ceiling %s)",
+                                        series, chk$path, .ret_fmt(now),
+                                        .ret_fmt(was), .ret_fmt(ceiling_v)))
       }
     }
     if (!is.null(chk$min_ratio)) {
       floor_v <- min(was * chk$min_ratio, was - chk$max_loss)
       if (now < floor_v) {
-        out <- c(out, sprintf("%s %s fell to %s from %s (floor %s)",
-                              series, chk$path, .ret_fmt(now), .ret_fmt(was),
-                              .ret_fmt(floor_v)))
+        out <- c(out, floor = sprintf("%s %s fell to %s from %s (floor %s)",
+                                      series, chk$path, .ret_fmt(now),
+                                      .ret_fmt(was), .ret_fmt(floor_v)))
       }
     }
   }
@@ -313,6 +321,72 @@ retention_repair_advice <- function() {
     "cran_code_churn and cran_api_history and republishes a 400-package ",
     "catalog as latest, which is the outcome this check exists to prevent. ",
     "Use it only for a rebuild of the whole catalog that you actually want.")
+}
+
+#' What an operator should actually do when the failures ceiling refuses.
+#'
+#' The ceiling needs its own text because the advice above would actively harm
+#' here. Nothing was lost when this guard fires: the packages that failed still
+#' have every row they had, and the repair above opens with the previous
+#' release and offers deleting it, which in the middle of a mirror outage means
+#' throwing away a release that is perfectly fine while the 250 packages that
+#' actually failed go unmentioned.
+#'
+#' @return A single string, ready to append to a refusal.
+retention_failure_advice <- function() {
+  sprintf(paste0(
+    "\nNothing was dropped. Every row these packages had is still in the ",
+    "database. What this run recorded is that they would not clone or would ",
+    "not analyse, and cran_metrics_failures counts them.\n",
+    "Look at the run log first: each failing package prints its name and the ",
+    "reason it failed on one line, and a jump this size is usually one cause ",
+    "shared by all of them and upstream of the pipeline (the cran mirror ",
+    "refusing clones, the runner losing the network, an analyzer meeting a ",
+    "shape it did not handle before). `SELECT package, consecutive_failures, ",
+    "last_attempt FROM cran_metrics_failures ORDER BY last_attempt DESC` in ",
+    "this run's database lists them.\n",
+    "A package leaves this table the moment it is analysed successfully, so ",
+    "the repair is to fix that cause and re-run. Leaving it is not free: a ",
+    "package that fails %d times in a row is dropped from the queue for good. ",
+    "Do not reach for the previous release, which did not cause this, and do ",
+    "not reach for force_full, which re-analyses through the same failure and ",
+    "republishes a 400-package catalog while doing it."),
+    MAX_CLONE_FAILURES)
+}
+
+#' The whole refusal a run stops with, worded for the guards that tripped.
+#'
+#' retention_violations() reports two opposite failures through one vector, and
+#' one fixed headline cannot cover both: told that a burst of failures "would
+#' drop history the previous release carried" and handed the release-level
+#' repair, an operator deletes a good release during an incident whose cause is
+#' entirely upstream. The kinds present in the vector pick both the headline
+#' and which advice is appended, and a run that managed both gets both.
+#'
+#' @param violations Character vector from retention_violations(), named by
+#'   guard kind. An unnamed element is treated as a floor, which is what every
+#'   check but one is.
+#' @return A single string, ready to pass to stop().
+retention_refusal <- function(violations) {
+  kinds <- names(violations) %||% rep("", length(violations))
+  kinds[!nzchar(kinds)] <- "floor"
+
+  headline <- character(0L)
+  advice   <- character(0L)
+  if ("floor" %in% kinds) {
+    headline <- c(headline,
+                  "this run would drop history the previous release carried")
+    advice   <- c(advice, retention_repair_advice())
+  }
+  if ("ceiling" %in% kinds) {
+    headline <- c(headline,
+                  "this run failed far more packages than the previous release did")
+    advice   <- c(advice, retention_failure_advice())
+  }
+
+  paste0("refusing to publish: ", paste(headline, collapse = ", and "), ".\n  ",
+         paste(violations, collapse = "\n  "),
+         paste(advice, collapse = ""))
 }
 
 #' Whether a downloaded prior database has LESS in it than the manifest that

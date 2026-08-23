@@ -206,3 +206,29 @@ test_that("a package the reader did read keeps no attempt record and settles at 
   expect_identical(.n_datasets_unreadable(con), 0L)
   expect_identical(.n_datasets_unscanned(con), 0L)
 })
+
+test_that("a package given up on is asked again by the next analyzer build", {
+  # The cap is a verdict about one reader. A count that outlived its reader
+  # would retire a package for good on the say-so of a build nobody runs any
+  # more, and the row it protects carries no scan marker, so the marker-based
+  # invalidation cannot reach it either.
+  skip_on_os("windows")
+  stub_dir <- withr::local_tempdir()
+  withr::local_envvar(RPKG_ANALYZER_BIN = .dsa_analyzer(stub_dir, "0.4.0-test"))
+  withr::local_envvar(c(PREV_CODE_TAG = "", PREV_DATA_TAG = ""))
+
+  out <- withr::local_tempdir()
+  io  <- .dsa_io()
+  for (i in seq_len(MAX_ANALYZER_READ_ATTEMPTS)) {
+    suppressWarnings(run_update(io, out, shard_size = 10L))
+  }
+  settled <- suppressWarnings(run_update(io, out, shard_size = 10L))
+  expect_false(settled$changed)
+
+  # A new build arrives. Same package, same failure, but nothing here has been
+  # asked of this reader yet.
+  .dsa_analyzer(stub_dir, "0.5.0-test")
+  retried <- suppressWarnings(run_update(io, out, shard_size = 10L))
+  expect_equal(retried$n_fresh, 1L)
+  expect_true(retried$changed)
+})

@@ -463,10 +463,12 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # Thinned per-worker completion line, emitted FROM the fork so it streams live
     # during the otherwise-silent parallel phase. Prints only on every 25th queue
     # position, every failure, every slow (>=30s) package, and the last position.
-    # One fully-formed cat() to stdout (< PIPE_BUF): forks reorder whole lines but
-    # never byte-interleave, and fd 1 is disjoint from mclapply's result pipe. The
-    # emit is wrapped in try() so a broken-stream write can never turn an ok
-    # package into a recorded failure.
+    # One fully-formed cat() to stdout: forks reorder whole lines but never
+    # byte-interleave, and fd 1 is disjoint from mclapply's result pipe. Staying
+    # under PIPE_BUF is what makes that true, and .worker_line is where it is
+    # enforced, because the line now carries a condition message. The emit is
+    # wrapped in try() so a broken-stream write can never turn an ok package
+    # into a recorded failure.
     .done <- function(ok, stage, nver, reason = NULL) {
       el <- as.numeric(difftime(Sys.time(), .t0, units = "secs"))
       if (isTRUE(ok) && .idx %% 25L != 0L && el < 30 && !identical(.idx, .n)) {

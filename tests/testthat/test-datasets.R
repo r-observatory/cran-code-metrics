@@ -590,21 +590,6 @@ test_that("a columns profile within the bound is stored untouched", {
 # produced nothing, which is the same false claim datasets_scanned is withheld
 # to avoid, and the two would then disagree about the same row.
 
-.mk_versioned_analyzer <- function(dir, version, reads = FALSE) {
-  stub <- file.path(dir, "stub-analyzer.sh")
-  writeLines(c(
-    "#!/bin/sh",
-    'if [ "$1" = "--version" ]; then',
-    sprintf('  echo "rpkg-analyzer %s"', version),
-    "  exit 0",
-    "fi",
-    # Answers for itself and fails on the package: installed, and cannot read
-    # this one.
-    "exit 1"), stub)
-  Sys.chmod(stub, mode = "0755")
-  stub
-}
-
 .ds_run_io <- function() list(
   package_list = function() data.frame(package = "pkgA", latest_version = "1.0",
                                        stringsAsFactors = FALSE),
@@ -702,7 +687,7 @@ test_that("a run records the analyzer build on the rows the analyzer produced", 
   skip_on_os("windows")
   stub_dir <- withr::local_tempdir()
   withr::local_envvar(
-    RPKG_ANALYZER_BIN = .mk_versioned_analyzer(stub_dir, "0.4.0-test"))
+    RPKG_ANALYZER_BIN = .stub_analyzer_bin(stub_dir, "0.4.0-test"))
   withr::local_envvar(c(PREV_CODE_TAG = "", PREV_DATA_TAG = ""))
 
   old <- .ds_stub_analyze(version = NA_character_)
@@ -725,7 +710,7 @@ test_that("the scan marker survives a second run over the same universe", {
   skip_on_os("windows")
   stub_dir <- withr::local_tempdir()
   withr::local_envvar(
-    RPKG_ANALYZER_BIN = .mk_versioned_analyzer(stub_dir, "0.4.0-test"))
+    RPKG_ANALYZER_BIN = .stub_analyzer_bin(stub_dir, "0.4.0-test"))
   withr::local_envvar(c(PREV_CODE_TAG = "", PREV_DATA_TAG = ""))
 
   old <- .ds_stub_analyze()
@@ -748,7 +733,7 @@ test_that("a fallback row reaches the database naming no build at all", {
   skip_on_os("windows")
   stub_dir <- withr::local_tempdir()
   withr::local_envvar(
-    RPKG_ANALYZER_BIN = .mk_versioned_analyzer(stub_dir, "0.4.0-test"))
+    RPKG_ANALYZER_BIN = .stub_analyzer_bin(stub_dir, "0.4.0-test"))
   withr::local_envvar(c(PREV_CODE_TAG = "", PREV_DATA_TAG = ""))
 
   old <- .ds_stub_fallback()
@@ -773,7 +758,7 @@ test_that("a package the installed analyzer cannot read names no build either", 
   skip_on_os("windows")
   stub_dir <- withr::local_tempdir()
   withr::local_envvar(
-    RPKG_ANALYZER_BIN = .mk_versioned_analyzer(stub_dir, "0.4.0-test"))
+    RPKG_ANALYZER_BIN = .stub_analyzer_bin(stub_dir, "0.4.0-test"))
   withr::local_envvar(c(PREV_CODE_TAG = "", PREV_DATA_TAG = ""))
 
   out <- withr::local_tempdir()

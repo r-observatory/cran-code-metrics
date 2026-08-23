@@ -1,4 +1,4 @@
-# tests/testthat/test-dataset-scan-attempts.R
+# tests/testthat/test-analyzer-read-attempts.R
 #
 # The third state of a dataset scan. datasets_scanned answers one question with
 # two answers: the reader ran (whatever it found), or it did not. A package the
@@ -9,21 +9,6 @@
 #
 # The record is the same shape the pipeline already uses for a package that
 # cannot be cloned: a count, a cap, and no place in the queue past it.
-
-.dsa_analyzer <- function(dir, version, reads = FALSE) {
-  stub <- file.path(dir, "stub-analyzer.sh")
-  writeLines(c(
-    "#!/bin/sh",
-    'if [ "$1" = "--version" ]; then',
-    sprintf('  echo "rpkg-analyzer %s"', version),
-    "  exit 0",
-    "fi",
-    # A binary that answers for itself and fails on the package is what
-    # "installed, and cannot read this one" looks like in production.
-    "exit 1"), stub)
-  Sys.chmod(stub, mode = "0755")
-  stub
-}
 
 # A real git repo, so the real analyze_package runs over it.
 .dsa_clone <- function(pkg, dest) {
@@ -127,7 +112,7 @@ test_that("a run that cannot name its analyzer forgets nothing", {
 test_that("a package the analyzer cannot read leaves the queue instead of never settling", {
   skip_on_os("windows")
   stub_dir <- withr::local_tempdir()
-  withr::local_envvar(RPKG_ANALYZER_BIN = .dsa_analyzer(stub_dir, "0.4.0-test"))
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_analyzer_bin(stub_dir, "0.4.0-test"))
   withr::local_envvar(c(PREV_CODE_TAG = "", PREV_DATA_TAG = ""))
 
   out <- withr::local_tempdir()
@@ -151,7 +136,7 @@ test_that("a package the analyzer cannot read leaves the queue instead of never 
 test_that("the count of packages nobody could read reaches both manifests", {
   skip_on_os("windows")
   stub_dir <- withr::local_tempdir()
-  withr::local_envvar(RPKG_ANALYZER_BIN = .dsa_analyzer(stub_dir, "0.4.0-test"))
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_analyzer_bin(stub_dir, "0.4.0-test"))
   withr::local_envvar(c(PREV_CODE_TAG = "", PREV_DATA_TAG = ""))
 
   out <- withr::local_tempdir()
@@ -214,7 +199,7 @@ test_that("a package given up on is asked again by the next analyzer build", {
   # invalidation cannot reach it either.
   skip_on_os("windows")
   stub_dir <- withr::local_tempdir()
-  withr::local_envvar(RPKG_ANALYZER_BIN = .dsa_analyzer(stub_dir, "0.4.0-test"))
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_analyzer_bin(stub_dir, "0.4.0-test"))
   withr::local_envvar(c(PREV_CODE_TAG = "", PREV_DATA_TAG = ""))
 
   out <- withr::local_tempdir()
@@ -227,7 +212,7 @@ test_that("a package given up on is asked again by the next analyzer build", {
 
   # A new build arrives. Same package, same failure, but nothing here has been
   # asked of this reader yet.
-  .dsa_analyzer(stub_dir, "0.5.0-test")
+  .stub_analyzer_bin(stub_dir, "0.5.0-test")
   retried <- suppressWarnings(run_update(io, out, shard_size = 10L))
   expect_equal(retried$n_fresh, 1L)
   expect_true(retried$changed)

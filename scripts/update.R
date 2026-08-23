@@ -668,8 +668,12 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   code_manifest <- build_manifest(
     con, series = "code", repo = PUBLISH_REPO, db_filename = DB_FILENAME,
     db_bytes = code_db_bytes,
+    # cran_metrics_failures is here for the guard rather than for the reader:
+    # it is the one count in this manifest that growing is the bad news, and
+    # the retention ceiling has nothing to compare against until it is
+    # published beside the rest.
     tables = c("cran_code_summary", "cran_api_history", "cran_functions",
-               "cran_call_edges", "cran_code_churn"),
+               "cran_call_edges", "cran_code_churn", "cran_metrics_failures"),
     fp_table = "cran_code_summary", fp_cols = c("package", "version"),
     pkg_table = "cran_code_summary", ver_table = "cran_code_summary",
     stat_table = "cran_code_summary", stat_cols = c("loc_r", "n_fns_r"),

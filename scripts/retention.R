@@ -32,6 +32,11 @@
 # allowance: max_loss = 0 means "ratio only". A flat allowance matters on a
 # small corpus, where a legitimate per-package delete-then-insert is a large
 # fraction of a small total.
+#
+# One field runs the other way. A check carrying max_gain instead is a CEILING:
+# rows it may gain over the previous release, not rows it may lose. Only
+# cran_metrics_failures has one, because it is the only count here that grows
+# when the pipeline is going wrong rather than when it is working.
 .RETENTION_CHECKS <- list(
   code = list(
     # No tolerance. The only paths that remove summary rows are force_full's
@@ -70,7 +75,25 @@
     # the denominator of bootstrap_complete, so a collapsed universe makes
     # "complete" true exactly when the database is empty. A single failed fetch
     # is a 26% or 74% drop; the largest measured is -1 (-0.003%).
-    list(path = "bootstrap.n_universe",      min_ratio = 0.90,  max_loss = 0)
+    list(path = "bootstrap.n_universe",      min_ratio = 0.90,  max_loss = 0),
+    # The ceiling, and the only one. A package enters this table when its
+    # clone or its analysis fails and leaves it the moment either succeeds, so
+    # a run that suddenly cannot analyse anything shows up here first and
+    # nowhere else: the row counts it did not write are not a fall, they are an
+    # absence of a rise, and no floor can see that.
+    #
+    # 100 is a quarter of a shard. A run that newly fails that many packages
+    # has something wrong with it rather than a bad day, and publishing it
+    # would make its baseline the one tomorrow is measured against.
+    #
+    # It is deliberately a per-release ceiling and not an absolute cap. This
+    # table only sheds a package when that package is analysed successfully
+    # again, and a package that has failed MAX_CLONE_FAILURES times is excluded
+    # from the queue, so its row can never leave on its own. An absolute cap on
+    # a count that cannot come down is a refusal that repeats every run
+    # forever, which is the state this whole file is written to avoid. The
+    # standing level is reported by retention_warnings() instead.
+    list(path = "tables.cran_metrics_failures", max_gain = 100)
   ),
   data = list(
     # The dataset database is downloaded by its own request and can be lost
@@ -178,6 +201,15 @@ retention_violations <- function(series, current, prior, prior_tag = "",
     was <- .ret_at(prior, chk$path)
     if (is.null(was)) next          # the prior manifest predates this field
     now <- .ret_at(current, chk$path) %||% 0
+    if (!is.null(chk$max_gain)) {
+      ceiling_v <- was + chk$max_gain
+      if (now > ceiling_v) {
+        out <- c(out, sprintf("%s %s rose to %s from %s (ceiling %s)",
+                              series, chk$path, .ret_fmt(now), .ret_fmt(was),
+                              .ret_fmt(ceiling_v)))
+      }
+      next
+    }
     floor_v <- min(was * chk$min_ratio, was - chk$max_loss)
     if (now < floor_v) {
       out <- c(out, sprintf("%s %s fell to %s from %s (floor %s)",
@@ -187,6 +219,27 @@ retention_violations <- function(series, current, prior, prior_tag = "",
   }
   out
 }
+
+# The share of the universe that may sit in cran_metrics_failures before the
+# run says so.
+#
+# The ceiling in .RETENTION_CHECKS compares one release to the next, so a table
+# that creeps up two packages at a time passes it every time, which is exactly
+# how this one reached 200 rows from 3 inside a month with nothing said. The
+# level itself is the other half of that finding, and it is a warning rather
+# than a gate because a package failing is not history being lost: its stored
+# rows are still there, and refusing to publish over it would throw away the
+# collection of every package that did work.
+#
+# 0.5% of 33,307 is 166. A package leaves this table the moment it is analysed
+# successfully, so anything standing at that level is not a bad afternoon, it
+# is a part of the catalog nobody is collecting any more.
+#
+# The share needs a floor under it as well, because a share on its own says
+# nothing about a small corpus: one failing package out of five is 20% and is
+# not a finding. Both have to be met.
+FAILURE_SHARE_WARN <- 0.005
+FAILURE_COUNT_WARN <- 25L
 
 #' Figures worth saying out loud without halting the run.
 #'
@@ -201,14 +254,29 @@ retention_violations <- function(series, current, prior, prior_tag = "",
 #' @return Character vector of warnings, possibly empty.
 retention_warnings <- function(series, current) {
   if (!identical(series, "code")) return(character(0L))
+  out <- character(0L)
+
+  fails    <- .ret_at(current, "tables.cran_metrics_failures")
+  universe <- .ret_at(current, "bootstrap.n_universe")
+  if (!is.null(fails) && !is.null(universe) && universe > 0 &&
+      fails >= FAILURE_COUNT_WARN && fails > universe * FAILURE_SHARE_WARN) {
+    out <- c(out, sprintf(paste0(
+      "cran_metrics_failures holds %s packages, %.2f%% of the %s in the ",
+      "universe: that many packages are failing to clone or to analyse and ",
+      "the ones past %d attempts have been dropped from the queue for good"),
+      .ret_fmt(fails), 100 * fails / universe, .ret_fmt(universe),
+      MAX_CLONE_FAILURES))
+  }
+
   n_ver <- .ret_at(current, "n_versions")
   summ  <- .ret_at(current, "tables.cran_code_summary")
   api   <- .ret_at(current, "tables.cran_api_history")
-  if (is.null(n_ver) || is.null(summ) || is.null(api)) return(character(0L))
-  if (api == summ && summ == n_ver) return(character(0L))
-  sprintf(paste0("cran_api_history holds %s rows and cran_code_summary %s ",
-                 "(n_versions %s): a version was written without its api row"),
-          .ret_fmt(api), .ret_fmt(summ), .ret_fmt(n_ver))
+  if (is.null(n_ver) || is.null(summ) || is.null(api)) return(out)
+  if (api == summ && summ == n_ver) return(out)
+  c(out, sprintf(
+    paste0("cran_api_history holds %s rows and cran_code_summary %s ",
+           "(n_versions %s): a version was written without its api row"),
+    .ret_fmt(api), .ret_fmt(summ), .ret_fmt(n_ver)))
 }
 
 #' What an operator should actually do when one of these guards refuses.

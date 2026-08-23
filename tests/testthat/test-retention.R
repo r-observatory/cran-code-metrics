@@ -647,3 +647,70 @@ test_that("the refusal survives R's error-printing limit", {
     expect_true(grepl("options(warning.length", src, fixed = TRUE))
   }
 })
+
+# ---------------------------------------------------------------------------
+# The one count where growth is the bad direction
+# ---------------------------------------------------------------------------
+
+test_that("a burst of new failures is refused", {
+  # Every other check in this file is a floor. cran_metrics_failures is the
+  # count that means the opposite: it grows when packages stop being
+  # analyzable, and it grew from 3 rows to 200 in a month without one guard
+  # noticing.
+  prev <- .code_manifest_0814()
+  prev$tables$cran_metrics_failures <- 3L
+  cur  <- prev
+  cur$tables$cran_metrics_failures <- 200L
+  v <- retention_violations("code", cur, prev)
+  expect_length(v, 1L)
+  expect_true(grepl("cran_metrics_failures", v, fixed = TRUE))
+  expect_true(grepl("rose to 200 from 3", v, fixed = TRUE))
+})
+
+test_that("failures accumulating a few at a time, and failures clearing, both pass", {
+  prev <- .code_manifest_0814()
+  prev$tables$cran_metrics_failures <- 180L
+  cur  <- prev
+
+  # A shard of 400 with a handful of bad clones in it.
+  cur$tables$cran_metrics_failures <- 187L
+  expect_identical(retention_violations("code", cur, prev), character(0L))
+
+  # And the direction the guard must never object to.
+  cur$tables$cran_metrics_failures <- 12L
+  expect_identical(retention_violations("code", cur, prev), character(0L))
+})
+
+test_that("a baseline that predates the failures count skips the ceiling", {
+  # Every release published before this check existed carries no such field,
+  # and reading its absence as zero would refuse the first run that saw one.
+  prev <- .code_manifest_0814()          # no cran_metrics_failures in tables
+  cur  <- prev
+  cur$tables$cran_metrics_failures <- 5000L
+  expect_identical(retention_violations("code", cur, prev), character(0L))
+})
+
+test_that("a standing pile of failures is said out loud without halting the run", {
+  # The burst ceiling above compares one release to the next, so a table that
+  # creeps up two packages at a time passes it every single time. The level
+  # itself is the other half of the finding.
+  cur <- .code_manifest_0814()
+  cur$tables$cran_metrics_failures <- 200L
+  expect_identical(retention_violations("code", cur, cur), character(0L))
+  w <- retention_warnings("code", cur)
+  expect_true(any(grepl("cran_metrics_failures", w, fixed = TRUE)))
+  expect_true(any(grepl("200", w, fixed = TRUE)))
+
+  # A handful is the ordinary state and says nothing.
+  cur$tables$cran_metrics_failures <- 3L
+  expect_identical(retention_warnings("code", cur), character(0L))
+})
+
+test_that("a handful of failures on a small corpus says nothing", {
+  # A share on its own would make one failing package out of five a 20%
+  # finding, so the test suite and any small run would warn on every shard.
+  cur <- .code_manifest_0814()
+  cur$bootstrap$n_universe <- 5L
+  cur$tables$cran_metrics_failures <- 1L
+  expect_identical(retention_warnings("code", cur), character(0L))
+})

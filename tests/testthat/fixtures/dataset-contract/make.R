@@ -71,7 +71,12 @@ sv(c(TRUE, TRUE, FALSE, NA), "flags")
 sv(factor(c("a", "b", "a", "c")), "just_a_factor")
 sv(factor(c("lo", "hi", "mid"), levels = c("lo", "mid", "hi"), ordered = TRUE), "ranked_factor")
 sv(as.Date("2020-01-01") + c(0, 1, 2, 40), "gappy_dates")
-sv(as.POSIXlt("2021-06-01 12:00", tz = "UTC") + c(0, 86400 * 400), "broken_down_time")
+# A broken-down time, kept broken down. Arithmetic on a POSIXlt returns a
+# POSIXct, so this has to be written without any, or the object saved here is
+# an instant like any other and the field count and year range never come back.
+# Two calendar years apart, so the range has two ends.
+sv(as.POSIXlt(c("2021-06-01 12:00:00", "2022-07-05 03:00:00"), tz = "UTC"),
+   "broken_down_time")
 
 lab <- 1:5
 attr(lab, "label") <- "a labelled vector"
@@ -87,6 +92,11 @@ if (requireNamespace("units", quietly = TRUE)) {
 sv(matrix(c(1, 2, 3, 4, 5, 60), nrow = 2,
           dimnames = list(c("r1", "r2"), c("c1", "c2", "c3"))), "named_matrix")
 sv(array(1:24, dim = c(2, 3, 4)), "cube")
+# The awkward numbers a third time, now in something grid shaped. A grid has no
+# columns to hang a summary on, so its values are summarised as one set of
+# figures for the object, and NaN and the two signed infinities are counted
+# separately there and nowhere else.
+sv(matrix(c(1, NaN, Inf, -Inf, 0, 2), nrow = 2), "awkward_matrix")
 if (requireNamespace("Matrix", quietly = TRUE)) {
   sv(Matrix::sparseMatrix(i = c(1, 2, 3), j = c(3, 1, 2), x = c(1, 2, 3), dims = c(4, 4)), "sparse_cols")
   sv(Matrix::triu(Matrix::Matrix(matrix(1:16, 4), sparse = FALSE)), "upper_triangle")
@@ -101,6 +111,17 @@ sv(ts(1:24, start = c(2000, 1), frequency = 12), "monthly_series")
 sv(ts(matrix(1:20, ncol = 2), start = c(2000, 1), frequency = 4), "quarterly_pair")
 if (requireNamespace("zoo", quietly = TRUE)) {
   sv(zoo::zoo(1:5, as.Date("2020-01-01") + c(0, 1, 2, 9, 10)), "irregular_zoo")
+  # An index that stands still: two observations claim the same instant, so the
+  # series has fewer moments than rows and any lookup by time is ambiguous.
+  sv(suppressWarnings(zoo::zoo(1:4, as.Date("2020-01-01") + c(0, 1, 1, 2))),
+     "repeated_index_zoo")
+  # An index that runs backwards. zoo sorts whatever order.by it is handed, so
+  # the only way to save an out-of-order series is to write the index on
+  # afterwards, which is also how one ends up in the wild: something rewrote
+  # the attribute and the ordering the class promises no longer holds.
+  backwards <- zoo::zoo(1:4, as.Date("2020-01-01") + 0:3)
+  attr(backwards, "index") <- rev(unclass(as.Date("2020-01-01") + 0:3))
+  sv(backwards, "backwards_zoo")
 }
 if (requireNamespace("xts", quietly = TRUE)) {
   sv(xts::xts(1:4, as.POSIXct("2020-01-01", tz = "UTC") + (0:3) * 3600), "hourly_xts")

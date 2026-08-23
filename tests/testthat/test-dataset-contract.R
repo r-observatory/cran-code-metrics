@@ -48,18 +48,18 @@
   "n_cols",
 
   # Reported per column, inside the columns JSON, and never for the object as a
-  # whole. The value is in the data; these columns are its empty top-level
-  # home, which only a vector-shaped dataset could ever fill.
-  "n_nan", "n_infinite_pos", "n_infinite_neg",
+  # whole. Both are properties of a geometry column, and a geometry column is
+  # something a table has rather than something a table is, so no dataset-level
+  # value exists to put here.
   "is_geometry", "n_empty",
 
-  # Not emitted anywhere, by any fixture, at any level. These are the dead
-  # columns: declared, shipped, and NULL for every package in the archive.
+  # Not emitted anywhere, at any level, by any shape. The one dead column:
+  # declared, shipped, and NULL for every package in the archive. A ts carries
+  # its observations per unit of time in a `frequency` attribute, which the
+  # reader emits under the name ts_frequency, so nothing ever fills this.
   # Removing a column is a separate exercise from noticing it, because the
   # pipelines only ever ALTER ADD and the published data has readers.
-  "frequency",             # ts objects report ts_frequency instead
-  "index_sorted", "index_has_duplicates",
-  "n_fields", "year_min", "year_max"
+  "frequency"
 )
 
 # Run the analyzer over the fixture package once per session and return the
@@ -125,6 +125,38 @@ test_that("the fixture package exercises every declared dataset family", {
   expect_true(file.exists(file.path(.contract_fixture_pkg(), "R", "sysdata.rda")))
 })
 
+# Fields that only one narrow shape reaches, with the shape that reaches it.
+# Each of these was once certified dead by .CONTRACT_NOT_EMITTED below, on the
+# strength of a fixture that never built the object that fills it, so the
+# exemption list was measuring the fixture rather than the analyzer.
+.CONTRACT_NARROW_SHAPES <- c(
+  # A broken-down time, and only a broken-down time. Arithmetic on a POSIXlt
+  # returns a POSIXct, so a fixture written as as.POSIXlt(...) + offset holds
+  # no POSIXlt at all and these three never arrive.
+  "n_fields", "year_min", "year_max",
+  # An index that repeats a value, and separately one that runs backwards.
+  # zoo sorts the index it is given, so a series built the ordinary way can
+  # never be the unsorted one.
+  "index_sorted", "index_has_duplicates",
+  # Awkward numbers in something grid shaped. A vector holding NaN and both
+  # infinities reports n_infinite and nothing finer, and a data frame reports
+  # these per column; only a matrix lifts them to the object as a whole.
+  "n_nan", "n_infinite_pos", "n_infinite_neg"
+)
+
+test_that("the fixture reaches the shapes only one object can reach", {
+  keys <- .contract_setup()
+  unreached <- sort(setdiff(.CONTRACT_NARROW_SHAPES, keys$top))
+  expect_identical(
+    unreached, character(0L),
+    info = paste0(
+      "the fixture package no longer builds the object that makes the ",
+      "analyzer emit these, so nothing below can tell a dead column from an ",
+      "unexercised one: ", paste(unreached, collapse = ", "),
+      ". Restore the shape in fixtures/dataset-contract/make.R rather than ",
+      "exempting the column."))
+})
+
 test_that("every dataset field the analyzer emits is declared by a column spec", {
   keys <- .contract_setup()
   undeclared <- sort(setdiff(keys$top,
@@ -155,18 +187,27 @@ test_that("every declared dataset column is one the analyzer emits", {
       "a reason."))
 })
 
-test_that("a column exempted as per-column-only really is emitted per column", {
+test_that("no dataset column is exempted on a claim the analyzer contradicts", {
   keys <- .contract_setup()
-  # The exemptions split into three claims, and the two that assert a value
-  # exists somewhere are checkable. n_cols is derived, so it is exempt from the
-  # check as well as from the spec.
-  per_column <- c("n_nan", "n_infinite_pos", "n_infinite_neg",
-                  "is_geometry", "n_empty")
+  # Every exemption says the same thing first: this column has no top-level key
+  # to fill it. The moment one arrives the reason written beside the name is
+  # wrong, whichever reason it was, so this is checked before the reasons are.
+  stale <- sort(intersect(.CONTRACT_NOT_EMITTED, keys$top))
+  expect_identical(
+    stale, character(0L),
+    info = paste0(
+      "these columns are exempted as unfillable and the analyzer emits them ",
+      "at the top level: ", paste(stale, collapse = ", "),
+      ". Take each off .CONTRACT_NOT_EMITTED."))
+
+  # Then the reasons. Of the three claims, the two that say a value exists
+  # somewhere are checkable; n_cols is derived by .datasets_frame, so it is
+  # exempt from the check as well as from the spec.
+  per_column <- c("is_geometry", "n_empty")
   expect_identical(sort(setdiff(per_column, keys$nested)), character(0L))
 
   # And the dead ones are genuinely dead: not at the top level, not per column,
-  # not anywhere in the stream. If one of these starts arriving, the exemption
-  # is stale and the column should come off the list.
+  # not anywhere in the stream.
   dead <- setdiff(.CONTRACT_NOT_EMITTED, c(per_column, "n_cols"))
   expect_identical(sort(intersect(dead, c(keys$top, keys$nested))), character(0L))
 })

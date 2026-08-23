@@ -47,6 +47,12 @@
   # that array.
   "n_cols",
 
+  # Written by .write_datasets_normalized, not read from a record: how much of
+  # a column profile it refused to store because the value was too large to
+  # load anywhere downstream. Zero on every row the analyzer describes
+  # honestly, which is why it reads as unfilled here and not as dead.
+  "columns_refused_bytes",
+
   # Reported per column, inside the columns JSON, and never for the object as a
   # whole. Both are properties of a geometry column, and a geometry column is
   # something a table has rather than something a table is, so no dataset-level

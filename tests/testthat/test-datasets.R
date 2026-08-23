@@ -539,3 +539,41 @@ test_that("what the analyzer describes reaches the tables that hold it", {
   expect_equal(ident$title, "Readings from an instrument")
   expect_false("title" %in% DBI::dbListFields(con, "cran_dataset_contents"))
 })
+
+test_that("a columns profile too large to serve is refused, and the row says so", {
+  # A single value over MySQL's max_allowed_packet cannot be loaded at all, and
+  # that ceiling is not raisable: a misparsed file has already produced a
+  # 306 MB profile here. The profile is what gets dropped, never the row.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  orig <- MAX_DATASET_COLUMNS_BYTES
+  MAX_DATASET_COLUMNS_BYTES <<- 64L
+  on.exit(MAX_DATASET_COLUMNS_BYTES <<- orig, add = TRUE)
+
+  big <- .mk_ds_row("p", "1.0", TRUE, "C1")
+  big$columns <- paste0('[{"name":"', strrep("x", 500L), '"}]')
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, big, "p"))
+
+  got <- DBI::dbGetQuery(con,
+    "SELECT class, nrow, columns, columns_refused_bytes FROM cran_dataset_contents")
+  expect_equal(nrow(got), 1L)
+  expect_true(is.na(got$columns))
+  expect_equal(got$columns_refused_bytes, nchar(big$columns, type = "bytes"))
+  # The rest of the profile is still true and still stored.
+  expect_equal(got$class, "data.frame")
+  expect_equal(got$nrow, 3L)
+})
+
+test_that("a columns profile within the bound is stored untouched", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  row <- .mk_ds_row("p", "1.0", TRUE, "C1")
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, row, "p"))
+
+  got <- DBI::dbGetQuery(con,
+    "SELECT columns, columns_refused_bytes FROM cran_dataset_contents")
+  expect_equal(got$columns, row$columns)
+  # Zero rather than NULL: nothing was refused is a measurement, and a column
+  # that is NULL for every healthy row reads to the coverage canary as dead.
+  expect_equal(got$columns_refused_bytes, 0L)
+})

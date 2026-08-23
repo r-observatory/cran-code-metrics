@@ -72,6 +72,27 @@ WORKER_TIMEOUT <- as.integer(Sys.getenv("WORKER_TIMEOUT", unset = "600"))
 # pages back.
 VACUUM_MIN_RECLAIM_BYTES <- 64 * 1024^2
 
+# The largest column profile a single dataset row may carry, in bytes.
+#
+# Nothing bounded this. The profile is a JSON array with one entry per column,
+# so its size follows the width of what was read, and a file read as something
+# it is not can be read as having millions of columns: three of them in the
+# published data measure 321 MB, 117 MB and 63 MB, from an analyzer that
+# mistook a file with only carriage returns for one very long line.
+#
+# A value that size is not merely large, it is unservable. The viewer's MySQL
+# refuses any single value over max_allowed_packet, whose 32 MiB ceiling is a
+# hard one that cannot be raised, and a write over it fails the load of the
+# whole table rather than of the one row. That has already cost this org three
+# days of cold loads.
+#
+# 4 MiB is an eighth of that ceiling, so a refused row still leaves the rest of
+# the profile room inside a packet, and it is far above what a real schema
+# costs: one column's entry runs to a few hundred bytes, so this is thousands
+# of columns before anything is refused. The bound is aimed at the misparse,
+# not at wide data.
+MAX_DATASET_COLUMNS_BYTES <- 4 * 1024^2
+
 # VACUUM builds the compacted database beside the original and then copies it
 # back over it under a rollback journal, so at its peak the file exists about
 # twice over on top of itself. Ask for that much free space and skip the

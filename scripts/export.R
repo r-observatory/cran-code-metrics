@@ -893,10 +893,14 @@ upsert_datasets <- function(data_con, datasets_df, pkgs) {
 #' @param stat_cols   Character vector of numeric columns to summarise.
 #' @param bootstrap   list(n_analyzed, n_universe, n_remaining, bootstrap_complete).
 #'   n_universe/n_remaining may be NULL.
+#' @param coverage    Optional frame from dataset_column_coverage(). When given,
+#'   the manifest carries how many declared columns hold nothing for anybody,
+#'   so the finding outlives the run that made it. NULL leaves the block out,
+#'   which is what the code series does: it has no dataset columns to measure.
 #' @return A named list matching the MANIFEST SCHEMA.
 build_manifest <- function(con, series, repo, db_filename, db_bytes,
                            tables, fp_table, fp_cols, pkg_table, ver_table,
-                           stat_table, stat_cols, bootstrap) {
+                           stat_table, stat_cols, bootstrap, coverage = NULL) {
   present <- DBI::dbListTables(con)
   count_tbl <- function(t) {
     if (!t %in% present) return(0L)
@@ -959,7 +963,7 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
     }
   }
 
-  list(
+  out <- list(
     schema_version = 1L,
     series         = series,
     repo           = repo,
@@ -978,6 +982,20 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
       bootstrap_complete = isTRUE(bootstrap$bootstrap_complete)
     )
   )
+
+  # The names are capped and the count is not. A reader chasing this wants the
+  # number first, and enough names to start looking; the full list is a query
+  # against the database the manifest describes.
+  if (!is.null(coverage)) {
+    all_null <- coverage[coverage$n_rows > 0L & coverage$measured == 0L, , drop = FALSE]
+    named <- sort(paste(all_null$table, all_null$column, sep = "."))
+    out$coverage <- list(
+      n_columns  = nrow(coverage),
+      n_all_null = nrow(all_null),
+      all_null   = head(named, 20L)
+    )
+  }
+  out
 }
 
 #' Union `pkgs` into a sorted, deduped newline file at `path` (accumulates the
@@ -2208,4 +2226,78 @@ metric_coverage_alerts <- function(cov, prior = NULL, drop_tol = 0.5) {
     }
   }
   out
+}
+
+# ---- dataset column coverage ----------------------------------------------
+#
+# The same question metric_coverage asks of cran_code_summary, asked of the
+# three dataset tables. It went unasked for a year and the answer, when it was
+# finally taken, was that a hundred of the content columns held nothing at all
+# for any package in the archive: the reader had never emitted the field, or a
+# generation bump had not been made and every widened row was being discarded
+# on the way in. Either way the column shipped as public data and read as an
+# honest NA, which is exactly what an empty column is not.
+#
+# Asked in SQL rather than by pulling the frame into R, because the contents
+# table is the largest object the pipeline publishes and a shard has to be able
+# to afford this every run. It costs one scan per table, which is the order of
+# work the manifest's own fingerprint and statistics already spend on the same
+# tables a few lines later.
+
+#' Per-column coverage over the dataset tables.
+#'
+#' For every declared dataset column the table actually has: how many rows the
+#' table holds, and how many of them carry a value at all. A column measured on
+#' nobody is either a field the analyzer never emits or one whose writes are
+#' being discarded, and the count alone cannot tell those apart. That is the
+#' point: it says look here.
+#'
+#' @param con Connection to the dataset database.
+#' @return data.frame(table, column, n_rows, measured); zero rows when none of
+#'   the dataset tables exist yet.
+dataset_column_coverage <- function(con) {
+  empty <- data.frame(table = character(), column = character(),
+                      n_rows = integer(), measured = integer(),
+                      stringsAsFactors = FALSE)
+  specs <- list(
+    cran_dataset_contents = .DATASET_CONTENT_COLS,
+    cran_dataset_versions = .DATASET_VERSION_COLS,
+    cran_datasets         = .DATASET_IDENTITY_COLS)
+  present <- DBI::dbListTables(con)
+  out <- list()
+  for (tbl in names(specs)) {
+    if (!tbl %in% present) next
+    cols <- intersect(names(specs[[tbl]]), DBI::dbListFields(con, tbl))
+    if (!length(cols)) next
+    # One scan per table: SQLite's COUNT(col) skips NULLs, so the whole
+    # coverage of a 148-column table is a single aggregate query.
+    sel <- paste(c('COUNT(*) AS "n_rows"',
+                   sprintf('COUNT("%s") AS "c%d"', cols, seq_along(cols))),
+                 collapse = ", ")
+    got <- DBI::dbGetQuery(con, sprintf('SELECT %s FROM "%s"', sel, tbl))
+    out[[tbl]] <- data.frame(
+      table = tbl, column = cols,
+      n_rows = as.integer(got$n_rows),
+      measured = as.integer(unlist(got[sprintf("c%d", seq_along(cols))],
+                                   use.names = FALSE)),
+      stringsAsFactors = FALSE)
+  }
+  if (!length(out)) return(empty)
+  res <- do.call(rbind, out)
+  rownames(res) <- NULL
+  res
+}
+
+#' Dataset columns worth a second look, given this run's coverage.
+#'
+#' A column with no value in any row of a table that holds rows. An empty table
+#' says nothing (a first shard has not written anything yet), so it raises
+#' nothing: the alert is about a column the corpus had every chance to fill.
+dataset_coverage_alerts <- function(cov) {
+  if (is.null(cov) || nrow(cov) == 0L) return(character(0L))
+  dead <- cov[cov$n_rows > 0L & cov$measured == 0L, , drop = FALSE]
+  if (nrow(dead) == 0L) return(character(0L))
+  sprintf("%s.%s: no value in any of %d %s",
+          dead$table, dead$column, dead$n_rows,
+          ifelse(dead$n_rows == 1L, "row", "rows"))
 }

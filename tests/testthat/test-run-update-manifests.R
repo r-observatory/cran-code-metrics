@@ -37,3 +37,36 @@ test_that("run_update writes both manifests and the changed-packages file", {
   expect_identical(dm$n_packages, 1L)
   expect_true("pkgA" %in% read_changed_packages(file.path(out, "changed-packages.txt")))
 })
+
+test_that("the run says which dataset columns hold nothing, and the manifest keeps the count", {
+  # The dataset row below fills six of the declared columns and leaves the rest
+  # empty, which is the shape the real corpus had for a year without anybody
+  # being told. The run has to say so, and the manifest has to carry the number
+  # past the log that scrolls away.
+  old <- analyze_package
+  assign("analyze_package", function(dest, pkg) list(
+    summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
+      latest_release_date = "2026-01-01", datasets_scanned = 1L, detail_scanned = 1L,
+      stringsAsFactors = FALSE),
+    churn = NULL, api = NULL, functions = NULL, edges = NULL,
+    datasets = data.frame(package = pkg, name = "d1", version = "1.0",
+      file = "data/d1.rda", internal = 0L, format = "rda", compression = "gzip",
+      confidence = "high", class = "data.frame", kind = "table", nrow = 5L,
+      ncol = 1L, n_missing_total = 0L, content_fp = "cf", schema_fp = "sf",
+      fp_algo_version = 3L, columns = '["a"]', row_sketch = NA_character_,
+      is_current = 1L, stringsAsFactors = FALSE)),
+    envir = environment(run_update))
+  on.exit(assign("analyze_package", old, envir = environment(run_update)), add = TRUE)
+
+  out <- withr::local_tempdir()
+  expect_output(run_update(.fake_io2(), out, shard_size = 10L), "dataset coverage")
+
+  dm <- jsonlite::fromJSON(file.path(out, "data-manifest.json"))
+  expect_gt(dm$coverage$n_all_null, 0L)
+  expect_gt(dm$coverage$n_columns, dm$coverage$n_all_null)
+  expect_true(any(grepl("^cran_dataset_contents[.]", dm$coverage$all_null)))
+
+  # The code manifest measures nothing of the sort and must not claim to.
+  cm <- jsonlite::fromJSON(file.path(out, "code-manifest.json"))
+  expect_null(cm$coverage)
+})

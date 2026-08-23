@@ -303,15 +303,31 @@ test_that("preflight_prior_dbs reports a baseline manifest whose database never 
                                        stringsAsFactors = FALSE),
   clone = function(pkg, dest) { dir.create(dest, showWarnings = FALSE); TRUE })
 
-.ret_stub_analyze <- function(env) {
+#' Stand in for analyze_package with one package the analyzer read.
+#'
+#' Installs a stub binary first, because the row below says the analyzer read
+#' this package and a machine with no analyzer cannot be the one that did. The
+#' stub is never asked to read anything: analyze_package is replaced. It is
+#' asked for its build, which is what the row names and what the re-scan queue
+#' compares that row against, so these tests settle for the reason production
+#' settles rather than because a run with no binary can invalidate nothing.
+#'
+#' @param frame Where the stub binary and the environment variable naming it
+#'   live: the caller's test, so both are cleaned up with it.
+.ret_stub_analyze <- function(env, frame = parent.frame()) {
+  withr::local_envvar(
+    RPKG_ANALYZER_BIN = .stub_analyzer_bin(
+      withr::local_tempdir(.local_envir = frame), "0.4.0-test"),
+    .local_envir = frame)
   old <- get("analyze_package", envir = env)
   assign("analyze_package", function(dest, pkg) list(
     # A package the analyzer read. The scan marker, the build that earned it
     # and the version named as one the binary produced arrive together,
     # because that is the only combination analyze_package can return: the
     # reader that sets the marker is the producer that names the build. The
-    # build is whatever this machine's analyzer answers, so the row is one the
-    # re-scan queue reads as current rather than as collected by somebody else.
+    # build is whatever this machine's analyzer answers, which the line above
+    # makes the stub, so the row is one the re-scan queue reads as current
+    # rather than as collected by somebody else.
     summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
       latest_release_date = "2026-01-01", datasets_scanned = TRUE, detail_scanned = TRUE,
       analyzer_version = rpkg_analyzer_version(), stringsAsFactors = FALSE),
@@ -324,6 +340,26 @@ test_that("preflight_prior_dbs reports a baseline manifest whose database never 
     envir = env)
   old
 }
+
+test_that("the stand-in shard is a shard the pipeline could have collected", {
+  # The converged-no-op guard further down settles because the stored row names
+  # the build that is running, so the re-scan queue can show it current and
+  # leaves it alone. On a machine with no analyzer the stub wrote a scanned row
+  # naming nobody, and that settles for the opposite reason: nothing can be
+  # shown stale when nothing can be named. analyze_package cannot produce that
+  # pair there, because the reader that sets the marker is the binary whose
+  # build the run then reads, so the guard was holding against a shape it never
+  # has to hold against.
+  withr::local_envvar(RPKG_ANALYZER_BIN = "")
+  env <- environment(run_update)
+  old <- .ret_stub_analyze(env)
+  on.exit(assign("analyze_package", old, envir = env), add = TRUE)
+
+  row <- analyze_package("ignored", "pkgA")$summary
+  expect_true(isTRUE(row$datasets_scanned))
+  expect_false(is.na(rpkg_analyzer_version()))
+  expect_identical(row$analyzer_version, rpkg_analyzer_version())
+})
 
 test_that("run_update refuses to finish a shard that would drop history", {
   env <- environment(run_update)

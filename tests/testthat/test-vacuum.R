@@ -88,6 +88,16 @@ test_that("free_disk_bytes measures a real directory and refuses to guess at one
   expect_true(is.na(free_disk_bytes(file.path(tempdir(), "no-such-directory-here"))))
 })
 
+test_that("the space a rewrite needs is measured on both filesystems it uses", {
+  # The compacted copy goes to the temp directory and the write-back goes
+  # beside the database, so both are measured.
+  both <- .vacuum_free_bytes(file.path(tempdir(), "db.db"))
+  expect_true(is.finite(both) && both > 0)
+  # A filesystem that cannot be measured does not veto one that can.
+  expect_equal(.vacuum_free_bytes("/no/such/directory/at/all/db.db"),
+               free_disk_bytes(tempdir()), tolerance = 0.01)
+})
+
 # ---------------------------------------------------------------------------
 # The baseline the retention guard compares against has to be restated in the
 # same units, or the reclaim reads as a loss.

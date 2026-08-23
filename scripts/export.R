@@ -539,14 +539,28 @@ free_disk_bytes <- function(path) {
   nums[3L] * 1024
 }
 
+# Free space that a VACUUM of `path` actually depends on.
+#
+# SQLite builds the compacted copy in the temp directory, which is not
+# necessarily the filesystem the database lives on, and then writes it back
+# beside the original under a rollback journal. Both have to have room, so the
+# smaller of the two is the one that decides. NA when neither could be
+# measured; a filesystem that did answer is used on its own.
+.vacuum_free_bytes <- function(path) {
+  measured <- c(free_disk_bytes(dirname(path)), free_disk_bytes(tempdir()))
+  measured <- measured[!is.na(measured)]
+  if (length(measured) == 0L) return(NA_real_)
+  min(measured)
+}
+
 #' Return the pages a delete freed to the filesystem.
 #'
 #' .gc_dataset_contents() and upsert_shard()'s per-package delete remove rows,
 #' and SQLite puts every page they release on the database's own free list
 #' rather than shrinking the file, so the published database only ever records
 #' the largest it has ever been. VACUUM is what actually hands the space back,
-#' and until this ran the only VACUUM in the tree was in export_metrics(),
-#' which the pipeline never calls.
+#' and the only other one in the tree is in export_metrics(), which the
+#' pipeline never calls.
 #'
 #' Skipping is a normal outcome and never an error. A free list too small to be
 #' worth a rewrite is the free list working, and a disk that cannot hold the
@@ -558,14 +572,14 @@ free_disk_bytes <- function(path) {
 #' @param con        Open DBI connection to the database at `path`.
 #' @param path       The database file, needed to measure the file itself.
 #' @param min_reclaim Smallest free-list size worth rewriting the file for.
-#' @param free_bytes Free space on the filesystem holding `path`. NA means it
-#'   could not be measured, in which case the reclaim goes ahead: VACUUM is
+#' @param free_bytes Free space the rewrite has to fit in. NA means it could
+#'   not be measured, in which case the reclaim goes ahead: VACUUM is
 #'   atomic, so a disk that turns out to be too small costs the reclaim and
 #'   leaves the database exactly as it was.
 #' @return list(ran, before, after, reclaimed, reason). `reclaimed` is 0
 #'   whenever `ran` is FALSE, so a caller can credit it unconditionally.
 vacuum_db <- function(con, path, min_reclaim = VACUUM_MIN_RECLAIM_BYTES,
-                      free_bytes = free_disk_bytes(dirname(path))) {
+                      free_bytes = .vacuum_free_bytes(path)) {
   before <- as.numeric(file.info(path)$size %||% 0)
   skipped <- function(reason) {
     list(ran = FALSE, before = before, after = before, reclaimed = 0,
@@ -582,7 +596,7 @@ vacuum_db <- function(con, path, min_reclaim = VACUUM_MIN_RECLAIM_BYTES,
   }
   if (free_pages < min_reclaim) {
     return(skipped(sprintf(
-      "its free list holds %s, below the %s worth rewriting the file for",
+      "its free list holds %s, and %s is the least worth rewriting the file for",
       format_bytes(free_pages), format_bytes(min_reclaim))))
   }
 

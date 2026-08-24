@@ -707,10 +707,10 @@ metrics_fingerprint <- function(summary_df) {
     lo <- plan$move_rowid[[ends[[b]] - runs$lengths[[b]] + 1L]]
     hi <- plan$move_rowid[[ends[[b]]]]
     DBI::dbExecute(con, sprintf(
-      'INSERT INTO "%s" (%s) SELECT %s FROM "%s" WHERE rowid BETWEEN %.0f AND %.0f',
-      to, into, taken, from, lo, hi))
+      'INSERT INTO "%s" (%s) SELECT %s FROM "%s" WHERE rowid BETWEEN ? AND ?',
+      to, into, taken, from), params = list(lo, hi))
     DBI::dbExecute(con, sprintf(
-      'DELETE FROM "%s" WHERE rowid BETWEEN %.0f AND %.0f', from, lo, hi))
+      'DELETE FROM "%s" WHERE rowid BETWEEN ? AND ?', from), params = list(lo, hi))
   }
   invisible(length(ends))
 }

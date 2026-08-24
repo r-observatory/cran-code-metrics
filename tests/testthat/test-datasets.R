@@ -703,22 +703,35 @@ test_that("a database that kept the depth on the version link is given it on the
   DBI::dbExecute(con, "INSERT INTO cran_dataset_versions
       (package, name, version, content_id, format, is_current, notes, column_detail)
       VALUES ('p', 'kept', '1.0', 7, 'rda', 1, 'from before', 'reduced')")
+  DBI::dbExecute(con, "INSERT INTO cran_dataset_versions
+      (package, name, version, content_id, format, is_current, column_detail)
+      VALUES ('q', 'kept', '1.0', 7, 'rda', 1, 'reduced')")
   DBI::dbExecute(con, "CREATE TABLE cran_dataset_contents (
       content_id INTEGER PRIMARY KEY,
       content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
       class TEXT, kind TEXT, nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
       UNIQUE (content_fp, schema_fp, fp_algo_version))")
+  DBI::dbExecute(con, "INSERT INTO cran_dataset_contents
+      (content_id, content_fp, schema_fp, fp_algo_version, nrow, ncol)
+      VALUES (7, 'C1', 'S1', 3, 3, 600)")
   DBI::dbDisconnect(con)
 
   con <- open_or_init_data_db(path)
   on.exit(DBI::dbDisconnect(con), add = TRUE)
   expect_false("column_detail" %in% DBI::dbListFields(con, "cran_dataset_versions"))
   expect_true("column_detail" %in% DBI::dbListFields(con, "cran_dataset_contents"))
-  # And the row it was carrying is otherwise untouched.
-  kept <- DBI::dbGetQuery(con, "SELECT * FROM cran_dataset_versions")
-  expect_equal(kept$name, "kept")
-  expect_equal(kept$content_id, 7L)
-  expect_equal(kept$notes, "from before")
+  # The depth the links were carrying comes with them. A profile is written
+  # with INSERT OR IGNORE against its generation key, so a re-scan of data
+  # whose bytes have not moved would not put it there, and the column would
+  # read NULL on every row that was already published.
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT column_detail FROM cran_dataset_contents")$column_detail, "reduced")
+  # And the rows it was carrying are otherwise untouched.
+  kept <- DBI::dbGetQuery(con,
+    "SELECT * FROM cran_dataset_versions ORDER BY package")
+  expect_equal(kept$package, c("p", "q"))
+  expect_equal(kept$content_id, c(7L, 7L))
+  expect_equal(kept$notes, c("from before", NA_character_))
 })
 
 test_that("a dataset the reader could not fingerprint keeps its place in the catalog", {

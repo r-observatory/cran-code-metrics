@@ -451,6 +451,43 @@ metrics_fingerprint <- function(summary_df) {
     "element_names", "inner_names")
 )
 
+#' Bring the reading depth across to the profiles that already exist.
+#'
+#' A profile is written with INSERT OR IGNORE against its generation key, so a
+#' re-scan of data whose bytes have not moved does not reach the table and the
+#' depth would read NULL on every row that was already published. The version
+#' links about to lose the column are holding the answer, and it is the same
+#' answer on every link pointing at one profile, because which depth a record
+#' is read at follows from the data. So any one of them will do.
+#'
+#' Only this direction. The fields going the other way are the ones the
+#' profile's key does not cover, and the value on the profile is whichever
+#' dataset the shard reached first, so carrying it onto the links would copy
+#' one package's answer onto every package that shares the bytes. Those come
+#' back from the reader on the next scan instead, which a new analyzer build
+#' already asks for on every package in the archive.
+.carry_reading_depth_to_profiles <- function(con) {
+  tables <- DBI::dbListTables(con)
+  if (!all(c("cran_dataset_contents", "cran_dataset_versions") %in% tables)) {
+    return(invisible(NULL))
+  }
+  if (!"column_detail" %in% DBI::dbListFields(con, "cran_dataset_contents")) {
+    return(invisible(NULL))
+  }
+  if (!"column_detail" %in% DBI::dbListFields(con, "cran_dataset_versions")) {
+    return(invisible(NULL))
+  }
+  DBI::dbExecute(con, "
+    UPDATE cran_dataset_contents
+       SET column_detail = (
+             SELECT v.column_detail FROM cran_dataset_versions v
+              WHERE v.content_id = cran_dataset_contents.content_id
+                AND v.column_detail IS NOT NULL
+              LIMIT 1)
+     WHERE column_detail IS NULL")
+  invisible(NULL)
+}
+
 #' Drop the copy a moved dataset column left behind on the table it came from.
 #'
 #' A no-op on a database that never had it, and a no-op for good once it has
@@ -573,7 +610,9 @@ metrics_fingerprint <- function(summary_df) {
   .ensure_dataset_columns(con)
   # After the widening, so a column that has changed table is added to its new
   # home before the copy on the old one goes: the two halves of one move, in
-  # the order that never leaves the field homeless.
+  # the order that never leaves the field homeless. The value it was holding
+  # travels in between, for the one field that can be carried.
+  .carry_reading_depth_to_profiles(con)
   .retire_moved_dataset_columns(con)
   DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_cran_dsv_content ON cran_dataset_versions(content_id)")
   DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_cran_dsc_schema ON cran_dataset_contents(schema_fp)")

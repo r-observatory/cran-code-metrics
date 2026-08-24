@@ -566,6 +566,25 @@ test_that("the key covers every field the profile stores", {
   expect_equal(.dataset_profile_fp(same), .dataset_profile_fp(base))
 })
 
+test_that("the key reads the same on a run that has nothing to do with this one", {
+  # Written down rather than recomputed. Every shard runs in its own process on
+  # its own runner, and a profile written by one has to be found by the next, so
+  # the digest cannot be allowed to drift with an R version, a locale or a
+  # rewrite of the encoding. It also cannot drift with the column spec: adding a
+  # field to .DATASET_CONTENT_COLS moves every key in the store and orphans
+  # every profile in the published database, which is a decision and not a side
+  # effect. If this fails, that is what happened. Say so out loud and take the
+  # rebuild deliberately.
+  expect_identical(
+    .dataset_profile_fp(.mk_ds_row("p", "1.0", TRUE, "C1")),
+    "ba8be2e657ac16eafdb03bcbab07a8ffecc87b0ce29bb05bedc321e974982c01")
+  # And it does not depend on the record's neighbours in the frame.
+  pair <- rbind(.mk_ds_row("p", "1.0", TRUE, "C1"),
+                .mk_ds_row("q", "1.0", TRUE, "C2"))
+  expect_identical(.dataset_profile_fp(pair)[[1L]],
+                   .dataset_profile_fp(.mk_ds_row("p", "1.0", TRUE, "C1")))
+})
+
 test_that("a field one shard never mentions does not change the key", {
   # A shard is one analyzer run per package, and the frame it builds holds only
   # the fields that package's records mentioned. If the digest were taken over

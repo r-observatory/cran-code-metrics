@@ -608,14 +608,20 @@ metrics_fingerprint <- function(summary_df) {
   # applies to a database being built from nothing, and every incremental run
   # against a downloaded one silently drops them.
   .ensure_dataset_columns(con)
+  # Before the carry below, which asks the version links what depth they hold
+  # for a profile and is a scan of the whole table per profile without this.
+  # Measured on 110,000 profiles: four and a half minutes with the index put
+  # back afterwards, three seconds with it put back here. The rebuild in
+  # .relax_dataset_version_content_id takes the table's indexes down with it,
+  # so this is where they come back either way.
+  DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_cran_dsv_content ON cran_dataset_versions(content_id)")
+  DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_cran_dsc_schema ON cran_dataset_contents(schema_fp)")
   # After the widening, so a column that has changed table is added to its new
   # home before the copy on the old one goes: the two halves of one move, in
   # the order that never leaves the field homeless. The value it was holding
   # travels in between, for the one field that can be carried.
   .carry_reading_depth_to_profiles(con)
   .retire_moved_dataset_columns(con)
-  DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_cran_dsv_content ON cran_dataset_versions(content_id)")
-  DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_cran_dsc_schema ON cran_dataset_contents(schema_fp)")
   invisible(NULL)
 }
 

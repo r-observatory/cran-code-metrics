@@ -46,14 +46,12 @@ test_that("dataset_column_coverage counts, per declared column, the rows that ca
   expect_identical(names(cov), c("table", "column", "n_rows", "measured"))
 
   pick <- function(tbl, col) cov[cov$table == tbl & cov$column == col, ]
-  # nrow is written for this row, mean is written for this row, and the ~140
-  # other content columns are not. class rides the version link, because the
-  # digests the content row is keyed by do not cover the class chain.
-  expect_equal(pick("cran_dataset_contents", "nrow")$measured, 1L)
+  # class is written for this row, mean is written for this row, and the ~140
+  # other content columns are not.
+  expect_equal(pick("cran_dataset_contents", "class")$measured, 1L)
   expect_equal(pick("cran_dataset_contents", "mean")$measured, 1L)
   expect_equal(pick("cran_dataset_contents", "density")$measured, 0L)
-  expect_equal(pick("cran_dataset_contents", "nrow")$n_rows, 1L)
-  expect_equal(pick("cran_dataset_versions", "class")$measured, 1L)
+  expect_equal(pick("cran_dataset_contents", "class")$n_rows, 1L)
 
   # All three dataset tables are covered, not just the wide one.
   expect_setequal(unique(cov$table),

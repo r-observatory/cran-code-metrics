@@ -198,7 +198,7 @@ test_that(".gc_dataset_contents reclaims content orphaned by a data change", {
   row
 }
 
-test_that("fields a newer analyzer describes reach the tables that hold them", {
+test_that("fields a newer analyzer describes reach the contents table", {
   con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
   on.exit(DBI::dbDisconnect(con))
   DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_wide_row(), "p"))
@@ -208,12 +208,11 @@ test_that("fields a newer analyzer describes reach the tables that hold them", {
   expect_equal(got$n_stored, 3L)
   expect_equal(got$is_spatial, 1L)         # logicals store as integers
   # How a Matrix declares itself, and which object system it belongs to, are
-  # read off the class chain and the slots rather than off the values, so the
-  # digests the content row is keyed by do not cover them.
-  ver <- DBI::dbGetQuery(con, "SELECT * FROM cran_dataset_versions")
-  expect_equal(ver$matrix_shape, "symmetric")
-  expect_equal(ver$matrix_uplo, "L")
-  expect_equal(ver$object_system, "S4")
+  # read off the class chain and the slots rather than off the values. They are
+  # here all the same, because the key the row is stored under covers them.
+  expect_equal(got$matrix_shape, "symmetric")
+  expect_equal(got$matrix_uplo, "L")
+  expect_equal(got$object_system, "S4")
 })
 
 test_that("where a dataset was found is identity, not content", {
@@ -320,6 +319,7 @@ test_that("a published profile does not suppress the re-scan that widens it", {
   DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_published_row(), "p"))
   published <- DBI::dbGetQuery(con, "SELECT * FROM cran_dataset_contents")
   expect_equal(nrow(published), 1L)
+  expect_true(is.na(published$matrix_diag[[1]]))
   expect_true(is.na(published$n_nan[[1]]))
   expect_true(is.na(published$row_mean_mean[[1]]))
 
@@ -336,14 +336,9 @@ test_that("a published profile does not suppress the re-scan that widens it", {
   expect_equal(got$col_mean_mean[[1]], 2.5)
   expect_equal(got$n_nan[[1]], 4L)
   expect_equal(got$n_infinite_pos[[1]], 7L)
-  # The fields the newer reader lifts off attributes ride the version link,
-  # which is rewritten whole for the package every run, so they arrive whether
-  # or not the profile behind them is new.
-  ver <- DBI::dbGetQuery(con,
-    "SELECT matrix_diag, frequency, is_rowwise FROM cran_dataset_versions")
-  expect_equal(ver$matrix_diag[[1]], "unit")
-  expect_equal(ver$frequency[[1]], 12)
-  expect_equal(ver$is_rowwise[[1]], 1L)          # logicals store as integers
+  expect_equal(got$matrix_diag[[1]], "unit")
+  expect_equal(got$frequency[[1]], 12)
+  expect_equal(got$is_rowwise[[1]], 1L)          # logicals store as integers
 
   # A profile nobody can read is not a fix: the version link has to move onto the
   # new row, or readers keep seeing the narrow one.
@@ -643,22 +638,20 @@ test_that("a database keyed on the fingerprints is put onto the digest", {
     got$profile_fp)
 })
 
-# --- what the fingerprint does not cover -------------------------------------
-# The content row is addressed by (content_fp, schema_fp, fp_algo_version), and
-# the analyzer takes both digests over the column list alone: content_fp over
-# each column's base type and its cell bytes, schema_fp over each column's name
-# and base type. Nothing else in the object reaches either of them.
+# --- what the reader records beside the values -------------------------------
+# content_fp is taken over the column values alone: a factor's labels stand in
+# for its codes, and an attribute written beside the values reaches it not at
+# all. Each name below was demonstrated to be in that position, by building two
+# objects over the same values under different attributes, running them through
+# the analyzer, and watching them come back with one pair of fingerprints and
+# two answers.
 #
-# So a field the reader lifts off an attribute rather than off the values is
-# free to differ between two records that share a content row, and only one of
-# them can be stored there. The writer keeps the first, which is decided by a
-# sort on (package, name, version, internal), so the answer a reader gets is
-# whichever dataset the shard happened to reach first.
-#
-# Each name below was demonstrated to collide: two objects built to hold the
-# same values under different attributes, run through the analyzer, coming back
-# with one pair of digests and two answers.
-.MOVED_OFF_THE_CONTENT_ROW <- c(
+# All of them are on the profile, where the reader's answer about a dataset
+# belongs and where the viewer reads it. What makes that safe is the key: the
+# digest a profile row is stored under covers every one of them, so two records
+# that disagree about any of them are two rows and neither is handed the
+# other's answer.
+.RECORDED_BESIDE_THE_VALUES <- c(
   # The class chain, and everything read from it. A data.frame and a tibble of
   # the same columns are one fingerprint.
   "class", "kind", "frame_class", "object_system", "s4_package",
@@ -676,8 +669,8 @@ test_that("a database keyed on the fingerprints is put onto the digest", {
   "index_delta", "index_regular", "index_n_gaps", "index_max_gap",
   "index_sorted", "index_has_duplicates", "index_tz",
   # The projection the coordinates are declared in. The coordinates themselves
-  # are hashed, so the extent and the geometry counts stay; which datum they
-  # are read against does not.
+  # are hashed, so the extent and the geometry counts follow the values; which
+  # datum they are read against does not.
   "crs_input", "crs_epsg", "crs_wkt",
   # A raster's bands and their metadata, read off slots.
   "n_layers", "resolution", "nodata_value", "in_memory",
@@ -697,20 +690,28 @@ test_that("a database keyed on the fingerprints is put onto the digest", {
   "element_names", "inner_names"
 )
 
-test_that("no dataset field the fingerprint leaves out sits on the content row", {
-  expect_equal(intersect(.MOVED_OFF_THE_CONTENT_ROW,
-                         names(.DATASET_CONTENT_COLS)),
+test_that("what the reader records about the data sits on the profile", {
+  expect_equal(setdiff(.RECORDED_BESIDE_THE_VALUES,
+                       names(.DATASET_CONTENT_COLS)),
                character(0L))
-  expect_equal(setdiff(.MOVED_OFF_THE_CONTENT_ROW,
-                       names(.DATASET_VERSION_COLS)),
+  expect_equal(intersect(.RECORDED_BESIDE_THE_VALUES,
+                         names(.DATASET_VERSION_COLS)),
                character(0L))
-  # The list above says what the audit found; .DATASET_COLS_THAT_MOVED says
-  # what a database opened from an earlier release has taken off the content
-  # row. A name in one and not the other is a field that either keeps a stale
-  # copy for ever or is deleted with nowhere to go.
-  expect_setequal(.MOVED_OFF_THE_CONTENT_ROW,
-                  .DATASET_COLS_THAT_MOVED$cran_dataset_contents)
-  # And nothing is scheduled for deletion that its own table still declares.
+  # And the key covers each of them, which is what makes keeping them there
+  # safe. Without this the profile is back to holding one answer for two
+  # records and handing a package a measurement of somebody else's data.
+  base <- .mk_ds_row("p", "1.0", TRUE, "C1")
+  for (f in .RECORDED_BESIDE_THE_VALUES) {
+    row <- base
+    row[[f]] <- "recorded"
+    expect_false(identical(.dataset_profile_fp(row), .dataset_profile_fp(base)),
+                 info = f)
+  }
+  # A database that was given the copy on the version link has it taken off
+  # again, and nothing is scheduled for deletion that its own table declares.
+  expect_equal(setdiff(.RECORDED_BESIDE_THE_VALUES,
+                       .DATASET_COLS_THAT_MOVED$cran_dataset_versions),
+               character(0L))
   for (tbl in names(.DATASET_COLS_THAT_MOVED)) {
     spec <- switch(tbl,
                    cran_dataset_contents = .DATASET_CONTENT_COLS,
@@ -721,10 +722,10 @@ test_that("no dataset field the fingerprint leaves out sits on the content row",
   }
 })
 
-test_that("two packages shipping one dataset keep their own answer for what sits beside it", {
-  # One content row, two version links, and every uncovered field its own on
-  # each link. Collapsed onto the content row these would be one answer, and
-  # the one a reader got would be decided by which package sorted first.
+test_that("two packages describing the same bytes differently take a profile each", {
+  # Same values, so one content_fp, and the reader read two different objects.
+  # One profile row between them would hold one answer, and the one a reader
+  # got would be decided by which package sorted first.
   con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
   on.exit(DBI::dbDisconnect(con))
   a <- .mk_ds_row("aaa", "1.0", TRUE, "C1")
@@ -746,12 +747,14 @@ test_that("two packages shipping one dataset keep their own answer for what sits
     con, .write_datasets_normalized(con, rbind(a, b), c("aaa", "zzz")))
 
   expect_equal(DBI::dbGetQuery(con,
-    "SELECT count(*) n FROM cran_dataset_contents")$n, 1L)
+    "SELECT count(*) n FROM cran_dataset_contents")$n, 2L)
   got <- DBI::dbGetQuery(con,
-    "SELECT package, class, frame_class, tz, index_tz, crs_epsg, is_ordered,
-            has_rownames, matrix_uplo, ts_start, dt_key, element_names,
-            inner_names, label
-       FROM cran_dataset_versions ORDER BY package")
+    "SELECT v.package, c.class, c.frame_class, c.tz, c.index_tz, c.crs_epsg,
+            c.is_ordered, c.has_rownames, c.matrix_uplo, c.ts_start, c.dt_key,
+            c.element_names, c.inner_names, c.label
+       FROM cran_dataset_versions v
+       JOIN cran_dataset_contents c ON c.content_id = v.content_id
+      ORDER BY v.package")
   expect_equal(got$package, c("aaa", "zzz"))
   expect_equal(got$class, c("data.frame", "tbl_df,tbl,data.frame"))
   expect_equal(got$frame_class, c("data.frame", "tibble"))
@@ -766,9 +769,16 @@ test_that("two packages shipping one dataset keep their own answer for what sits
   expect_equal(got$element_names, c('["one"]', '["alpha"]'))
   expect_equal(got$inner_names, c('["x"]', '["z"]'))
   expect_equal(got$label, c("first", "second"))
+  # Still one dataset shipped twice, which is the question content_fp answers.
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT count(DISTINCT content_fp) n FROM cran_dataset_contents")$n, 1L)
 })
 
-test_that("a database that kept the uncovered fields on the profile is given them on the link", {
+test_that("a database that put these fields on the link is given them back", {
+  # The intermediate shape: the profile stripped of everything its old key did
+  # not cover, and a copy of it on the version link. Both halves have to be
+  # undone, or the profile stays empty and the copy on the link stands for ever
+  # holding whatever it held the day it stopped being written.
   path <- withr::local_tempfile(fileext = ".db")
   con  <- DBI::dbConnect(RSQLite::SQLite(), path)
   DBI::dbExecute(con, "CREATE TABLE cran_dataset_versions (
@@ -776,31 +786,41 @@ test_that("a database that kept the uncovered fields on the profile is given the
       content_id INTEGER, format TEXT, compression TEXT, confidence TEXT,
       is_current INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (package, name, version))")
+  for (col in .RECORDED_BESIDE_THE_VALUES) {
+    DBI::dbExecute(con, sprintf(
+      'ALTER TABLE cran_dataset_versions ADD COLUMN "%s" TEXT', col))
+  }
   DBI::dbExecute(con, "CREATE TABLE cran_dataset_contents (
       content_id INTEGER PRIMARY KEY,
       content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
-      class TEXT, kind TEXT, nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
+      nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
       UNIQUE (content_fp, schema_fp, fp_algo_version))")
-  for (col in c("tz", "index_tz", "crs_epsg", "is_ordered", "has_rownames")) {
-    DBI::dbExecute(con, sprintf(
-      'ALTER TABLE cran_dataset_contents ADD COLUMN "%s" TEXT', col))
-  }
   DBI::dbExecute(con, "INSERT INTO cran_dataset_contents
-      (content_id, content_fp, schema_fp, fp_algo_version, class, nrow, ncol, tz)
-      VALUES (1, 'C1', 'S1', 2, 'data.frame', 3, 2, 'UTC')")
+      (content_id, content_fp, schema_fp, fp_algo_version, nrow, ncol)
+      VALUES (1, 'C1', 'S1', 2, 3, 2)")
+  DBI::dbExecute(con, "INSERT INTO cran_dataset_versions
+      (package, name, version, content_id, is_current, tz)
+      VALUES ('p', 'd', '1.0', 1, 1, 'UTC')")
   DBI::dbDisconnect(con)
 
   con <- open_or_init_data_db(path)
   on.exit(DBI::dbDisconnect(con), add = TRUE)
-  cts <- DBI::dbListFields(con, "cran_dataset_contents")
-  expect_equal(intersect(.MOVED_OFF_THE_CONTENT_ROW, cts), character(0L))
-  expect_equal(setdiff(.MOVED_OFF_THE_CONTENT_ROW,
-                       DBI::dbListFields(con, "cran_dataset_versions")),
+  expect_equal(setdiff(.RECORDED_BESIDE_THE_VALUES,
+                       DBI::dbListFields(con, "cran_dataset_contents")),
                character(0L))
-  # The profile itself survives, and so does everything the digests do cover.
-  kept <- DBI::dbGetQuery(con, "SELECT content_fp, nrow, ncol FROM cran_dataset_contents")
+  expect_equal(intersect(.RECORDED_BESIDE_THE_VALUES,
+                         DBI::dbListFields(con, "cran_dataset_versions")),
+               character(0L))
+  # The profile and its link survive whole, and the reader fills the fields in
+  # on the next scan: they cannot be carried across from the links, because a
+  # profile that several links point at is exactly the collapsed answer this
+  # is undoing and there is no way to tell whose answer it was.
+  kept <- DBI::dbGetQuery(con,
+    "SELECT content_fp, nrow, ncol FROM cran_dataset_contents")
   expect_equal(kept$content_fp, "C1")
   expect_equal(kept$nrow, 3L)
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT count(*) n FROM cran_dataset_versions")$n, 1L)
 })
 
 # --- how deeply a dataset's columns were read --------------------------------
@@ -1056,12 +1076,10 @@ test_that("what the analyzer describes reaches the tables that hold it", {
   expect_equal(got$inner_nrow_total, 2000L)
   expect_equal(got$n_nonzero, 6L)
   expect_equal(got$skewness, 1.5)
-  expect_true(all(c("levels", "n_outliers") %in% names(got)))
-
-  ver <- DBI::dbGetQuery(con, "SELECT * FROM cran_dataset_versions")
-  expect_equal(ver$nodata_value, -9999)
-  expect_true(all(c("dimnames", "dt_key", "element_names", "resolution",
-                    "index_delta", "ts_span", "frame_class") %in% names(ver)))
+  expect_equal(got$nodata_value, -9999)
+  expect_true(all(c("levels", "dimnames", "dt_key", "element_names", "resolution",
+                    "index_delta", "ts_span", "n_outliers", "frame_class")
+                  %in% names(got)))
 
   # A title belongs to the package's documentation, not to the bytes: two
   # packages carrying identical data may describe it differently.

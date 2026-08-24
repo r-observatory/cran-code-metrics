@@ -228,14 +228,21 @@ metrics_fingerprint <- function(summary_df) {
 # carry. A shard whose every density is missing would otherwise fix that column
 # as text for good, and the column would then read back as text forever.
 .DATASET_CONTENT_COLS <- c(
-  nrow = "INTEGER", ncol = "INTEGER",
+  class = "TEXT", kind = "TEXT", nrow = "INTEGER", ncol = "INTEGER",
   length = "INTEGER", n_cols = "INTEGER", n_unique = "INTEGER",
-  n_missing_total = "INTEGER", columns = "TEXT",
+  n_missing_total = "INTEGER", columns = "TEXT", has_rownames = "INTEGER",
   shape_fp = "TEXT",
-  dim = "TEXT", n_dim = "INTEGER",
+  dim = "TEXT", n_dim = "INTEGER", has_dimnames = "INTEGER",
   n_stored = "INTEGER", n_cells = "INTEGER", density = "REAL",
+  matrix_value_type = "TEXT", matrix_shape = "TEXT", matrix_storage = "TEXT",
+  matrix_uplo = "TEXT", matrix_diag = "TEXT",
+  ts_start = "REAL", ts_end = "REAL", ts_frequency = "REAL", frequency = "REAL",
+  index_start = "TEXT", index_end = "TEXT", index_n = "INTEGER", index_class = "TEXT",
   geom_type = "TEXT", is_geometry = "INTEGER", n_geometries = "INTEGER",
-  is_spatial = "INTEGER", bbox = "TEXT",
+  is_spatial = "INTEGER",
+  crs_input = "TEXT", crs_epsg = "INTEGER", crs_wkt = "TEXT", bbox = "TEXT",
+  n_layers = "INTEGER", object_system = "TEXT", s4_package = "TEXT",
+  label = "TEXT", comment = "TEXT", units = "TEXT", attrs_other = "TEXT",
 
   # What a column or a grid holds, on the same terms summary() reports it.
   type = "TEXT", mean = "REAL", median = "REAL", q1 = "REAL", q3 = "REAL",
@@ -252,27 +259,37 @@ metrics_fingerprint <- function(summary_df) {
   max_missing_run = "INTEGER",
   summary_over = "TEXT",
 
-  # A factor's labels, which the reader hashes in place of the codes, so two
-  # factors over the same labels are the same bytes and these are the same
-  # answer. Whether those labels are ranked is not: that is in the class chain,
-  # and it sits on the version link.
+  # Written down beside the values rather than computed from them.
   levels = "TEXT", n_levels = "INTEGER", level_counts = "TEXT",
-  is_factor = "INTEGER",
+  is_factor = "INTEGER", is_ordered = "INTEGER",
+
+  # Which kind of table, and how it is keyed and grouped.
+  frame_class = "TEXT", is_grouped = "INTEGER",
+  dt_key = "TEXT", dt_indices = "TEXT",
+  group_vars = "TEXT", n_groups = "INTEGER",
 
   # What a list holds. The inner row count is the one that matters: a nested
-  # table reports its group count as its rows. The names of the slots and of a
-  # nested frame's columns are not here: the schema digest is taken over a
-  # frame's columns and never descends into a list.
-  element_class = "TEXT", element_classes = "TEXT",
+  # table reports its group count as its rows.
+  element_names = "TEXT", element_class = "TEXT", element_classes = "TEXT",
   element_len_min = "INTEGER", element_len_max = "INTEGER",
   element_len_total = "INTEGER", max_depth = "INTEGER",
-  inner_nrow_total = "INTEGER", inner_ncol = "INTEGER",
+  inner_nrow_total = "INTEGER", inner_ncol = "INTEGER", inner_names = "TEXT",
   inner_schema_varies = "INTEGER",
 
-  # Where a geometry column's coordinates reach and what shape they draw. Read
-  # off the coordinates, which are hashed; the projection they are declared in
-  # is not, and sits on the version link.
+  # The labels along the margins of a grid, without which a table of counts
+  # cannot be read.
+  dimnames = "TEXT",
+
+  # How evenly a series is observed.
+  ts_span = "REAL", index_span = "REAL", index_tz = "TEXT",
+  index_delta = "REAL", index_regular = "INTEGER",
+  index_n_gaps = "INTEGER", index_max_gap = "REAL",
+  index_sorted = "INTEGER", index_has_duplicates = "INTEGER",
+
+  # Spatial and raster detail.
   geom_dimension = "TEXT", n_empty = "INTEGER",
+  resolution = "TEXT", nodata_value = "REAL", in_memory = "INTEGER",
+  layer_names = "TEXT", layer_min = "TEXT", layer_max = "TEXT",
 
   # Which kind of missing, and which end an infinity runs to. Both are
   # column-level too and ride in the columns JSON; these are for the objects
@@ -290,6 +307,8 @@ metrics_fingerprint <- function(summary_df) {
   # A list's elements profiled the way a frame's columns are, in the same
   # shape, so one renderer serves both.
   elements = "TEXT",
+  # dplyr's rowwise state, which was in the class chain and never recorded.
+  is_rowwise = "INTEGER",
 
   # Per element rather than reduced across the list. The aggregates cannot say
   # how big any one slot was, which is the question a list of folds raises.
@@ -310,6 +329,12 @@ metrics_fingerprint <- function(summary_df) {
   # they draw as nothing, so a list of ten with four of them empty is not the
   # list its length says it is.
   n_empty_slots = "INTEGER",
+  # The time zone an instant is stored in. It belongs to the object rather than
+  # to the file: the same moment written in two zones reads as two different
+  # local times. index_tz above it is the zone of a series' index, which is a
+  # different field on a different kind of object, and declaring one was not
+  # declaring the other.
+  tz = "TEXT",
 
   # How deeply this profile's columns were read: full, reduced, none or
   # structural. It is the legend for the rest of the row. At `none` there is no
@@ -340,87 +365,20 @@ metrics_fingerprint <- function(summary_df) {
 # format has versions, and version 3 cannot be read by R before 3.5.0, so this
 # is the difference between a dataset a reader can open and one they cannot.
 #
-# And everything the content row's key does not cover. That key is
-# (content_fp, schema_fp, fp_algo_version), and both digests are taken over the
-# column list alone: content_fp over each column's base type and its cell
-# bytes, schema_fp over each column's name and base type. A field the reader
-# lifts off an attribute instead reaches neither, so two records that share a
-# content row can disagree about it, and the content row can hold only one
-# answer. The writer keeps the first, decided by a sort on
-# (package, name, version, internal), so the answer a reader gets would be
-# whichever dataset the shard happened to reach first. Every group below was
-# demonstrated by building two objects over the same values under different
-# attributes and watching them come back with one pair of digests and two
-# answers.
+# Nothing else belongs here. A field the reader lifts off an attribute rather
+# than off the values reaches neither fingerprint, but the digest the profile
+# is keyed on covers it, so it sits on the profile with the rest of what the
+# reader recorded and two records that disagree about it take a row each.
 #
 # One consequence worth knowing. These rows are deleted and rewritten for every
 # package in a shard, so a field here arrives on every scan. The profile is
-# written with INSERT OR IGNORE against the generation key, so a field there
-# arrives only when the bytes or the generation move. A reader that improves
-# how it describes an attribute is therefore visible here on the next scan and
-# on the profile only under a new generation.
+# written with INSERT OR IGNORE, so a field there arrives when anything the
+# digest covers moves, which is what a reader recording something new does.
 .DATASET_VERSION_COLS <- c(
   format_version = "INTEGER", compressed_bytes = "INTEGER", notes = "TEXT",
   # A file that is not what its name says: which separator would work, and how
   # many columns it would give. A property of this file, not of the data.
-  delimiter_looks_like = "TEXT", delimiter_would_give_ncol = "INTEGER",
-
-  # The class chain, and what is read out of it. A data.frame and a tibble of
-  # the same columns are one fingerprint, and so are an S4 object of one class
-  # and an S4 object of another over the same slot values.
-  class = "TEXT", kind = "TEXT", frame_class = "TEXT",
-  object_system = "TEXT", s4_package = "TEXT",
-
-  # Labels along the margins. Neither row names nor dimnames are hashed, so a
-  # frame with named rows and one without are the same bytes.
-  has_rownames = "INTEGER", has_dimnames = "INTEGER", dimnames = "TEXT",
-
-  # How a Matrix declares itself. Two triangular matrices holding the same x
-  # differ only in uplo; a general and a symmetric one differ only in class.
-  matrix_value_type = "TEXT", matrix_shape = "TEXT", matrix_storage = "TEXT",
-  matrix_uplo = "TEXT", matrix_diag = "TEXT",
-
-  # The calendar a series is placed on. Its observations are hashed; the tsp
-  # attribute and the index vector beside them are not, so the same four
-  # numbers are a 1980 monthly series and a 2000 quarterly one at once.
-  ts_start = "REAL", ts_end = "REAL", ts_frequency = "REAL",
-  ts_span = "REAL", frequency = "REAL",
-  index_start = "TEXT", index_end = "TEXT", index_n = "INTEGER",
-  index_class = "TEXT", index_span = "REAL", index_tz = "TEXT",
-  index_delta = "REAL", index_regular = "INTEGER",
-  index_n_gaps = "INTEGER", index_max_gap = "REAL",
-  index_sorted = "INTEGER", index_has_duplicates = "INTEGER",
-
-  # The projection coordinates are declared in. The coordinates themselves are
-  # hashed, so the extent and the geometry counts stay on the profile; which
-  # datum they are read against does not reach the digest at all.
-  crs_input = "TEXT", crs_epsg = "INTEGER", crs_wkt = "TEXT",
-
-  # A raster's bands and their metadata, all of it read off slots.
-  n_layers = "INTEGER", resolution = "TEXT", nodata_value = "REAL",
-  in_memory = "INTEGER", layer_names = "TEXT",
-  layer_min = "TEXT", layer_max = "TEXT",
-
-  # Written down beside the values rather than computed from them, the time
-  # zone included: the same moment stored in two zones is the same bytes and
-  # two different local times.
-  label = "TEXT", comment = "TEXT", units = "TEXT", attrs_other = "TEXT",
-  tz = "TEXT",
-
-  # Whether a factor's levels are ranked. The labels are hashed in place of the
-  # codes and the ranking is in the class chain, so an ordered factor and a
-  # plain one over the same labels are one fingerprint.
-  is_ordered = "INTEGER",
-
-  # Grouping and keying state, all of it in attributes. A grouped tibble and
-  # the tibble it was grouped from hold the same columns.
-  is_grouped = "INTEGER", group_vars = "TEXT", n_groups = "INTEGER",
-  is_rowwise = "INTEGER", dt_key = "TEXT", dt_indices = "TEXT",
-
-  # Names of things the schema digest never sees. It is taken over a frame's
-  # columns and never descends, so a list's slot names and the column names of
-  # a frame nested inside one are outside it.
-  element_names = "TEXT", inner_names = "TEXT"
+  delimiter_looks_like = "TEXT", delimiter_would_give_ncol = "INTEGER"
 )
 
 # Where a dataset was found. Not a property of its contents: the same data can
@@ -508,8 +466,22 @@ metrics_fingerprint <- function(summary_df) {
 # version, content_id and every other field the writer names one by one, and a
 # migration that dropped those would empty the database.
 .DATASET_COLS_THAT_MOVED <- list(
-  cran_dataset_versions = c("column_detail"),
-  cran_dataset_contents = c(
+  cran_dataset_versions = c(
+    # The reading depth, which is content-determined and now sits beside the
+    # array it explains.
+    "column_detail",
+    # And everything a database written between the key change and this one was
+    # given on the link: the fields content_fp does not cover, which were put
+    # there while the profile key was too narrow to hold them safely. The key
+    # covers them now, so they are back on the profile, where the viewer reads
+    # them, and this copy has to go or it stands for ever holding whatever it
+    # held on the day it stopped being written.
+    #
+    # The values are not carried across. A profile several links point at is
+    # exactly the collapsed answer this undoes, and picking one link's answer
+    # for it would be the substitution again. They come back from the reader on
+    # the next scan, which a new analyzer build asks for on every package in
+    # the archive.
     "class", "kind", "frame_class", "object_system", "s4_package",
     "has_rownames", "has_dimnames", "dimnames",
     "matrix_value_type", "matrix_shape", "matrix_storage", "matrix_uplo",
@@ -537,12 +509,13 @@ metrics_fingerprint <- function(summary_df) {
 #' answer on every link pointing at one profile, because which depth a record
 #' is read at follows from the data. So any one of them will do.
 #'
-#' Only this direction. The fields going the other way are the ones the
-#' profile's key does not cover, and the value on the profile is whichever
-#' dataset the shard reached first, so carrying it onto the links would copy
-#' one package's answer onto every package that shares the bytes. Those come
-#' back from the reader on the next scan instead, which a new analyzer build
-#' already asks for on every package in the archive.
+#' Only this direction, and only this field. A database written between the
+#' key change and the one that undid it also has fields to bring back off the
+#' links, and those cannot be carried: a profile that several links point at is
+#' the collapsed answer the key change undoes, and there is no way to say whose
+#' answer it was. They come back from the reader on the next scan instead,
+#' which a new analyzer build already asks for on every package in the
+#' archive.
 .carry_reading_depth_to_profiles <- function(con) {
   tables <- DBI::dbListTables(con)
   if (!all(c("cran_dataset_contents", "cran_dataset_versions") %in% tables)) {
@@ -717,11 +690,12 @@ metrics_fingerprint <- function(summary_df) {
       PRIMARY KEY (package, name))")
   }
   # content_id is nullable: a dataset whose values the reader could not take
-  # comes back with no fingerprints, so there is no content row for it to point
+  # comes back with no fingerprints, so there is no profile row for it to point
   # at and none can be invented without telling two objects that were never
   # compared that they hold the same data. The link still says the package
-  # ships this dataset at this version, and confidence, notes and
-  # column_detail beside it say what was and was not read.
+  # ships this dataset at this version, and confidence and notes beside it say
+  # what was and was not read. How many links stand like this is published in
+  # the manifest.
   if (!"cran_dataset_versions" %in% tables) {
     DBI::dbExecute(con, "CREATE TABLE cran_dataset_versions (
       package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
@@ -879,13 +853,15 @@ metrics_fingerprint <- function(summary_df) {
   # so the dataset left the catalog rather than appearing in it with what is
   # known about it.
   #
-  # They still get no content row: that table is addressed by fingerprint, and
-  # a key invented for a record with none would tell two objects that were
-  # never compared that they hold the same data. They get the identity row and
-  # the version link, with no content_id, and confidence and notes beside it
-  # say what was read and what was not. The version link also carries the class
-  # chain, the object system and a raster's bands now, so a record with no
-  # profile says considerably more than it used to.
+  # They still get no profile row. The digest a profile is keyed on can be
+  # taken over such a record, but taking it would put two objects that were
+  # never compared on one row whenever the little that is known about them
+  # agrees, and the page that row feeds says "the same data in N packages".
+  # They get the identity row and the version link, with no content_id, and
+  # confidence and notes beside it say what was read and what was not. How many
+  # of them there are is published in the manifest, because a catalog entry
+  # with nothing behind it is a coverage figure and a shard where the number
+  # climbs is the reader losing objects it used to measure.
   fingerprinted <- !is.na(df$content_fp) & nzchar(df$content_fp)
   if (any(!fingerprinted)) {
     # Said out loud for the same reason the refusal above is: a dataset in the

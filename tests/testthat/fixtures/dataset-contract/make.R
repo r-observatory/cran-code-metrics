@@ -179,8 +179,8 @@ sv(new("FixtureThing", x = c(1, 2, 3)), "an_s4_object")
 # Past 512 columns the reader stops writing a profile per column, and what it
 # writes instead depends on whether the columns are alike. Past its cell cap it
 # stops reading values at all and keeps only the structure. Each of the three
-# is a different record shape, and the last one carries no fingerprint, so all
-# three have to be reachable or the writer's handling of them is untested.
+# is a different record shape, so all three have to be reachable or the
+# writer's handling of them is untested.
 #
 # Kept as small as the rule allows: 600 columns is the narrowest thing over the
 # 512 the reader draws the line at, and eight rows is enough to summarise.

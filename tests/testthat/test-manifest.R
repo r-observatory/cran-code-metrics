@@ -214,3 +214,49 @@ test_that("a database with no dataset marker at all counts every package as unsc
 
   expect_identical(.n_datasets_unscanned(con), 2L)
 })
+
+test_that("a dataset with no profile does not unsettle the manifest fingerprint", {
+  # cran_datasets.current_content_id is part of the data series' fingerprint
+  # key, and it is NULL for every dataset the reader could not fingerprint: an
+  # S4 object it holds no representation for, a packed raster, an R script, a
+  # frame whose one column is a generated sequence. The digest is what tells
+  # the pipeline whether a run changed anything, so a NULL that renders
+  # differently from one call to the next would report a change on every run
+  # for ever, and a NULL that renders as some content_id would hide a real one.
+  mk <- function(ids, pkgs = c("a", "b", "c")) {
+    db <- withr::local_tempfile(fileext = ".db", .local_envir = parent.frame())
+    con <- DBI::dbConnect(RSQLite::SQLite(), db)
+    withr::defer(DBI::dbDisconnect(con), envir = parent.frame())
+    DBI::dbWriteTable(con, "cran_datasets", data.frame(
+      package = pkgs, name = rep("d", length(pkgs)),
+      current_content_id = ids, stringsAsFactors = FALSE))
+    DBI::dbWriteTable(con, "cran_dataset_versions", data.frame(
+      package = pkgs, content_id = ids, stringsAsFactors = FALSE))
+    build_manifest(
+      con, series = "data", repo = "r-observatory/cran-code-metrics",
+      db_filename = "cran-data-metrics.db", db_bytes = 4096L,
+      tables = c("cran_datasets", "cran_dataset_versions"),
+      fp_table = "cran_datasets",
+      fp_cols = c("package", "name", "current_content_id"),
+      pkg_table = "cran_datasets", ver_table = "cran_dataset_versions",
+      stat_table = "cran_dataset_contents", stat_cols = c("nrow", "ncol"),
+      bootstrap = list(n_analyzed = 3L, n_universe = 3L, n_remaining = 0L,
+                       bootstrap_complete = TRUE))
+  }
+
+  with_null <- mk(c(1L, NA_integer_, 3L))
+  expect_true(grepl("^[0-9a-f]{64}$", with_null$fingerprint))
+  # Same database, same answer: the run that follows this one has to be able to
+  # see that nothing moved.
+  expect_identical(mk(c(1L, NA_integer_, 3L))$fingerprint, with_null$fingerprint)
+  # And a profile arriving where there was none is a change, not a no-op.
+  expect_false(identical(mk(c(1L, 2L, 3L))$fingerprint, with_null$fingerprint))
+  # So is the dataset itself arriving or leaving. A key that skipped the rows
+  # naming no profile would read the same either way, and those are exactly the
+  # rows this pipeline just stopped dropping.
+  expect_false(identical(mk(c(1L, 3L), c("a", "c"))$fingerprint,
+                         with_null$fingerprint))
+  # The row is counted, whether or not it names a profile.
+  expect_identical(with_null$n_packages, 3L)
+  expect_identical(with_null$n_versions, 3L)
+})

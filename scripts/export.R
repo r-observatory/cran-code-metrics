@@ -336,6 +336,13 @@ metrics_fingerprint <- function(summary_df) {
 # demonstrated by building two objects over the same values under different
 # attributes and watching them come back with one pair of digests and two
 # answers.
+#
+# One consequence worth knowing. These rows are deleted and rewritten for every
+# package in a shard, so a field here arrives on every scan. The profile is
+# written with INSERT OR IGNORE against the generation key, so a field there
+# arrives only when the bytes or the generation move. A reader that improves
+# how it describes an attribute is therefore visible here on the next scan and
+# on the profile only under a new generation.
 .DATASET_VERSION_COLS <- c(
   format_version = "INTEGER", compressed_bytes = "INTEGER", notes = "TEXT",
   # A file that is not what its name says: which separator would work, and how
@@ -666,18 +673,23 @@ metrics_fingerprint <- function(summary_df) {
   df <- df[order(df$package, df$name, df$version, df$internal), , drop = FALSE]
   df <- df[!duplicated(paste(df$package, df$name, df$version, sep = "\x1f")), , drop = FALSE]
 
-  # Which records the reader fingerprinted. The ones it did not are objects it
-  # described and could not measure: an S4 object it holds no representation
-  # for, and a frame with a column past the cell cap, which comes back with its
-  # shape and its column names and no fingerprint at all. Every such record
-  # used to be dropped here, whole, so the dataset left the catalog rather than
-  # appearing in it with what is known about it.
+  # Which records the reader fingerprinted. Nearly everything is: a column too
+  # long to read still has bytes, and the reader hashes them on the way past,
+  # so even a frame it never opened has an identity. The ones it did not are
+  # the four shapes with nothing to hash: an S4 object it holds no
+  # representation for, a packed raster, an R script under data/ that only R
+  # can run, and a frame whose every column is a generated sequence, which
+  # occupies no bytes at all. Every such record used to be dropped here, whole,
+  # so the dataset left the catalog rather than appearing in it with what is
+  # known about it.
   #
   # They still get no content row: that table is addressed by fingerprint, and
   # a key invented for a record with none would tell two objects that were
   # never compared that they hold the same data. They get the identity row and
-  # the version link, with no content_id, and confidence, notes and
-  # column_detail beside it say what was read and what was not.
+  # the version link, with no content_id, and confidence and notes beside it
+  # say what was read and what was not. The version link also carries the class
+  # chain, the object system and a raster's bands now, so a record with no
+  # profile says considerably more than it used to.
   fingerprinted <- !is.na(df$content_fp) & nzchar(df$content_fp)
   if (any(!fingerprinted)) {
     # Said out loud for the same reason the refusal above is: a dataset in the

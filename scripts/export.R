@@ -586,6 +586,135 @@ metrics_fingerprint <- function(summary_df) {
   invisible(NULL)
 }
 
+# How far a table rebuild may let the file grow before the pages behind the
+# rows it has already moved come back to it, and how many rows may go into one
+# batch on the way to that.
+#
+# A rebuild is a second copy of a table, and SQLite hands the pages of the
+# table it replaces to the file's own free list rather than to the filesystem,
+# so a rebuild that fills the copy before it drops the original leaves the file
+# at the sum of the two forever. On the published dataset database that is
+# 1.21 GB in and 2.24 GB out, past the size at which the workflow refuses to
+# publish, and the reclaim that would bring it back is allowed to decline: a
+# disk too small for it, a free list too small to be worth it, or a rewrite
+# that failed are all reasons to skip, and a migration that publishes nothing
+# is a silent stall on a pipeline that keeps its state in its own release
+# asset.
+#
+# So rows are moved rather than copied, a batch at a time, and the file only
+# ever has to hold one batch more than the table itself. Counted in bytes and
+# not in rows because one column profile runs to MAX_DATASET_COLUMNS_BYTES and
+# nothing smaller, so a fixed number of rows is a batch whose size nobody
+# stated. The row ceiling is the other end of the same bound: a table of tiny
+# profiles would otherwise put a quarter of a million rows into one range.
+#
+# 32 MiB is headroom the published file has and the workflow will take. It is
+# not a memory figure: the copy is a statement SQLite runs against itself and
+# nothing here reads a row.
+.DATASET_REKEY_BATCH_BYTES <- 32 * 1024^2
+.DATASET_REKEY_BATCH_ROWS  <- 2000L
+
+#' Group rows into batches bounded by the bytes they carry.
+#'
+#' Greedy and in order, because the rows are moved by a contiguous range of the
+#' rowid, which is a walk down the table rather than a scan per batch.
+#'
+#' A row heavier on its own than the whole budget still has to travel. It takes
+#' a batch to itself: the budget is a ceiling on what a batch adds to the file,
+#' not a promise that any single row fits under it.
+#'
+#' @param weight    Byte weight of each row, in the order they will be read. A
+#'   weight that could not be taken counts as nothing rather than dropping the
+#'   row out of the plan.
+#' @param max_bytes Byte budget for one batch.
+#' @param max_rows  Row ceiling for one batch.
+#' @return Integer vector, one per row, naming the batch it belongs to. Batch
+#'   numbers start at 1 and rise by one, so the runs are contiguous.
+.dataset_rekey_batches <- function(weight,
+                                   max_bytes = .DATASET_REKEY_BATCH_BYTES,
+                                   max_rows  = .DATASET_REKEY_BATCH_ROWS) {
+  n <- length(weight)
+  if (n == 0L) return(integer(0L))
+  w <- as.numeric(weight)
+  w[is.na(w)] <- 0
+  out  <- integer(n)
+  b    <- 1L
+  acc  <- 0
+  rows <- 0L
+  for (i in seq_len(n)) {
+    if (rows > 0L && (acc + w[[i]] > max_bytes || rows >= max_rows)) {
+      b    <- b + 1L
+      acc  <- 0
+      rows <- 0L
+    }
+    out[[i]] <- b
+    acc  <- acc + w[[i]]
+    rows <- rows + 1L
+  }
+  out
+}
+
+#' Move every row of one table into another, a bounded number of bytes at a
+#' time, freeing what each batch leaves behind before the next one is read.
+#'
+#' The point is the file rather than the memory: a batch is inserted and then
+#' deleted from the table it came from, and SQLite takes the pages the delete
+#' releases for the pages the next insert needs, so the file's high-water mark
+#' is the table plus one batch instead of the table twice.
+#'
+#' Rows travel by a range of rowid rather than by LIMIT and OFFSET, because
+#' OFFSET re-walks every row already moved and reads the whole of each one on
+#' the way past, which is quadratic in the size of the table.
+#'
+#' @param con   Open connection. The caller holds the savepoint: this deletes
+#'   rows it has copied, so a failure part-way is only safe under one.
+#' @param from,to Table names. `to` must already exist.
+#' @param cols  Columns to carry across, by name, present in both.
+#' @param extra Optional named list of one element: the name of a column in
+#'   `to` that has no counterpart in `from`, and the SQL expression over
+#'   `from`'s columns that fills it.
+#' @return Invisibly, the number of batches the move took.
+.move_dataset_rows <- function(con, from, to, cols, extra = NULL,
+                               max_bytes = .DATASET_REKEY_BATCH_BYTES,
+                               max_rows  = .DATASET_REKEY_BATCH_ROWS) {
+  # What every row weighs, asked of SQLite rather than of memory. LENGTH over a
+  # CAST to BLOB is the stored byte count and not a character count, so a
+  # profile carrying multi-byte text is not planned for as smaller than it is,
+  # and SQLite answers it off the record header without reading the value.
+  #
+  # Added up in groups of 64 and finished in R, because SQLite stops at an
+  # expression a thousand deep and one chain of column lengths is exactly that
+  # deep. The profile is 148 columns and gains a few every time the reader
+  # describes more, so a single chain is a migration that works until the spec
+  # crosses a line nobody is watching, and then fails whole.
+  groups <- split(cols, (seq_along(cols) - 1L) %/% 64L)
+  sums   <- vapply(seq_along(groups), function(g) sprintf(
+    "%s AS w%d",
+    paste(sprintf('COALESCE(LENGTH(CAST("%s" AS BLOB)), 0)', groups[[g]]),
+          collapse = " + "), g), character(1L))
+  plan <- DBI::dbGetQuery(con, sprintf(
+    'SELECT rowid AS move_rowid, %s FROM "%s" ORDER BY rowid',
+    paste(sums, collapse = ", "), from))
+  if (nrow(plan) == 0L) return(invisible(0L))
+  weight <- rowSums(as.matrix(plan[, sprintf("w%d", seq_along(groups)), drop = FALSE]))
+
+  named <- paste(sprintf('"%s"', cols), collapse = ", ")
+  into  <- if (is.null(extra)) named else paste(named, sprintf('"%s"', names(extra)), sep = ", ")
+  taken <- if (is.null(extra)) named else paste(named, extra[[1L]], sep = ", ")
+  runs <- rle(.dataset_rekey_batches(weight, max_bytes = max_bytes, max_rows = max_rows))
+  ends <- cumsum(runs$lengths)
+  for (b in seq_along(ends)) {
+    lo <- plan$move_rowid[[ends[[b]] - runs$lengths[[b]] + 1L]]
+    hi <- plan$move_rowid[[ends[[b]]]]
+    DBI::dbExecute(con, sprintf(
+      'INSERT INTO "%s" (%s) SELECT %s FROM "%s" WHERE rowid BETWEEN %.0f AND %.0f',
+      to, into, taken, from, lo, hi))
+    DBI::dbExecute(con, sprintf(
+      'DELETE FROM "%s" WHERE rowid BETWEEN %.0f AND %.0f', from, lo, hi))
+  }
+  invisible(length(ends))
+}
+
 #' Put a profile table that was keyed on the fingerprints onto the digest.
 #'
 #' The old key, UNIQUE (content_fp, schema_fp, fp_algo_version), is declared
@@ -612,10 +741,14 @@ metrics_fingerprint <- function(summary_df) {
 #' savepoint an interrupted run leaves the file exactly as it found it.
 #'
 #' A savepoint and not a transaction: this is also reached from inside the
-#' writer's own transaction, where a second BEGIN is an error.
+#' writer's own transaction, where a second BEGIN is an error. It is also what
+#' makes moving the rows safe: they leave the old table as they reach the new
+#' one, which is the only way the file does not have to hold both.
 #'
 #' A one-time no-op once the column is there.
-.rekey_dataset_contents <- function(con) {
+.rekey_dataset_contents <- function(con,
+                                    max_bytes = .DATASET_REKEY_BATCH_BYTES,
+                                    max_rows  = .DATASET_REKEY_BATCH_ROWS) {
   if (!"cran_dataset_contents" %in% DBI::dbListTables(con)) return(invisible(NULL))
   info <- DBI::dbGetQuery(con, "PRAGMA table_info(cran_dataset_contents)")
   if ("profile_fp" %in% info$name) return(invisible(NULL))
@@ -651,7 +784,6 @@ metrics_fingerprint <- function(summary_df) {
     defs <- c(defs, sprintf("PRIMARY KEY (%s)",
                             paste(sprintf('"%s"', pk), collapse = ", ")))
   }
-  cols <- paste(sprintf('"%s"', info$name), collapse = ", ")
   # A digest is 64 hex characters and this is not one, so a seeded row cannot
   # collide with a real profile however the fingerprints read.
   seeded <- if (all(.DATASET_CONTENT_KEY_COLS %in% info$name)) {
@@ -663,9 +795,12 @@ metrics_fingerprint <- function(summary_df) {
   DBI::dbExecute(con, sprintf(
     'CREATE TABLE cran_dataset_contents_new (%s, "profile_fp" TEXT NOT NULL,
        UNIQUE ("profile_fp"))', paste(defs, collapse = ", ")))
-  DBI::dbExecute(con, sprintf(
-    'INSERT INTO cran_dataset_contents_new (%s, "profile_fp")
-       SELECT %s, %s FROM cran_dataset_contents', cols, cols, seeded))
+  # Moved and not copied: the file would otherwise come out holding the profile
+  # table twice, which on the published database is past the size the workflow
+  # will publish.
+  .move_dataset_rows(con, "cran_dataset_contents", "cran_dataset_contents_new",
+                     info$name, extra = list(profile_fp = seeded),
+                     max_bytes = max_bytes, max_rows = max_rows)
   DBI::dbExecute(con, "DROP TABLE cran_dataset_contents")
   DBI::dbExecute(con,
     "ALTER TABLE cran_dataset_contents_new RENAME TO cran_dataset_contents")
@@ -687,7 +822,9 @@ metrics_fingerprint <- function(summary_df) {
 #' between them, and every run after it stops on the leftover.
 #'
 #' A one-time no-op once the constraint is gone.
-.relax_dataset_version_content_id <- function(con) {
+.relax_dataset_version_content_id <- function(con,
+                                              max_bytes = .DATASET_REKEY_BATCH_BYTES,
+                                              max_rows  = .DATASET_REKEY_BATCH_ROWS) {
   if (!"cran_dataset_versions" %in% DBI::dbListTables(con)) return(invisible(NULL))
   sql <- DBI::dbGetQuery(con,
     "SELECT sql FROM sqlite_master
@@ -708,15 +845,15 @@ metrics_fingerprint <- function(summary_df) {
   # carries the constraint, so anything under this name is an abandoned
   # attempt.
   DBI::dbExecute(con, "DROP TABLE IF EXISTS cran_dataset_versions_new")
-  cols   <- paste(sprintf('"%s"', DBI::dbListFields(con, "cran_dataset_versions")),
-                  collapse = ", ")
+  cols   <- DBI::dbListFields(con, "cran_dataset_versions")
   create <- sub(notnull, "content_id INTEGER", sql, fixed = TRUE)
   create <- sub("cran_dataset_versions", "cran_dataset_versions_new", create,
                 fixed = TRUE)
   DBI::dbExecute(con, create)
-  DBI::dbExecute(con, sprintf(
-    "INSERT INTO cran_dataset_versions_new (%s) SELECT %s FROM cran_dataset_versions",
-    cols, cols))
+  # Moved and not copied, for the reason the profile table is: this one is
+  # smaller and still adds 64 MB of its own to the published file.
+  .move_dataset_rows(con, "cran_dataset_versions", "cran_dataset_versions_new",
+                     cols, max_bytes = max_bytes, max_rows = max_rows)
   DBI::dbExecute(con, "DROP TABLE cran_dataset_versions")
   DBI::dbExecute(con,
     "ALTER TABLE cran_dataset_versions_new RENAME TO cran_dataset_versions")

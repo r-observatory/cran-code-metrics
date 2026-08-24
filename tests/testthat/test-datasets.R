@@ -757,6 +757,219 @@ test_that("the re-key holds together from inside the writer's own transaction", 
     "SELECT COUNT(*) n FROM cran_dataset_contents")$n, 6L)
 })
 
+# --- what the re-key costs the file ------------------------------------------
+
+# A profile table carrying a stated weight of column profile, on disk, under
+# the old key. `payload` bytes per row, `rows` rows.
+.mk_weighed_db <- function(path, rows, payload) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbExecute(con, "CREATE TABLE cran_dataset_contents (
+      content_id INTEGER PRIMARY KEY,
+      content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
+      nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
+      UNIQUE (content_fp, schema_fp, fp_algo_version))")
+  blob <- strrep("x", payload)
+  step <- 50L
+  for (s in seq(1L, rows, by = step)) {
+    ids <- s:min(s + step - 1L, rows)
+    DBI::dbExecute(con,
+      "INSERT INTO cran_dataset_contents
+         (content_id, content_fp, schema_fp, fp_algo_version, nrow, columns)
+         VALUES (?, ?, ?, 2, ?, ?)",
+      params = list(ids, sprintf("C%08d", ids), sprintf("S%08d", ids), ids,
+                    rep(blob, length(ids))))
+  }
+  path
+}
+
+test_that("a re-key does not ask the file to hold the profile table twice", {
+  # The rebuild filled a second copy of the table before it dropped the first,
+  # so the file came out about twice the size and stayed there: SQLite hands a
+  # dropped table's pages to the free list rather than to the filesystem. On
+  # the published database that is 1.21 GB in and 2.24 GB out, past the size at
+  # which the workflow refuses to publish at all, and the reclaim that would
+  # bring it back is allowed to decline.
+  #
+  # Rows move a bounded number of bytes at a time and each batch's pages are
+  # handed back before the next one is read, so the file never has to hold both
+  # copies and the size does not depend on a later step going ahead.
+  path <- withr::local_tempfile(fileext = ".db")
+  .mk_weighed_db(path, rows = 100L, payload = 100000L)
+  before <- file.info(path)$size
+  expect_gt(before, 9e6)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con))
+  .rekey_dataset_contents(con, max_bytes = 512 * 1024, max_rows = 2000L)
+  after <- file.info(path)$size
+
+  # Every row across, keyed on the new column, with the content_id the version
+  # links name.
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM cran_dataset_contents")$n, 100L)
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT MIN(content_id) lo, MAX(content_id) hi FROM cran_dataset_contents"),
+    data.frame(lo = 1L, hi = 100L))
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(DISTINCT profile_fp) n FROM cran_dataset_contents")$n, 100L)
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT SUM(LENGTH(CAST(columns AS BLOB))) s FROM cran_dataset_contents")$s,
+    100 * 100000)
+
+  # The whole payload is 10 MB. A rebuild that holds it twice adds all of it.
+  expect_lt(after - before, 4 * 1024^2)
+})
+
+test_that("what the re-key adds to the file does not grow with the table", {
+  # The property that decides whether the real one publishes: a bound that
+  # moves with the size of the table is not a bound. Twice the table, the same
+  # batch budget, and the same headroom spent.
+  small <- withr::local_tempfile(fileext = ".db")
+  large <- withr::local_tempfile(fileext = ".db")
+  .mk_weighed_db(small, rows = 100L, payload = 100000L)
+  .mk_weighed_db(large, rows = 200L, payload = 100000L)
+  grew <- function(p) {
+    before <- file.info(p)$size
+    con <- DBI::dbConnect(RSQLite::SQLite(), p)
+    on.exit(DBI::dbDisconnect(con))
+    .rekey_dataset_contents(con, max_bytes = 512 * 1024, max_rows = 2000L)
+    file.info(p)$size - before
+  }
+  g_small <- grew(small)
+  g_large <- grew(large)
+  expect_lt(g_large, g_small + 2 * 1024^2)
+  expect_lt(g_large, 4 * 1024^2)
+})
+
+test_that("the version table rebuild does not ask the file to hold it twice", {
+  # The same four statements relax the NOT NULL on the links, and on the
+  # published database they add 64 MB of their own for the same reason.
+  path <- withr::local_tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  DBI::dbExecute(con, "CREATE TABLE cran_dataset_versions (
+      package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
+      content_id INTEGER NOT NULL, format TEXT, compression TEXT, confidence TEXT,
+      is_current INTEGER NOT NULL DEFAULT 0, notes TEXT,
+      PRIMARY KEY (package, name, version))")
+  blob <- strrep("n", 20000L)
+  for (s in seq(1L, 500L, by = 50L)) {
+    ids <- s:min(s + 49L, 500L)
+    DBI::dbExecute(con,
+      "INSERT INTO cran_dataset_versions
+         (package, name, version, content_id, is_current, notes)
+         VALUES ('p', ?, '1.0', ?, 1, ?)",
+      params = list(sprintf("d%06d", ids), ids, rep(blob, length(ids))))
+  }
+  DBI::dbDisconnect(con)
+
+  before <- file.info(path)$size
+  expect_gt(before, 9e6)
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con))
+  .relax_dataset_version_content_id(con, max_bytes = 512 * 1024, max_rows = 2000L)
+  after <- file.info(path)$size
+
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM cran_dataset_versions")$n, 500L)
+  expect_false(grepl("content_id INTEGER NOT NULL",
+    DBI::dbGetQuery(con, "SELECT sql FROM sqlite_master
+      WHERE type = 'table' AND name = 'cran_dataset_versions'")$sql, fixed = TRUE))
+  expect_lt(after - before, 4 * 1024^2)
+})
+
+test_that("a batch is bounded by the bytes it carries, not by a count of rows", {
+  # One column profile runs to MAX_DATASET_COLUMNS_BYTES and nothing smaller,
+  # so a fixed number of rows is a batch whose size nobody stated.
+  expect_equal(.dataset_rekey_batches(rep(10, 6L), max_bytes = 25, max_rows = 1000L),
+               c(1L, 1L, 2L, 2L, 3L, 3L))
+  # The row ceiling is the other end of the same bound: a table of tiny
+  # profiles would otherwise put a quarter of a million rows in one range.
+  expect_equal(.dataset_rekey_batches(rep(1, 5L), max_bytes = 1e6, max_rows = 2L),
+               c(1L, 1L, 2L, 2L, 3L))
+  # Batch numbers rise by one and never revisit, so each is a contiguous range
+  # of the key the copy walks down.
+  b <- .dataset_rekey_batches(c(5, 40, 5, 5), max_bytes = 20, max_rows = 100L)
+  expect_equal(b, cummax(b))
+  expect_equal(.dataset_rekey_batches(numeric(0L)), integer(0L))
+})
+
+test_that("a row heavier than the whole budget still travels", {
+  # The budget is a ceiling on what a batch adds to the file, not a promise
+  # that any one row fits under it. The published table holds a column profile
+  # of 321 MB, from a file the reader mistook for one very long line.
+  b <- .dataset_rekey_batches(c(10, 1000, 10), max_bytes = 100, max_rows = 100L)
+  expect_equal(b, c(1L, 2L, 3L))
+  # And a weight nobody could take counts as nothing rather than dropping the
+  # row out of the plan.
+  expect_equal(length(.dataset_rekey_batches(c(1, NA, 1), max_bytes = 100,
+                                             max_rows = 100L)), 3L)
+})
+
+test_that("a wide profile table can still be weighed", {
+  # SQLite refuses an expression more than a thousand deep, and one chain of
+  # column lengths is exactly that deep. The profile is 148 columns today and
+  # gains a few every time the reader describes more, so a single chain is a
+  # migration that works until the spec crosses a line nobody is watching and
+  # then fails whole.
+  path <- withr::local_tempfile(fileext = ".db")
+  wide <- sprintf('"w%04d" TEXT', seq_len(1200L))
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbExecute(con, sprintf("CREATE TABLE cran_dataset_contents (
+      content_id INTEGER PRIMARY KEY,
+      content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
+      columns TEXT, %s,
+      UNIQUE (content_fp, schema_fp, fp_algo_version))", paste(wide, collapse = ", ")))
+  DBI::dbExecute(con, "INSERT INTO cran_dataset_contents
+      (content_id, content_fp, schema_fp, fp_algo_version) VALUES (1, 'C1', 'S1', 2)")
+  expect_error(.rekey_dataset_contents(con), NA)
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM cran_dataset_contents")$n, 1L)
+  expect_true("profile_fp" %in% DBI::dbListFields(con, "cran_dataset_contents"))
+})
+
+test_that("a re-key that fails part-way leaves every row where it was", {
+  # Rows leave the old table as they reach the new one, so a rebuild that stops
+  # in the middle is the one shape that could lose data outright. The savepoint
+  # is what makes it all of it or none of it.
+  path <- withr::local_tempfile(fileext = ".db")
+  .mk_old_key_db(path)
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbExecute(con, "CREATE TRIGGER stop_the_rekey
+      BEFORE DELETE ON cran_dataset_contents WHEN OLD.content_id = 4
+      BEGIN SELECT RAISE(ABORT, 'stopped part-way'); END")
+
+  expect_error(.rekey_dataset_contents(con, max_bytes = 1L, max_rows = 1L),
+               "stopped part-way")
+  DBI::dbExecute(con, "DROP TRIGGER stop_the_rekey")
+
+  # The rows that had already moved are back, the table is the one it started
+  # as, and nothing is left under the rebuild name.
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM cran_dataset_contents")$n, 5L)
+  expect_false("profile_fp" %in% DBI::dbListFields(con, "cran_dataset_contents"))
+  expect_false("cran_dataset_contents_new" %in% DBI::dbListTables(con))
+
+  # And the next run finishes the job, which is what the leftover used to stop.
+  .rekey_dataset_contents(con)
+  expect_true("profile_fp" %in% DBI::dbListFields(con, "cran_dataset_contents"))
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM cran_dataset_contents")$n, 5L)
+})
+
+test_that("the batch budget is small beside the file the workflow will take", {
+  # What the migration may spend is headroom under the workflow's own refusal.
+  # The published dataset database is 1.21 GB and the workflow refuses at
+  # 2.04 GB, so the answer is tens of megabytes and not hundreds. Stated as a
+  # figure rather than as a multiple of the constant it guards, because a
+  # ceiling written as a multiple of that constant rises with it and stops
+  # guarding anything the moment somebody raises it.
+  expect_lte(.DATASET_REKEY_BATCH_BYTES, 64 * 1024^2)
+  expect_lte(.DATASET_REKEY_BATCH_ROWS, 10000L)
+})
+
 # --- what the reader records beside the values -------------------------------
 # content_fp is taken over the column values alone: a factor's labels stand in
 # for its codes, and an attribute written beside the values reaches it not at

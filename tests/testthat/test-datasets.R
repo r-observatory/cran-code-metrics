@@ -772,6 +772,49 @@ test_that("a dataset the reader could not fingerprint keeps its place in the cat
   expect_equal(cts$column_detail, "full")
 })
 
+test_that("a dataset read only for its structure is told apart from one nobody could read", {
+  # Both are `structural` and both are `degraded`, and after the reader learned
+  # to hash the bytes it goes past they take different paths: a column with
+  # bytes has an identity and reaches the contents table like any other record,
+  # and a column with no bytes at all, a generated sequence, has none and keeps
+  # its place in the catalog with nothing behind it. A writer that treated the
+  # depth as the discriminator would send both the same way.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  hashed <- .mk_ds_row("p", "1.0", TRUE, "C1", name = "tall")
+  hashed$column_detail <- "structural"
+  hashed$confidence    <- "degraded"
+  hashed$notes         <- "value scan skipped (size cap)"
+  hashed$nrow          <- 8000001L
+  bare <- .mk_ds_row("p", "1.0", TRUE, NA_character_, name = "generated")
+  bare$schema_fp     <- NA_character_
+  bare$shape_fp      <- NA_character_
+  bare$row_sketch    <- NA_character_
+  bare$column_detail <- "structural"
+  bare$confidence    <- "degraded"
+  bare$notes         <- "value scan skipped (size cap)"
+  expect_output(
+    DBI::dbWithTransaction(
+      con, .write_datasets_normalized(con, rbind(hashed, bare), "p")),
+    "kept 1 dataset with no profile")
+
+  # One profile, and it is the one the reader could hash.
+  cts <- DBI::dbGetQuery(con,
+    "SELECT content_fp, nrow, column_detail FROM cran_dataset_contents")
+  expect_equal(nrow(cts), 1L)
+  expect_equal(cts$content_fp, "C1")
+  expect_equal(cts$nrow, 8000001L)
+  expect_equal(cts$column_detail, "structural")
+
+  # Both are in the catalog, and the one with no profile says why.
+  got <- DBI::dbGetQuery(con,
+    "SELECT name, content_id, confidence, notes FROM cran_dataset_versions ORDER BY name")
+  expect_equal(got$name, c("generated", "tall"))
+  expect_true(is.na(got$content_id[[1L]]))
+  expect_false(is.na(got$content_id[[2L]]))
+  expect_equal(got$notes, rep("value scan skipped (size cap)", 2L))
+})
+
 test_that("the profile GC is not stopped by a version link with no profile", {
   # NOT IN over a column holding a NULL is NULL for every row, so one
   # unfingerprinted dataset anywhere in the table would quietly retire the GC

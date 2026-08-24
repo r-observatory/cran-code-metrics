@@ -89,17 +89,34 @@
     }
     n_records <- 0L
     depths <- character(0L)
+    # Which records come back with no fingerprint, and which depth each record
+    # was read at, kept side by side. A depth on its own cannot say whether the
+    # writer took the record to the contents table or kept it with nothing
+    # behind it, and those are different paths through .write_datasets_normalized.
+    fp_by_depth <- list()
+    unfingerprinted <- data.frame(name = character(0L), notes = character(0L),
+                                  stringsAsFactors = FALSE)
     for (line in out) {
       rec <- tryCatch(jsonlite::fromJSON(line, simplifyVector = FALSE),
                       error = function(e) NULL)
       if (is.null(rec) || !identical(rec[["rec"]], "dataset")) next
       n_records <- n_records + 1L
       top <- union(top, names(rec))
-      depths <- union(depths, as.character(rec[["column_detail"]]))
+      depth <- as.character(rec[["column_detail"]] %||% NA_character_)
+      depths <- union(depths, depth)
+      has_fp <- !is.null(rec[["content_fp"]]) && nzchar(as.character(rec[["content_fp"]]))
+      fp_by_depth[[depth]] <- union(fp_by_depth[[depth]], has_fp)
+      if (!has_fp) {
+        unfingerprinted <- rbind(unfingerprinted, data.frame(
+          name = as.character(rec[["name"]]),
+          notes = as.character(rec[["notes"]] %||% NA_character_),
+          stringsAsFactors = FALSE))
+      }
       for (k in c("columns", "elements")) walk(rec[[k]])
     }
     cached <<- list(top = top, nested = nested, n_records = n_records,
-                    depths = depths)
+                    depths = depths, fp_by_depth = fp_by_depth,
+                    unfingerprinted = unfingerprinted)
     cached
   }
 })
@@ -168,9 +185,7 @@ test_that("the fixture reaches the shapes only one object can reach", {
 
 test_that("the fixture reaches every depth a column list can be written at", {
   keys <- .contract_setup()
-  # Three of the four change what the rest of the record means, and the fourth
-  # decides whether the record reaches the tables at all: a structural record
-  # carries no fingerprint, and the writer has to keep it anyway. A fixture set
+  # Each of the four changes what the rest of the record means. A fixture set
   # that only ever produces `full` would let all of that go untested.
   unreached <- sort(setdiff(c("full", "reduced", "none", "structural"),
                             keys$depths))
@@ -180,6 +195,50 @@ test_that("the fixture reaches every depth a column list can be written at", {
       "no object in the fixture package makes the analyzer write a column ",
       "list at these depths: ", paste(unreached, collapse = ", "),
       ". Restore the shape in fixtures/dataset-contract/make.R."))
+})
+
+test_that("the fixture reaches a structural record the reader fingerprinted and one it could not", {
+  keys <- .contract_setup()
+  # The reader hashes the bytes of a value it goes past, so a frame whose
+  # column is too long to read still has an identity and takes the ordinary
+  # path into the contents table. It cannot do that for a column with no bytes
+  # at all, which is a generated sequence, and that record keeps its place in
+  # the catalog with nothing behind it. Those are the two paths through
+  # .write_datasets_normalized, and one fixture reaching only one of them
+  # leaves the other untested against a real analyzer.
+  expect_true(TRUE %in% keys$fp_by_depth[["structural"]],
+              info = paste("no structural record in the fixture package carries",
+                           "a fingerprint, so the digest over skipped bytes is",
+                           "untested"))
+  expect_true(FALSE %in% keys$fp_by_depth[["structural"]],
+              info = paste("every structural record in the fixture package",
+                           "carries a fingerprint, so the writer's keep-anyway",
+                           "path is untested"))
+})
+
+test_that("the fixture reaches every shape that comes back without a fingerprint", {
+  keys <- .contract_setup()
+  # Each of these keeps its identity row and its version link and gets no
+  # content row, so each is a version link with a NULL content_id in the
+  # published data. They are named here so that a reader of the schema can see
+  # what a NULL means, and so a build that starts or stops producing one of
+  # them is noticed here rather than downstream.
+  want <- c("s4-class-only", "terra-packed", "R script data (requires R)",
+            "value scan skipped (size cap)")
+  got <- unique(keys$unfingerprinted$notes)
+  expect_identical(
+    sort(setdiff(want, got)), character(0L),
+    info = paste0(
+      "the fixture package no longer produces a record the reader cannot ",
+      "fingerprint for: ", paste(setdiff(want, got), collapse = ", "),
+      ". Restore the shape in fixtures/dataset-contract/make.R."))
+  expect_identical(
+    sort(setdiff(got, want)), character(0L),
+    info = paste0(
+      "the analyzer now returns an unfingerprinted record for a shape this ",
+      "list does not name: ", paste(setdiff(got, want), collapse = ", "),
+      ". Every one of these is a NULL content_id in the published data, so ",
+      "add it here rather than leaving it unnamed."))
 })
 
 test_that("every dataset field the analyzer emits is declared by a column spec", {

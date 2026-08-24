@@ -18,9 +18,10 @@ dir.create(file.path(root, "R"), recursive = TRUE, showWarnings = FALSE)
 dir.create(file.path(root, "man"), recursive = TRUE, showWarnings = FALSE)
 dir.create(file.path(root, "inst", "extdata"), recursive = TRUE, showWarnings = FALSE)
 
-sv <- function(obj, name, version = 3) {
+sv <- function(obj, name, version = 3, compress = "gzip") {
   assign(name, obj)
-  save(list = name, file = file.path(d, paste0(name, ".rda")), version = version)
+  save(list = name, file = file.path(d, paste0(name, ".rda")), version = version,
+       compress = compress)
 }
 
 # ---- rectangles -----------------------------------------------------------
@@ -190,9 +191,22 @@ mixed <- wide
 for (i in seq(1, 600, by = 3)) mixed[[i]] <- paste0("s", mixed[[i]])
 sv(mixed, "wide_mixed_types")
 
-# 9,000,000 rows in 202 bytes: R writes 1:n as a compact sequence, and the
-# reader reads its length and skips its values, which is the whole point of
-# this fixture. Nothing here is ever materialised.
+# Past the reader's cell cap, twice over, by the two routes that get there.
+#
+# A column with bytes: 8,000,001 doubles, materialised, so the reader reads
+# their length, hashes the bytes on the way past and skips the values. It comes
+# back structural WITH content_fp, schema_fp and shape_fp over those digests,
+# which is what lets it take the ordinary path into the contents table. Two
+# alternating values compress to about 14 KB under xz, which is what makes an
+# eight million row frame something a repository can hold.
+sv(data.frame(v = rep(c(0.5, 1.5), length.out = 8000001),
+              g = rep(1L, 8000001)),
+   "tall_values", compress = "xz")
+
+# A column with no bytes at all: R writes 1:n as a compact sequence, and 9
+# million of them are 202 bytes on disk. There is nothing to hash, so this one
+# comes back structural with no fingerprint of any kind, and the writer has to
+# keep it in the catalog anyway. Nothing here is ever materialised.
 sv(data.frame(a = 1:9000000, b = 1:9000000), "unread_values")
 
 # ---- text files under data/ -----------------------------------------------
@@ -203,6 +217,13 @@ wl <- function(lines, name) writeLines(lines, file.path(d, name))
 wl(c("height,weight,sex", "1.7,65,F", "1.8,80,M"), "comma_sep.csv")
 wl(c("height;weight;sex", "1.7;65;F", "1.8;80;M"), "semicolon_sep.csv")
 wl(c("grade   sex   score", "    6   M        43", "    7   F        88"), "spaced.txt")
+
+# data() also runs a .R file to build the object it names, which needs R and so
+# is something the reader can only report the existence of. The record carries
+# no fingerprint, which makes it one of the shapes that keeps its place in the
+# catalog with nothing behind it.
+wl(c("script_built <- data.frame(a = 1:3, b = c(\"x\", \"y\", \"z\"))"),
+   "script_built.R")
 
 # ---- internal, and files that are not data/ -------------------------------
 internal_lookup <- data.frame(code = c("a", "b"), value = c(1, 2), stringsAsFactors = FALSE)

@@ -20,9 +20,10 @@
 #    a wide table column by column: past 512 columns a table of one type is
 #    summarised whole and the array is replaced by that summary, a table of
 #    mixed types keeps every column at four fields, and a table whose values
-#    were never read keeps every column at its name and its type and gives up
-#    its fingerprints. column_detail on the version row says which of the four
-#    this record is.
+#    were never read keeps every column at its name and its type. That last one
+#    is still fingerprinted, over digests the reader takes of the bytes it goes
+#    past rather than over cells, so it reaches the contents table like any
+#    other. column_detail on the profile says which of the four it is.
 FP_ALGO_VERSION <- 3L
 
 #' Registry of metric group functions.

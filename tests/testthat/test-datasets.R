@@ -502,7 +502,7 @@ test_that("two versions of one dataset can differ in how they were stored", {
   expect_equal(got$format_version, c(2L, 3L))
 })
 
-# --- how deeply a version's columns were read --------------------------------
+# --- how deeply a dataset's columns were read --------------------------------
 # Past 512 columns the reader stops describing them one by one, and past its
 # cell cap it stops reading their values at all. Which of the four it did is
 # the legend for everything else on the record: at `none` there is no columns
@@ -510,8 +510,14 @@ test_that("two versions of one dataset can differ in how they were stored", {
 # carries four fields and no col_fp, and at `structural` an entry is a name and
 # a type because no value was read. A reader holding the array without the
 # legend cannot tell an object with nothing to say from one that was not asked.
+#
+# The legend belongs beside the array it explains. Which depth a record reaches
+# follows from the data: `full`, `reduced` and `none` from its width, the mix
+# of its column types and how many cells they lay out to, and `structural` from
+# the length of one column. Two files holding identical bytes are read to the
+# same depth, so the answer is one the profile can hold once.
 
-test_that("a version says at what depth its dataset's columns were read", {
+test_that("a profile says at what depth its columns were read", {
   con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
   on.exit(DBI::dbDisconnect(con))
   row <- .mk_ds_row("p", "1.0", TRUE, "C1")
@@ -519,12 +525,46 @@ test_that("a version says at what depth its dataset's columns were read", {
   DBI::dbWithTransaction(con, .write_datasets_normalized(con, row, "p"))
 
   expect_equal(
-    DBI::dbGetQuery(con, "SELECT column_detail FROM cran_dataset_versions")$column_detail,
+    DBI::dbGetQuery(con, "SELECT column_detail FROM cran_dataset_contents")$column_detail,
     "reduced")
-  # Not on the content row. One of the four depths belongs to records that
-  # have no content row at all, so the contents table cannot hold the column
-  # without being NULL for that depth for good.
-  expect_false("column_detail" %in% DBI::dbListFields(con, "cran_dataset_contents"))
+  # Not on the version link. Repeating it there once per package that ships the
+  # data says the same thing several times and invites the copies to disagree.
+  expect_false("column_detail" %in% DBI::dbListFields(con, "cran_dataset_versions"))
+})
+
+test_that("a database that kept the depth on the version link is given it on the profile", {
+  # These tables only ever gain columns, so a field that has changed table
+  # leaves a copy behind on the old one that nothing will write to again. It
+  # keeps whatever it held on the day it stopped being written, and every
+  # reader that finds it there believes it.
+  path <- withr::local_tempfile(fileext = ".db")
+  con  <- DBI::dbConnect(RSQLite::SQLite(), path)
+  DBI::dbExecute(con, "CREATE TABLE cran_dataset_versions (
+      package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
+      content_id INTEGER, format TEXT, compression TEXT, confidence TEXT,
+      is_current INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (package, name, version))")
+  DBI::dbExecute(con, "ALTER TABLE cran_dataset_versions ADD COLUMN notes TEXT")
+  DBI::dbExecute(con, "ALTER TABLE cran_dataset_versions ADD COLUMN column_detail TEXT")
+  DBI::dbExecute(con, "INSERT INTO cran_dataset_versions
+      (package, name, version, content_id, format, is_current, notes, column_detail)
+      VALUES ('p', 'kept', '1.0', 7, 'rda', 1, 'from before', 'reduced')")
+  DBI::dbExecute(con, "CREATE TABLE cran_dataset_contents (
+      content_id INTEGER PRIMARY KEY,
+      content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
+      class TEXT, kind TEXT, nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
+      UNIQUE (content_fp, schema_fp, fp_algo_version))")
+  DBI::dbDisconnect(con)
+
+  con <- open_or_init_data_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_false("column_detail" %in% DBI::dbListFields(con, "cran_dataset_versions"))
+  expect_true("column_detail" %in% DBI::dbListFields(con, "cran_dataset_contents"))
+  # And the row it was carrying is otherwise untouched.
+  kept <- DBI::dbGetQuery(con, "SELECT * FROM cran_dataset_versions")
+  expect_equal(kept$name, "kept")
+  expect_equal(kept$content_id, 7L)
+  expect_equal(kept$notes, "from before")
 })
 
 test_that("a dataset the reader could not fingerprint keeps its place in the catalog", {
@@ -557,7 +597,7 @@ test_that("a dataset the reader could not fingerprint keeps its place in the cat
   expect_equal(ident$name, c("huge", "small"))
 
   got <- DBI::dbGetQuery(con,
-    "SELECT name, content_id, confidence, notes, column_detail
+    "SELECT name, content_id, confidence, notes
        FROM cran_dataset_versions ORDER BY name")
   expect_equal(got$name, c("huge", "small"))
   # No profile to point at, and the row says why rather than pointing at
@@ -567,11 +607,15 @@ test_that("a dataset the reader could not fingerprint keeps its place in the cat
   expect_false(is.na(got$content_id[[2L]]))
   expect_equal(got$confidence[[1L]], "degraded")
   expect_equal(got$notes[[1L]], "value scan skipped (size cap)")
-  expect_equal(got$column_detail[[1L]], "structural")
 
-  # And only the fingerprinted one has a profile.
-  expect_equal(
-    DBI::dbGetQuery(con, "SELECT count(*) n FROM cran_dataset_contents")$n, 1L)
+  # And only the fingerprinted one has a profile, so only it carries a depth.
+  # A record with nothing behind it carries no depth either: confidence and
+  # notes are the whole of what the catalog can say about it, which is the
+  # honest answer and the one the run counts out loud.
+  cts <- DBI::dbGetQuery(con,
+    "SELECT column_detail FROM cran_dataset_contents")
+  expect_equal(nrow(cts), 1L)
+  expect_equal(cts$column_detail, "full")
 })
 
 test_that("the profile GC is not stopped by a version link with no profile", {

@@ -311,6 +311,21 @@ metrics_fingerprint <- function(summary_df) {
   # declaring the other.
   tz = "TEXT",
 
+  # How deeply this profile's columns were read: full, reduced, none or
+  # structural. It is the legend for the rest of the row. At `none` there is no
+  # columns array at all and the whole-object figures stand in its place; at
+  # `reduced` an entry carries a name, a type and two counts and no col_fp; at
+  # `structural` an entry is a name and a type, because no value was read.
+  # Without it, an entry with no statistics reads the same as an object that
+  # had none to give.
+  #
+  # Content-determined, so it belongs beside the array it explains. Width, the
+  # mix of column types and the number of cells decide between the first three,
+  # and the length of one column decides the fourth; all of them are properties
+  # of the data, so two files holding identical bytes are read to the same
+  # depth and there is one answer to store rather than one per package.
+  column_detail = "TEXT",
+
   # How many bytes of column profile this row does NOT carry. Zero on a row
   # that carries all of it, which is every honest row; a count says the profile
   # was over MAX_DATASET_COLUMNS_BYTES and was refused rather than stored. It
@@ -328,24 +343,7 @@ metrics_fingerprint <- function(summary_df) {
   format_version = "INTEGER", compressed_bytes = "INTEGER", notes = "TEXT",
   # A file that is not what its name says: which separator would work, and how
   # many columns it would give. A property of this file, not of the data.
-  delimiter_looks_like = "TEXT", delimiter_would_give_ncol = "INTEGER",
-
-  # How deeply this version's columns were read: full, reduced, none or
-  # structural. It is the legend for the rest of the record. At `none` there is
-  # no columns array at all and the whole-object figures stand in its place; at
-  # `reduced` an entry carries a name, a type and two counts and no col_fp; at
-  # `structural` an entry is a name and a type, because no value was read.
-  # Without it, an entry with no statistics reads the same as an object that
-  # had none to give.
-  #
-  # Here rather than on the content row, even though two files holding
-  # identical bytes always get the same answer, because `structural` is the
-  # answer for a record that carries no fingerprints and so has no content row
-  # to say it on. A column that cannot express one of its four values is worse
-  # than one repeated across the version links sharing a profile, and the
-  # repetition is a word beside `confidence` and `notes`, which say the rest of
-  # the same sentence and already live here.
-  column_detail = "TEXT"
+  delimiter_looks_like = "TEXT", delimiter_would_give_ncol = "INTEGER"
 )
 
 # Where a dataset was found. Not a property of its contents: the same data can
@@ -358,6 +356,42 @@ metrics_fingerprint <- function(summary_df) {
   # or one may not document them at all.
   title = "TEXT"
 )
+
+# Dataset columns that have changed table, named by the table they left.
+#
+# These tables only ever gain columns. A field that moves is added to its new
+# home by .ensure_dataset_columns and then written there, and the copy on the
+# old table is never written again: it keeps whatever it held on the day the
+# move landed, for good, and every reader that finds it there believes it. So
+# the move has two halves, and this is the second.
+#
+# Held as an explicit list rather than derived from the specs, because "a
+# column this table's spec does not declare" is also true of package, name,
+# version, content_id and every other field the writer names one by one, and a
+# migration that dropped those would empty the database.
+.DATASET_COLS_THAT_MOVED <- list(
+  cran_dataset_versions = c("column_detail")
+)
+
+#' Drop the copy a moved dataset column left behind on the table it came from.
+#'
+#' A no-op on a database that never had it, and a no-op for good once it has
+#' run. Refuses to touch a column the table's own spec still declares, so a
+#' name left in the list by mistake cannot delete live data.
+.retire_moved_dataset_columns <- function(con) {
+  specs <- list(cran_dataset_contents = .DATASET_CONTENT_COLS,
+                cran_dataset_versions = .DATASET_VERSION_COLS,
+                cran_datasets         = .DATASET_IDENTITY_COLS)
+  present <- DBI::dbListTables(con)
+  for (tbl in names(.DATASET_COLS_THAT_MOVED)) {
+    if (!tbl %in% present) next
+    gone <- setdiff(.DATASET_COLS_THAT_MOVED[[tbl]], names(specs[[tbl]]))
+    for (col in intersect(gone, DBI::dbListFields(con, tbl))) {
+      DBI::dbExecute(con, sprintf('ALTER TABLE "%s" DROP COLUMN "%s"', tbl, col))
+    }
+  }
+  invisible(NULL)
+}
 
 #' Add any dataset column the analyzer now emits that the table has not seen.
 #' Mirrors what cran_code_summary already does for its own new columns; without
@@ -450,6 +484,10 @@ metrics_fingerprint <- function(summary_df) {
   # applies to a database being built from nothing, and every incremental run
   # against a downloaded one silently drops them.
   .ensure_dataset_columns(con)
+  # After the widening, so a column that has changed table is added to its new
+  # home before the copy on the old one goes: the two halves of one move, in
+  # the order that never leaves the field homeless.
+  .retire_moved_dataset_columns(con)
   DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_cran_dsv_content ON cran_dataset_versions(content_id)")
   DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_cran_dsc_schema ON cran_dataset_contents(schema_fp)")
   invisible(NULL)

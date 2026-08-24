@@ -186,27 +186,43 @@ metrics_fingerprint <- function(summary_df) {
 }
 
 # ---- dataset tables (normalized, content-addressed) -------------------------
-# Datasets are split three ways so identical content is stored once, not per
+# Datasets are split three ways so an identical profile is stored once, not per
 # version: an identity row per (package, name), a per-version link that carries
-# only a small integer content_id, and a content-addressed profile keyed by
-# (content_fp, schema_fp, fp_algo_version) shared across versions AND packages.
-# The heavy row_sketch lives in its own table (kept out of the merge allowlist).
+# only a small integer content_id, and a shared profile keyed by a digest over
+# everything that profile records, shared across versions AND packages. The
+# heavy row_sketch lives in its own table (kept out of the merge allowlist).
+#
+# The key used to be (content_fp, schema_fp, fp_algo_version), and that was a
+# narrower question than the row answers. The analyzer takes both of those
+# digests over the column values alone: content_fp over each column's base type
+# and its cell bytes, schema_fp over each column's name and base type. A
+# factor's labels stand in for its codes, and an attribute written beside the
+# values reaches neither. So two records could agree on the key and disagree
+# about what the reader went on to record, the row could hold only one answer,
+# and the one it held was whichever record the shard reached first. A package
+# was being handed another package's measurement.
+#
+# profile_fp closes that. It is taken in R, here, over every field this row
+# stores, so two profiles that differ in any recorded way are two rows and no
+# dataset can be given a measurement that was taken of another one.
+#
+# content_fp is unchanged and stays a column. It is the user-facing "the same
+# data in N packages" signal and the thing the discovery feature groups on;
+# widening it would change what it means. It is a fingerprint, not the key.
 
 # Columns of a dataset record that describe the data itself, and so belong on
-# the content-addressed row shared by every copy of it. Anything that can differ
-# between two files holding identical bytes is deliberately absent: which file
-# it came from, how it was compressed, which directory it sat in. Putting one of
-# those here would give two identical datasets two content rows and break the
-# dedup the table exists for.
+# the shared profile rather than on the per-version link. Anything that can
+# differ between two files holding identical bytes is deliberately absent:
+# which file it came from, how it was compressed, which directory it sat in.
+# Putting one of those here would give two identical datasets two profile rows
+# and cost the dedup this table exists for.
 #
-# The test of "identical bytes" is the row's own key, (content_fp, schema_fp,
-# fp_algo_version), and the analyzer takes both digests over the column list
-# alone: content_fp over each column's base type and its cell bytes, schema_fp
-# over each column's name and base type. Nothing else in the object reaches
-# either of them. So a field read off an attribute rather than off the values
-# is not a property of the bytes this row is addressed by, however much it
-# reads like one, and it lives on the version link instead. See
-# .DATASET_VERSION_COLS for what that covers and why each one is there.
+# Everything else the reader records about the object is here, whether or not
+# content_fp covers it, because profile_fp does. That includes the fields lifted
+# off attributes rather than off the values: the class chain, the time zone an
+# instant is stored in, the calendar a series is placed on, the projection its
+# coordinates are declared in. Two records that disagree about any of them now
+# take a row each.
 #
 # Types are declared rather than inferred from whatever a shard happens to
 # carry. A shard whose every density is missing would otherwise fix that column
@@ -418,6 +434,67 @@ metrics_fingerprint <- function(summary_df) {
   title = "TEXT"
 )
 
+# The three key fields a profile carries besides its measurements. They are
+# named one by one by the writer rather than declared in .DATASET_CONTENT_COLS,
+# because they are in the table's own CREATE and never arrive by ALTER, but the
+# digest has to cover them: two records with different content_fp must never
+# share a row, which is the guarantee the old key gave and this one keeps.
+.DATASET_CONTENT_KEY_COLS <- c("content_fp", "schema_fp", "fp_algo_version")
+
+#' The digest a profile row is keyed by: one value per record, over every field
+#' that record stores on the profile.
+#'
+#' Taken over the fixed field list rather than over whatever columns the frame
+#' happens to carry. A shard is one analyzer invocation per package and the
+#' frame it produces holds only the fields that package's records mentioned, so
+#' a raster field is a column in a shard that read a raster and absent in one
+#' that did not. Digesting `intersect(spec, names(df))` would give the same
+#' record two different digests in two shards and split the dedup down the
+#' middle. An absent column is read as missing, which is what it stores.
+#'
+#' Encoding, chosen so that a value can only ever hash to itself:
+#'   - missing is `~`, and every present value is its byte length, a colon, and
+#'     its bytes, so no value can impersonate the separator or another field;
+#'   - logicals become integers first, because that is what SQLite stores and
+#'     what the writer converts them to, and a field can arrive from the parser
+#'     as either depending on whether one package's records left it empty;
+#'   - doubles are written to 17 significant digits, which round-trips an IEEE
+#'     double exactly, so two distinct values cannot share a rendering;
+#'   - NaN counts as missing, matching SQLite, which stores it as NULL.
+#'
+#' @param df One row per dataset record, as the writer holds it: after the
+#'   column-profile refusal, so the digest describes what is stored rather than
+#'   what arrived.
+#' @return Character vector of 64-character hex digests, one per row.
+.dataset_profile_fp <- function(df) {
+  n <- nrow(df)
+  if (n == 0L) return(character(0L))
+  fields <- c(.DATASET_CONTENT_KEY_COLS, names(.DATASET_CONTENT_COLS))
+  parts <- vector("list", length(fields))
+  for (i in seq_along(fields)) {
+    v <- df[[fields[i]]]
+    if (is.null(v)) v <- rep(NA, n)
+    if (is.logical(v)) v <- as.integer(v)
+    enc <- if (is.double(v)) {
+      ifelse(is.na(v), NA_character_, sprintf("%.17g", v))
+    } else if (is.character(v)) {
+      enc2utf8(v)
+    } else {
+      as.character(v)
+    }
+    parts[[i]] <- ifelse(is.na(enc), "~",
+                         paste0(nchar(enc, type = "bytes"), ":", enc))
+  }
+  # One row's string at a time. A single column profile runs to
+  # MAX_DATASET_COLUMNS_BYTES, so pasting the whole frame into one vector would
+  # hold a second copy of the heaviest thing in it.
+  vapply(seq_len(n), function(r) {
+    digest::digest(paste0(vapply(parts, function(p) p[[r]], character(1L)),
+                          collapse = ""),
+                   algo = "sha256", serialize = FALSE)
+  }, character(1L))
+}
+
 # Dataset columns that have changed table, named by the table they left.
 #
 # These tables only ever gain columns. A field that moves is added to its new
@@ -536,6 +613,66 @@ metrics_fingerprint <- function(summary_df) {
   invisible(NULL)
 }
 
+#' Put a profile table that was keyed on the fingerprints onto the digest.
+#'
+#' The old key, UNIQUE (content_fp, schema_fp, fp_algo_version), is declared
+#' inline, so SQLite holds it in an automatic index that cannot be dropped. The
+#' table is rebuilt instead: every column it has picked up since, with its
+#' declared type and its NOT NULL, plus profile_fp and the one unique
+#' constraint that now decides what shares a row. content_id is copied as it
+#' stands, because the version links and the sketches name it.
+#'
+#' Rows that predate the digest cannot have one computed for them here: the
+#' fields it is taken over are on the row, but the row is exactly the collapsed
+#' answer the digest exists to stop, so a digest taken over it would be a claim
+#' about which record it came from that nobody can check. They are seeded with
+#' the key they were stored under instead, prefixed so it can never be mistaken
+#' for a digest. Nothing matches them again, and they leave on the first GC
+#' after the links that name them are rewritten, which the generation bump asks
+#' for on every package in the archive.
+#'
+#' A one-time no-op once the column is there.
+.rekey_dataset_contents <- function(con) {
+  if (!"cran_dataset_contents" %in% DBI::dbListTables(con)) return(invisible(NULL))
+  info <- DBI::dbGetQuery(con, "PRAGMA table_info(cran_dataset_contents)")
+  if ("profile_fp" %in% info$name) return(invisible(NULL))
+  # Rebuilt from what the table declares rather than from what this file's
+  # CREATE says, so every column it has picked up by ALTER since keeps its type
+  # and its NOT NULL, and content_id keeps being the rowid the version links
+  # and the sketches name.
+  pk <- info$name[info$pk == 1L]
+  defs <- vapply(seq_len(nrow(info)), function(i) {
+    nm <- info$name[[i]]
+    ty <- if (nzchar(info$type[[i]] %||% "")) info$type[[i]] else "TEXT"
+    sprintf('"%s" %s%s%s', nm, ty,
+            if (isTRUE(info$notnull[[i]] == 1L)) " NOT NULL" else "",
+            if (length(pk) == 1L && identical(nm, pk)) " PRIMARY KEY" else "")
+  }, character(1L))
+  if (length(pk) > 1L) {
+    defs <- c(defs, sprintf("PRIMARY KEY (%s)",
+                            paste(sprintf('"%s"', pk), collapse = ", ")))
+  }
+  cols <- paste(sprintf('"%s"', info$name), collapse = ", ")
+  # A digest is 64 hex characters and this is not one, so a seeded row cannot
+  # collide with a real profile however the fingerprints read.
+  seeded <- if (all(.DATASET_CONTENT_KEY_COLS %in% info$name)) {
+    "'kept from the fingerprint key:' || content_fp || char(31) || schema_fp ||
+     char(31) || fp_algo_version"
+  } else {
+    "'kept from the fingerprint key:' || content_id"
+  }
+  DBI::dbExecute(con, sprintf(
+    'CREATE TABLE cran_dataset_contents_new (%s, "profile_fp" TEXT NOT NULL,
+       UNIQUE ("profile_fp"))', paste(defs, collapse = ", ")))
+  DBI::dbExecute(con, sprintf(
+    'INSERT INTO cran_dataset_contents_new (%s, "profile_fp")
+       SELECT %s, %s FROM cran_dataset_contents', cols, cols, seeded))
+  DBI::dbExecute(con, "DROP TABLE cran_dataset_contents")
+  DBI::dbExecute(con,
+    "ALTER TABLE cran_dataset_contents_new RENAME TO cran_dataset_contents")
+  invisible(NULL)
+}
+
 #' Let a version link stand without a profile behind it.
 #'
 #' cran_dataset_versions.content_id was NOT NULL, which is what made "the
@@ -595,10 +732,12 @@ metrics_fingerprint <- function(summary_df) {
   if (!"cran_dataset_contents" %in% tables) {
     DBI::dbExecute(con, "CREATE TABLE cran_dataset_contents (
       content_id INTEGER PRIMARY KEY,
+      profile_fp TEXT NOT NULL,
       content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
       nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
-      UNIQUE (content_fp, schema_fp, fp_algo_version))")
+      UNIQUE (profile_fp))")
   }
+  .rekey_dataset_contents(con)
   if (!"cran_dataset_sketches" %in% tables) {
     DBI::dbExecute(con, "CREATE TABLE cran_dataset_sketches (
       content_id INTEGER PRIMARY KEY, row_sketch TEXT)")
@@ -613,9 +752,21 @@ metrics_fingerprint <- function(summary_df) {
   # Measured on 110,000 profiles: four and a half minutes with the index put
   # back afterwards, three seconds with it put back here. The rebuild in
   # .relax_dataset_version_content_id takes the table's indexes down with it,
-  # so this is where they come back either way.
+  # so this is where they come back either way, and so does the one in
+  # .rekey_dataset_contents.
   DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_cran_dsv_content ON cran_dataset_versions(content_id)")
   DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_cran_dsc_schema ON cran_dataset_contents(schema_fp)")
+  # The fingerprints used to be the table's unique key, and every reader asking
+  # "which packages ship this data" was served by the index that constraint
+  # carried. profile_fp is the key now, so that index has to be asked for by
+  # name; without it the discovery query is a scan of the whole table. Asked
+  # for only where all three columns are there, the way the schema index above
+  # is: a table stripped to a couple of columns by a restore has nothing here
+  # to index, and refusing to open it over that would be the wrong refusal.
+  if (all(.DATASET_CONTENT_KEY_COLS %in%
+          DBI::dbListFields(con, "cran_dataset_contents"))) {
+    DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_cran_dsc_content ON cran_dataset_contents(content_fp, schema_fp, fp_algo_version)")
+  }
   # After the widening, so a column that has changed table is added to its new
   # home before the copy on the old one goes: the two halves of one move, in
   # the order that never leaves the field homeless. The value it was holding
@@ -750,16 +901,18 @@ metrics_fingerprint <- function(summary_df) {
     flush(stdout())
   }
 
-  # 1. Content-addressed profiles: one INSERT OR IGNORE per distinct fingerprint.
+  # 1. Shared profiles: one INSERT OR IGNORE per distinct profile digest. Taken
+  # here rather than earlier, so it covers the refusal above: a row whose
+  # column profile would not fit stores NA and a refused size, and the digest
+  # says so, because it has to describe what the row holds.
+  df$profile_fp <- .dataset_profile_fp(df)
   ck <- rep(NA_character_, nrow(df))
-  ck[fingerprinted] <- paste(df$content_fp[fingerprinted],
-                             df$schema_fp[fingerprinted],
-                             df$fp_algo_version[fingerprinted], sep = "\x1f")
+  ck[fingerprinted] <- df$profile_fp[fingerprinted]
   cts <- df[fingerprinted & !duplicated(ck), , drop = FALSE]
   df$content_id <- NA_integer_
   if (nrow(cts) > 0L) {
     content_cols <- intersect(names(.DATASET_CONTENT_COLS), names(cts))
-    ins_cols <- c("content_fp", "schema_fp", "fp_algo_version", content_cols)
+    ins_cols <- c("profile_fp", .DATASET_CONTENT_KEY_COLS, content_cols)
     DBI::dbExecute(con,
       sprintf("INSERT OR IGNORE INTO cran_dataset_contents (%s) VALUES (%s)",
               paste(sprintf('"%s"', ins_cols), collapse = ", "),
@@ -769,14 +922,12 @@ metrics_fingerprint <- function(summary_df) {
         if (is.logical(v)) as.integer(v) else v
       }))
 
-    # Resolve content_id for the fingerprints in this shard and attach to every
-    # row that has one. The rest keep NA, which is the whole of what the
-    # content-addressed table can say about them.
+    # Resolve content_id for the profiles in this shard and attach to every row
+    # that has one. The rest keep NA, which is the whole of what the shared
+    # profile table can say about them.
     ids <- DBI::dbGetQuery(con,
-      "SELECT content_id, content_fp, schema_fp, fp_algo_version FROM cran_dataset_contents")
-    key_map <- stats::setNames(
-      ids$content_id,
-      paste(ids$content_fp, ids$schema_fp, ids$fp_algo_version, sep = "\x1f"))
+      "SELECT content_id, profile_fp FROM cran_dataset_contents")
+    key_map <- stats::setNames(ids$content_id, ids$profile_fp)
     df$content_id[fingerprinted] <- unname(key_map[ck[fingerprinted]])
   }
 

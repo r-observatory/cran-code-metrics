@@ -3,12 +3,17 @@
 # Load order: config.R -> git.R -> context.R -> metrics/structure.R -> analyze.R
 # This file does NOT auto-source its dependencies so the caller controls order.
 
-# The fingerprint algorithm's generation. It is part of the uniqueness key on
-# cran_dataset_contents, which is written with INSERT OR IGNORE, so a re-scan of
-# data whose bytes have not changed produces the same content_fp and is silently
-# dropped. Anything that changes what a profile records, rather than what the
-# data is, has to be a new generation or it never reaches the table. Superseded
-# rows are left unreferenced and reclaimed by the contents GC.
+# The fingerprint algorithm's generation. cran_dataset_contents is written with
+# INSERT OR IGNORE against a digest over everything a profile records, and this
+# is one of the fields that digest covers, so a scan under a new generation
+# reaches the table even where the data has not moved. Superseded rows are left
+# unreferenced and reclaimed by the contents GC.
+#
+# The generation stays because it says which reader produced a row, which is
+# not something the row itself reports. A change in what the reader records now
+# lands on its own, because the digest sees it; a change in how it records the
+# same thing still wants a generation, so that the answer a reader gets says
+# where it came from.
 #
 # 2: reads compiled objects, describes sparse matrices, rasters and the object
 #    systems, and follows data()'s own rules for delimited text.

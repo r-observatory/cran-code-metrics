@@ -511,6 +511,138 @@ test_that("two versions of one dataset can differ in how they were stored", {
   expect_equal(got$format_version, c(2L, 3L))
 })
 
+# --- the key a profile is stored under ---------------------------------------
+# content_fp answers "is this the same data", and it is taken over the column
+# values alone: a factor's labels stand in for its codes, an attribute written
+# beside the values reaches it not at all. Two datasets can agree on it and
+# disagree about what the reader went on to record. The profile row holds one
+# answer for both, and the one it holds is whichever record the shard reached
+# first, so a package can be handed another package's measurement.
+#
+# So the profile is keyed on a digest over everything it records instead.
+# content_fp stays exactly what it was, and stays a column: it is the
+# user-facing "the same data in N packages" signal and nothing here redefines
+# it. Two profiles that differ in any recorded way simply get two rows.
+
+test_that("two profiles that record different things get a row each", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  # A bare factor over the same three values, declared in one package with two
+  # levels and in the other with a third nobody uses. The reader hashes the
+  # labels in place of the codes, so both come back under one content_fp, and
+  # they do not hold the same number of levels.
+  a <- .mk_ds_row("aaa", "1.0", TRUE, "C1")
+  b <- .mk_ds_row("zzz", "1.0", TRUE, "C1")
+  a$levels   <- '["a","b"]'; b$levels   <- '["a","b","extra_level"]'
+  a$n_levels <- 2L;          b$n_levels <- 3L
+  DBI::dbWithTransaction(
+    con, .write_datasets_normalized(con, rbind(a, b), c("aaa", "zzz")))
+
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT count(*) n FROM cran_dataset_contents")$n, 2L)
+  got <- DBI::dbGetQuery(con,
+    "SELECT v.package, c.n_levels, c.levels
+       FROM cran_dataset_versions v
+       JOIN cran_dataset_contents c ON c.content_id = v.content_id
+      ORDER BY v.package")
+  expect_equal(got$package, c("aaa", "zzz"))
+  expect_equal(got$n_levels, c(2L, 3L))
+  expect_equal(got$levels, c('["a","b"]', '["a","b","extra_level"]'))
+  # And it is still one dataset shipped twice, which is what content_fp says.
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT count(DISTINCT content_fp) n FROM cran_dataset_contents")$n, 1L)
+})
+
+test_that("the key covers every field the profile stores", {
+  # The point of the digest, asserted field by field rather than by reading the
+  # writer: change any one thing the row records and it is a different row.
+  base <- .mk_ds_row("p", "1.0", TRUE, "C1")
+  for (f in c(.DATASET_CONTENT_KEY_COLS, names(.DATASET_CONTENT_COLS))) {
+    row <- base
+    row[[f]] <- if (f %in% c("fp_algo_version")) 99L else "moved"
+    expect_false(identical(.dataset_profile_fp(row), .dataset_profile_fp(base)),
+                 info = f)
+  }
+  # And a field it does not store leaves it alone: two files holding the same
+  # data under different names are still one profile.
+  same <- base
+  same$file <- "data/elsewhere.rda"
+  same$origin_dir <- "extdata"
+  expect_equal(.dataset_profile_fp(same), .dataset_profile_fp(base))
+})
+
+test_that("a field one shard never mentions does not change the key", {
+  # A shard is one analyzer run per package, and the frame it builds holds only
+  # the fields that package's records mentioned. If the digest were taken over
+  # the columns present rather than over the declared list, the same dataset
+  # would key differently in a shard that read a raster and one that did not,
+  # and the dedup would split down the middle.
+  narrow <- .mk_ds_row("p", "1.0", TRUE, "C1")
+  wide   <- narrow
+  wide$n_layers <- NA_integer_
+  wide$crs_wkt  <- NA_character_
+  expect_equal(.dataset_profile_fp(wide), .dataset_profile_fp(narrow))
+})
+
+test_that("a database keyed on the fingerprints is put onto the digest", {
+  path <- withr::local_tempfile(fileext = ".db")
+  con  <- DBI::dbConnect(RSQLite::SQLite(), path)
+  DBI::dbExecute(con, "CREATE TABLE cran_dataset_contents (
+      content_id INTEGER PRIMARY KEY,
+      content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
+      nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
+      UNIQUE (content_fp, schema_fp, fp_algo_version))")
+  DBI::dbExecute(con, "INSERT INTO cran_dataset_contents
+      (content_id, content_fp, schema_fp, fp_algo_version, nrow, ncol)
+      VALUES (7, 'C1', 'S1', 2, 3, 2)")
+  DBI::dbExecute(con, "CREATE TABLE cran_dataset_versions (
+      package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
+      content_id INTEGER, format TEXT, compression TEXT, confidence TEXT,
+      is_current INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (package, name, version))")
+  DBI::dbExecute(con, "INSERT INTO cran_dataset_versions
+      (package, name, version, content_id, is_current) VALUES ('p','d','1.0',7,1)")
+  DBI::dbDisconnect(con)
+
+  con <- open_or_init_data_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  # The row survives with the id its version link names, and everything it held.
+  got <- DBI::dbGetQuery(con,
+    "SELECT content_id, content_fp, schema_fp, fp_algo_version, nrow, ncol, profile_fp
+       FROM cran_dataset_contents")
+  expect_equal(got$content_id, 7L)
+  expect_equal(got$content_fp, "C1")
+  expect_equal(got$nrow, 3L)
+  # It could not have a digest computed for it: the row is the collapsed answer
+  # the digest exists to prevent, so it is seeded with the key it was stored
+  # under, which no digest can be mistaken for.
+  expect_false(grepl("^[0-9a-f]{64}$", got$profile_fp))
+  expect_true(grepl("C1", got$profile_fp, fixed = TRUE))
+
+  # The old key no longer decides what shares a row.
+  DBI::dbExecute(con, "INSERT INTO cran_dataset_contents
+      (profile_fp, content_fp, schema_fp, fp_algo_version, nrow)
+      VALUES ('other', 'C1', 'S1', 2, 4)")
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT count(*) n FROM cran_dataset_contents")$n, 2L)
+  # And the new one does.
+  expect_error(DBI::dbExecute(con, "INSERT INTO cran_dataset_contents
+      (profile_fp, content_fp, schema_fp, fp_algo_version) VALUES ('other','C9','S9',3)"),
+    "UNIQUE")
+  # The lookup the fingerprints used to get free from being the key.
+  idx <- DBI::dbGetQuery(con,
+    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'cran_dataset_contents'")$name
+  expect_true("idx_cran_dsc_content" %in% idx)
+
+  # A second open changes nothing.
+  DBI::dbDisconnect(con)
+  con <- open_or_init_data_db(path)
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT profile_fp FROM cran_dataset_contents WHERE content_id = 7")$profile_fp,
+    got$profile_fp)
+})
+
 # --- what the fingerprint does not cover -------------------------------------
 # The content row is addressed by (content_fp, schema_fp, fp_algo_version), and
 # the analyzer takes both digests over the column list alone: content_fp over

@@ -310,6 +310,14 @@ test_that("a package read at its newest version and not at an older one settles"
     "SELECT version, attempts FROM cran_analyzer_read_attempts")
   expect_equal(att$version, "1.0")
   expect_gte(att$attempts[[1L]], MAX_ANALYZER_READ_ATTEMPTS)
+
+  # The queues have given the package up, and its datasets are still there:
+  # they come from the newest version, and the newest version was read. What
+  # went unread is an older version's metrics, which is a different gap and
+  # not the one the dataset figures count.
+  expect_equal(.analyzer_read_exhausted(con), "pkgA")
+  expect_identical(.n_datasets_unscanned(con), 0L)
+  expect_identical(.n_datasets_unreadable(con), 0L)
 })
 
 test_that("a package given up on is asked again by the next analyzer build", {

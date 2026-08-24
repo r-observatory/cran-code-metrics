@@ -265,8 +265,31 @@
 #' its own, which is the fact worth publishing. It is what the deliberate slow
 #' convergence costs, and if it climbs, the reader is failing on packages
 #' rather than on one.
+#'
+#' Scoped to the latest-version row, the way .n_datasets_unscanned() and the
+#' dataset queue are, and unlike .analyzer_read_exhausted() beneath it. The
+#' queues give a package up when any one of its versions is at the cap, but a
+#' package whose newest version was read has its datasets: what went unread
+#' there is an older version's metrics, which is a different gap and not this
+#' number's.
+#'
+#' A database holding attempts and no summary rows cannot say which version is
+#' a package's newest, so every package with an exhausted version counts. The
+#' figure is a ceiling there rather than a guess.
 .n_datasets_unreadable <- function(con) {
-  length(.analyzer_read_exhausted(con))
+  exhausted <- .analyzer_read_exhausted(con)
+  if (length(exhausted) == 0L) return(0L)
+  if (!"cran_code_summary" %in% DBI::dbListTables(con)) return(length(exhausted))
+  if (!"latest_release_date" %in% DBI::dbListFields(con, "cran_code_summary")) {
+    return(length(exhausted))
+  }
+  as.integer(DBI::dbGetQuery(con,
+    "SELECT COUNT(DISTINCT a.package) n
+       FROM cran_analyzer_read_attempts a
+       JOIN cran_code_summary s
+         ON s.package = a.package AND s.version = a.version
+      WHERE a.attempts >= ? AND s.latest_release_date IS NOT NULL",
+    params = list(MAX_ANALYZER_READ_ATTEMPTS))$n %||% 0L)
 }
 
 #' Clear the dataset-scan marker on rows produced by a different analyzer build.
@@ -781,9 +804,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       .reset_failure(con, pkg)
       # Analysed, but which versions were read? A version the analyzer did not
       # read carries none of the fields the backfill queues wait on, and that
-      # attempt is what eventually takes its package out of them. Every other
-      # version starts over from nothing, so one bad run does not count against
-      # the next, and so does a version this package no longer has.
+      # attempt is what eventually takes its package out of them. Every version
+      # this run did read starts over from nothing, so one bad run does not
+      # count against the next, and so does one this package no longer has.
       unread <- .analyzer_unread_versions(r$summary, r$binary_versions)
       .clear_analyzer_read_attempts(con, pkg, keep = unread)
       for (v in unread) .record_analyzer_read_attempt(con, pkg, v, analyzer_version)

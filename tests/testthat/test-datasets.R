@@ -572,6 +572,21 @@ test_that("no dataset field the fingerprint leaves out sits on the content row",
   expect_equal(setdiff(.MOVED_OFF_THE_CONTENT_ROW,
                        names(.DATASET_VERSION_COLS)),
                character(0L))
+  # The list above says what the audit found; .DATASET_COLS_THAT_MOVED says
+  # what a database opened from an earlier release has taken off the content
+  # row. A name in one and not the other is a field that either keeps a stale
+  # copy for ever or is deleted with nowhere to go.
+  expect_setequal(.MOVED_OFF_THE_CONTENT_ROW,
+                  .DATASET_COLS_THAT_MOVED$cran_dataset_contents)
+  # And nothing is scheduled for deletion that its own table still declares.
+  for (tbl in names(.DATASET_COLS_THAT_MOVED)) {
+    spec <- switch(tbl,
+                   cran_dataset_contents = .DATASET_CONTENT_COLS,
+                   cran_dataset_versions = .DATASET_VERSION_COLS,
+                   cran_datasets         = .DATASET_IDENTITY_COLS)
+    expect_equal(intersect(.DATASET_COLS_THAT_MOVED[[tbl]], names(spec)),
+                 character(0L), info = tbl)
+  }
 })
 
 test_that("two packages shipping one dataset keep their own answer for what sits beside it", {

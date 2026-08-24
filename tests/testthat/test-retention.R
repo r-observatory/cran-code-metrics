@@ -844,3 +844,200 @@ test_that("update.R refuses through the wording built for the violations", {
   expect_false(grepl("this run would drop history the previous ", src,
                      fixed = TRUE))
 })
+
+# ---------------------------------------------------------------------------
+# The ceiling measures one shard, and a run is many shards
+# ---------------------------------------------------------------------------
+# prev-code-manifest.json is downloaded once per run, by the step before the
+# shard loop, and every shard of that run re-reads that same file. A ceiling
+# read straight off it therefore measures the whole day, however it is
+# calibrated: shard 5 is charged for the packages shards 1 to 4 already failed,
+# published and were passed for. The re-scan behind generation 3 walks 33,000
+# packages over weeks, so a day whose shards each fail a handful is the
+# ordinary shape of it rather than an incident.
+
+# A universe whose clone fails for whatever `failing()` answers at the time the
+# shard asks, so a test can widen an outage between one shard and the next.
+.ret_clone_io <- function(pkgs, failing) list(
+  package_list = function() data.frame(
+    package = pkgs, latest_version = rep("1.0", length(pkgs)),
+    stringsAsFactors = FALSE),
+  clone = function(pkg, dest) {
+    if (pkg %in% failing()) return(FALSE)
+    dir.create(dest, showWarnings = FALSE)
+    TRUE
+  })
+
+# A baseline a small run can be measured against at all: every floor at or
+# below what its first shard publishes, so the only guard these tests leave
+# standing is the ceiling they are about.
+.ret_shard_baseline <- function(failures = 0L) list(
+  schema_version = 1L, series = "code", db_filename = DB_FILENAME,
+  db_bytes = 4096, fingerprint = strrep("e", 64L),
+  n_packages = 1L, n_versions = 1L,
+  tables = list(cran_code_summary = 1L, cran_api_history = 1L,
+                cran_functions = 0L, cran_call_edges = 0L,
+                cran_code_churn = 0L, cran_metrics_failures = failures),
+  bootstrap = list(n_analyzed = 1L, n_universe = 5L, n_remaining = 0L,
+                   bootstrap_complete = FALSE))
+
+# What the shard just published, read where the ceiling reads it.
+.ret_published_failures <- function(out) as.numeric(read_manifest_file(
+  file.path(out, "code-manifest.json"))$tables$cran_metrics_failures)
+
+test_that("shards that each fail a few keep publishing past the day's ceiling", {
+  env <- environment(run_update)
+  old <- .ret_stub_analyze(env)
+  on.exit(assign("analyze_package", old, envir = env), add = TRUE)
+
+  withr::local_envvar(c(PREV_CODE_TAG = "", PREV_DATA_TAG = ""))
+  out <- withr::local_tempdir()
+  write_manifest(file.path(out, "prev-code-manifest.json"), .ret_shard_baseline())
+
+  # Paired packages, p001a failing to clone and p001b analysing, so every
+  # shard below carries collection as well as failures and is therefore a
+  # shard the workflow publishes rather than one it skips.
+  n    <- 130L
+  pkgs <- sort(c(sprintf("p%03da", seq_len(n)), sprintf("p%03db", seq_len(n))))
+  io   <- .ret_clone_io(pkgs, function() sprintf("p%03da", seq_len(n)))
+
+  # The standing pile is said out loud from here on, which is the guard that
+  # covers the creep this one deliberately does not.
+  shard <- function() suppressWarnings(run_update(io, out, shard_size = 150L))
+
+  # Shard 1: 75 of the 150 packages it took would not clone. A bad afternoon,
+  # under the ceiling, published.
+  expect_true(shard()$changed)
+  expect_equal(.ret_published_failures(out), 75)
+
+  # Shard 2 fails 38 packages this run had not failed before, which is well
+  # under the ceiling and is what the ceiling is calibrated for. The day's
+  # total has now passed it.
+  expect_true(shard()$changed)
+  expect_equal(.ret_published_failures(out), 113)
+
+  # Shard 3 adds 17 more, still its own handful.
+  expect_true(shard()$changed)
+  expect_equal(.ret_published_failures(out), 130)
+
+  # And a shard that newly fails nothing at all must not be refused for
+  # standing where the shards before it left the table.
+  expect_no_error(shard())
+  expect_equal(.ret_published_failures(out), 130)
+
+  # The level itself is not silent about any of this: it is reported every
+  # shard, as a warning, which is the half of the design that catches a table
+  # creeping up a few packages at a time.
+  w <- retention_warnings(
+    "code", read_manifest_file(file.path(out, "code-manifest.json")))
+  expect_true(any(grepl("cran_metrics_failures", w, fixed = TRUE)))
+})
+
+test_that("one shard failing past the ceiling is refused however far the run got", {
+  # Measuring a shard cannot become an exemption for the shards after the
+  # first. A run whose second shard really does fail 130 packages at once is
+  # the outage this guard exists for, and moving the baseline must not hide it.
+  env <- environment(run_update)
+  old <- .ret_stub_analyze(env)
+  on.exit(assign("analyze_package", old, envir = env), add = TRUE)
+
+  withr::local_envvar(c(PREV_CODE_TAG = "", PREV_DATA_TAG = ""))
+  out <- withr::local_tempdir()
+  prev <- file.path(out, "prev-code-manifest.json")
+  write_manifest(prev, .ret_shard_baseline())
+
+  pkgs   <- sprintf("p%03d", seq_len(300L))
+  outage <- pkgs[seq_len(20L)]
+  io     <- .ret_clone_io(pkgs, function() outage)
+
+  # A shard with a handful of bad clones in it, published.
+  expect_true(suppressWarnings(run_update(io, out, shard_size = 150L))$changed)
+  expect_equal(.ret_published_failures(out), 20)
+
+  # Then the mirror stops answering, and the next shard fails 130 packages it
+  # had never failed before.
+  outage <- c(outage, pkgs[151:300])
+  msg <- tryCatch({
+    suppressWarnings(run_update(io, out, shard_size = 150L))
+    ""
+  }, error = function(e) conditionMessage(e))
+
+  expect_true(grepl("cran_metrics_failures", msg, fixed = TRUE))
+  # Named against what this shard inherited, so the log says how many packages
+  # this shard failed rather than how many the day has failed.
+  expect_true(grepl("rose to 150 from 20", msg, fixed = TRUE))
+  expect_true(grepl("Nothing was dropped", msg, fixed = TRUE))
+  # And the headline says what was compared. An operator told this shard
+  # failed more than "the previous release" goes looking at a release that had
+  # nothing to do with it, and the 20 in the line above came from this run.
+  expect_true(grepl("than the shard before it", msg, fixed = TRUE))
+  expect_false(grepl("than the previous release did", msg, fixed = TRUE))
+
+  # And the refused shard did not move the baseline on its way out: a re-run
+  # of it has to meet the same ceiling, not one raised by its own failure.
+  expect_equal(
+    as.numeric(read_manifest_file(prev)$tables$cran_metrics_failures), 20)
+})
+
+test_that("the ceiling baseline moves with the shard and nothing else does", {
+  out  <- withr::local_tempdir()
+  path <- file.path(out, "prev-code-manifest.json")
+  write_manifest(path, .ret_shard_baseline(failures = 12L))
+
+  cur <- .ret_shard_baseline(failures = 61L)
+  cur$db_bytes              <- 999
+  cur$n_packages            <- 400L
+  cur$tables$cran_functions <- 7L
+  expect_true(advance_ceiling_baseline(path, "code", cur))
+
+  moved <- read_manifest_file(path)
+  expect_equal(as.numeric(moved$tables$cran_metrics_failures), 61)
+  # Every floor still measures the release the run started from. A shard that
+  # loses rows is refused against yesterday's release, not against whatever
+  # the shard before it happened to hold.
+  expect_equal(as.numeric(moved$n_packages), 1)
+  expect_equal(as.numeric(moved$db_bytes), 4096)
+  expect_equal(as.numeric(moved$tables$cran_functions), 0)
+
+  # The next shard is now measured from where this one left the table.
+  nxt <- .ret_shard_baseline(failures = 61L + 101L)
+  expect_true(length(retention_violations("code", nxt, moved)) > 0L)
+  nxt$tables$cran_metrics_failures <- 61L + 100L
+  expect_identical(retention_violations("code", nxt, moved), character(0L))
+})
+
+test_that("failures that cleared do not buy the next shard a burst", {
+  # The advance runs both ways. A shard that finally analysed 150 failing
+  # packages empties their rows, and a baseline left where the day started
+  # would then let the shard after it fail 130 new ones without a word.
+  out  <- withr::local_tempdir()
+  path <- file.path(out, "prev-code-manifest.json")
+  write_manifest(path, .ret_shard_baseline(failures = 200L))
+
+  expect_true(advance_ceiling_baseline(
+    path, "code", .ret_shard_baseline(failures = 50L)))
+  moved <- read_manifest_file(path)
+  expect_equal(as.numeric(moved$tables$cran_metrics_failures), 50)
+
+  burst <- .ret_shard_baseline(failures = 180L)
+  expect_true(length(retention_violations("code", burst, moved)) > 0L)
+})
+
+test_that("a baseline carrying no failures count is not given one mid-run", {
+  # .ret_at() skips a field the baseline does not carry, which is what keeps
+  # the ceiling off for a release published before the count existed. Writing
+  # one in at shard 1 would switch the guard on at shard 2 of that same run,
+  # measured against a number no release ever published.
+  out  <- withr::local_tempdir()
+  path <- file.path(out, "prev-code-manifest.json")
+  write_manifest(path, .code_manifest_0814())   # no cran_metrics_failures
+  expect_false(advance_ceiling_baseline(
+    path, "code", .ret_shard_baseline(failures = 5000L)))
+  expect_null(read_manifest_file(path)$tables$cran_metrics_failures)
+
+  # A cold start has no baseline at all, and must not be handed one here: the
+  # first release of a series is the one with nothing to compare against.
+  cold <- file.path(out, "prev-data-manifest.json")
+  expect_false(advance_ceiling_baseline(cold, "data", .data_manifest_0814()))
+  expect_false(file.exists(cold))
+})

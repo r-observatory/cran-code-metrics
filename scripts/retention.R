@@ -37,9 +37,16 @@
 # fraction of a small total.
 #
 # One field runs the other way. A check carrying max_gain instead is a CEILING:
-# rows it may gain over the previous release, not rows it may lose. Only
-# cran_metrics_failures has one, because it is the only count here that grows
-# when the pipeline is going wrong rather than when it is working.
+# rows it may gain, not rows it may lose. Only cran_metrics_failures has one,
+# because it is the only count here that grows when the pipeline is going wrong
+# rather than when it is working.
+#
+# The two also measure different spans, and the same downloaded baseline serves
+# both. A floor asks what the previous RELEASE published: rows lost are lost
+# however many shards ago it happened, so every shard of a run is measured
+# against the same release. A ceiling asks what one SHARD failed, which is what
+# its calibration below is written in, and advance_ceiling_baseline() is what
+# makes the number it reads say that.
 .RETENTION_CHECKS <- list(
   code = list(
     # No tolerance. The only paths that remove summary rows are force_full's
@@ -85,11 +92,18 @@
     # nowhere else: the row counts it did not write are not a fall, they are an
     # absence of a rise, and no floor can see that.
     #
-    # 100 is a quarter of a shard. A run that newly fails that many packages
+    # 100 is a quarter of a shard. A shard that newly fails that many packages
     # has something wrong with it rather than a bad day, and publishing it
     # would make its baseline the one tomorrow is measured against.
     #
-    # It is deliberately a per-release ceiling and not an absolute cap. This
+    # A shard, and not a day. The re-scan a new analyzer generation asks for
+    # walks the whole catalog at 400 packages a shard over weeks, so a day
+    # whose shards each fail a handful is what that looks like, and a ceiling
+    # read straight off the downloaded baseline would charge shard 5 for what
+    # shards 1 to 4 already published and were passed for.
+    # advance_ceiling_baseline() is what keeps the span the one written here.
+    #
+    # It is deliberately a per-shard ceiling and not an absolute cap. This
     # table only sheds a package when that package is analysed successfully
     # again, and a package that has failed MAX_CLONE_FAILURES times is excluded
     # from the queue, so its row can never leave on its own. An absolute cap on
@@ -235,7 +249,7 @@ retention_violations <- function(series, current, prior, prior_tag = "",
 # The share of the universe that may sit in cran_metrics_failures before the
 # run says so.
 #
-# The ceiling in .RETENTION_CHECKS compares one release to the next, so a table
+# The ceiling in .RETENTION_CHECKS compares one shard to the next, so a table
 # that creeps up two packages at a time passes it every time, which is exactly
 # how this one reached 200 rows from 3 inside a month with nothing said. The
 # level itself is the other half of that finding, and it is a warning rather
@@ -380,7 +394,7 @@ retention_refusal <- function(violations) {
   }
   if ("ceiling" %in% kinds) {
     headline <- c(headline,
-                  "this run failed far more packages than the previous release did")
+                  "this shard failed far more packages than the shard before it did")
     advice   <- c(advice, retention_failure_advice())
   }
 
@@ -631,6 +645,84 @@ credit_reclaim_to_baseline <- function(path, reclaimed) {
   was <- .ret_at(prior, "db_bytes")
   if (is.null(was)) return(invisible(FALSE))
   prior$db_bytes <- max(0, round(was - reclaimed))
+  jsonlite::write_json(prior, path, auto_unbox = TRUE, pretty = TRUE)
+  invisible(TRUE)
+}
+
+# The paths in a series' checks that carry a ceiling rather than a floor. Read
+# off .RETENTION_CHECKS rather than named here, so a second ceiling added there
+# is measured the same way as the first without anyone remembering this.
+.ret_ceiling_paths <- function(series) {
+  checks <- .RETENTION_CHECKS[[series]]
+  if (is.null(checks)) return(character(0L))
+  has <- vapply(checks, function(chk) !is.null(chk$max_gain), logical(1L))
+  vapply(checks[has], function(chk) chk$path, character(1L))
+}
+
+# Write one dotted path into a parsed manifest. The caller settles whether the
+# field is there to write; this only reaches it.
+.ret_set_at <- function(x, path, value) {
+  parts <- strsplit(path, ".", fixed = TRUE)[[1L]]
+  if (length(parts) == 1L) {
+    x[[parts[[1L]]]] <- value
+    return(x)
+  }
+  x[[parts[[1L]]]] <- .ret_set_at(x[[parts[[1L]]]],
+                                  paste(parts[-1L], collapse = "."), value)
+  x
+}
+
+#' Restate a baseline's ceilings as what the shard that just passed published.
+#'
+#' A floor and a ceiling measure different spans. A floor asks what the
+#' previous RELEASE published, because losing rows is losing them however many
+#' shards ago it happened, and every shard of a run is rightly measured against
+#' the same release. A ceiling asks what one SHARD newly failed: 100 is a
+#' quarter of a shard, and a shard that newly fails that many has something
+#' wrong with it rather than a bad day.
+#'
+#' Nothing made that difference true. prev-*-manifest.json is downloaded once
+#' per run, by the step before the shard loop, and every shard re-reads that
+#' same file, so the ceiling measured the whole day: shard 5 was charged for
+#' the packages shards 1 to 4 already failed, published, and were passed for.
+#' The re-scan behind a new analyzer generation walks the whole catalog over
+#' weeks, so a day whose shards each fail a handful is its ordinary shape, and
+#' a guard that refuses it is a guard that stops the re-scan.
+#'
+#' Moving the baseline forward after each shard passes is what makes the
+#' comparison the one the calibration describes, and it is not an exemption:
+#' the next shard may still fail only max_gain packages more than the table
+#' holds when it starts. It moves down as readily as up, because a shard that
+#' finally analysed a pile of failing packages empties their rows, and a
+#' baseline left where the day started would let the shard after it fail that
+#' many again without a word.
+#'
+#' Written to the downloaded file for the same reason credit_reclaim_to_baseline()
+#' writes there: each shard is a fresh R process, and a run only ever sees a
+#' baseline it downloaded itself, so the restatement expires when the run does.
+#' Only the ceiling fields move. Every floor keeps measuring the release the
+#' run started from, and a baseline that carries no such field is left without
+#' one, so a release published before a count existed keeps the ceiling off for
+#' the whole run rather than switching it on at shard 2.
+#'
+#' @param path    Path to a prev-<series>-manifest.json. An absent file is the
+#'   cold-start case and is not an error.
+#' @param series  "code" or "data".
+#' @param current Manifest the shard just passed the check with.
+#' @return TRUE when the baseline was rewritten, FALSE when there was nothing
+#'   to move.
+advance_ceiling_baseline <- function(path, series, current) {
+  prior <- read_manifest_file(path)
+  if (is.null(prior) || length(prior) == 0L) return(invisible(FALSE))
+  moved <- FALSE
+  for (p in .ret_ceiling_paths(series)) {
+    was <- .ret_at(prior, p)
+    now <- .ret_at(current, p)
+    if (is.null(was) || is.null(now) || was == now) next
+    prior <- .ret_set_at(prior, p, now)
+    moved <- TRUE
+  }
+  if (!moved) return(invisible(FALSE))
   jsonlite::write_json(prior, path, auto_unbox = TRUE, pretty = TRUE)
   invisible(TRUE)
 }

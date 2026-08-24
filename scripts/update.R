@@ -1079,6 +1079,19 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     stop(retention_refusal(violations), call. = FALSE)
   }
 
+  # This shard passed, so it is what the next shard of this run inherits. The
+  # ceilings are calibrated per shard (100 new failures is a quarter of one)
+  # and the baseline they read is downloaded once for the whole run, so
+  # without this the gain is measured over the day: a run of twelve shards
+  # that each fail forty packages is refused at shard three for a burst none
+  # of them had. The floors are deliberately left where they are, still
+  # measuring the release this run started from. After the refusal above, so a
+  # shard that was stopped does not raise the ceiling its re-run has to meet.
+  advance_ceiling_baseline(file.path(out_dir, "prev-code-manifest.json"),
+                           "code", code_manifest)
+  advance_ceiling_baseline(file.path(out_dir, "prev-data-manifest.json"),
+                           "data", data_manifest)
+
   if (length(fresh_pkgs) > 0L) {
     record_changed_packages(file.path(out_dir, "changed-packages.txt"), fresh_pkgs)
   }

@@ -16,7 +16,13 @@
 #    (spread, outliers, sort order, runs of missing values), summarises a grid
 #    along both of its margins rather than over every cell at once, separates
 #    NaN from NA and records which end an infinity runs to, and reads a
-#    broken-down time's fields and the years it spans.
+#    broken-down time's fields and the years it spans. It also stops describing
+#    a wide table column by column: past 512 columns a table of one type is
+#    summarised whole and the array is replaced by that summary, a table of
+#    mixed types keeps every column at four fields, and a table whose values
+#    were never read keeps every column at its name and its type and gives up
+#    its fingerprints. column_detail on the version row says which of the four
+#    this record is.
 FP_ALGO_VERSION <- 3L
 
 #' Registry of metric group functions.

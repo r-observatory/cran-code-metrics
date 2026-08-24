@@ -174,6 +174,27 @@ if (requireNamespace("igraph", quietly = TRUE)) {
 setClass("FixtureThing", representation(x = "numeric"))
 sv(new("FixtureThing", x = c(1, 2, 3)), "an_s4_object")
 
+# ---- how deeply a table's columns get described ----------------------------
+# Past 512 columns the reader stops writing a profile per column, and what it
+# writes instead depends on whether the columns are alike. Past its cell cap it
+# stops reading values at all and keeps only the structure. Each of the three
+# is a different record shape, and the last one carries no fingerprint, so all
+# three have to be reachable or the writer's handling of them is untested.
+#
+# Kept as small as the rule allows: 600 columns is the narrowest thing over the
+# 512 the reader draws the line at, and eight rows is enough to summarise.
+wide <- as.data.frame(matrix(as.numeric(seq_len(600 * 8)), nrow = 8, ncol = 600))
+sv(wide, "wide_one_type")
+
+mixed <- wide
+for (i in seq(1, 600, by = 3)) mixed[[i]] <- paste0("s", mixed[[i]])
+sv(mixed, "wide_mixed_types")
+
+# 9,000,000 rows in 202 bytes: R writes 1:n as a compact sequence, and the
+# reader reads its length and skips its values, which is the whole point of
+# this fixture. Nothing here is ever materialised.
+sv(data.frame(a = 1:9000000, b = 1:9000000), "unread_values")
+
 # ---- text files under data/ -----------------------------------------------
 # data() loads a .csv or a .txt as readily as an .rda, and the extension is a
 # promise about the separator that the contents need not keep. The reader says

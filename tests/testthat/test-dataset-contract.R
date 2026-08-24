@@ -88,15 +88,18 @@
       invisible(NULL)
     }
     n_records <- 0L
+    depths <- character(0L)
     for (line in out) {
       rec <- tryCatch(jsonlite::fromJSON(line, simplifyVector = FALSE),
                       error = function(e) NULL)
       if (is.null(rec) || !identical(rec[["rec"]], "dataset")) next
       n_records <- n_records + 1L
       top <- union(top, names(rec))
+      depths <- union(depths, as.character(rec[["column_detail"]]))
       for (k in c("columns", "elements")) walk(rec[[k]])
     }
-    cached <<- list(top = top, nested = nested, n_records = n_records)
+    cached <<- list(top = top, nested = nested, n_records = n_records,
+                    depths = depths)
     cached
   }
 })
@@ -161,6 +164,22 @@ test_that("the fixture reaches the shapes only one object can reach", {
       "unexercised one: ", paste(unreached, collapse = ", "),
       ". Restore the shape in fixtures/dataset-contract/make.R rather than ",
       "exempting the column."))
+})
+
+test_that("the fixture reaches every depth a column list can be written at", {
+  keys <- .contract_setup()
+  # Three of the four change what the rest of the record means, and the fourth
+  # decides whether the record reaches the tables at all: a structural record
+  # carries no fingerprint, and the writer has to keep it anyway. A fixture set
+  # that only ever produces `full` would let all of that go untested.
+  unreached <- sort(setdiff(c("full", "reduced", "none", "structural"),
+                            keys$depths))
+  expect_identical(
+    unreached, character(0L),
+    info = paste0(
+      "no object in the fixture package makes the analyzer write a column ",
+      "list at these depths: ", paste(unreached, collapse = ", "),
+      ". Restore the shape in fixtures/dataset-contract/make.R."))
 })
 
 test_that("every dataset field the analyzer emits is declared by a column spec", {

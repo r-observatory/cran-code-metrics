@@ -502,6 +502,133 @@ test_that("two versions of one dataset can differ in how they were stored", {
   expect_equal(got$format_version, c(2L, 3L))
 })
 
+# --- how deeply a version's columns were read --------------------------------
+# Past 512 columns the reader stops describing them one by one, and past its
+# cell cap it stops reading their values at all. Which of the four it did is
+# the legend for everything else on the record: at `none` there is no columns
+# array and the whole-object figures stand in for it, at `reduced` each entry
+# carries four fields and no col_fp, and at `structural` an entry is a name and
+# a type because no value was read. A reader holding the array without the
+# legend cannot tell an object with nothing to say from one that was not asked.
+
+test_that("a version says at what depth its dataset's columns were read", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  row <- .mk_ds_row("p", "1.0", TRUE, "C1")
+  row$column_detail <- "reduced"
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, row, "p"))
+
+  expect_equal(
+    DBI::dbGetQuery(con, "SELECT column_detail FROM cran_dataset_versions")$column_detail,
+    "reduced")
+  # Not on the content row. One of the four depths belongs to records that
+  # have no content row at all, so the contents table cannot hold the column
+  # without being NULL for that depth for good.
+  expect_false("column_detail" %in% DBI::dbListFields(con, "cran_dataset_contents"))
+})
+
+test_that("a dataset the reader could not fingerprint keeps its place in the catalog", {
+  # A frame with a column past the cell cap has its values skipped, so it comes
+  # back with its shape, its column names and no fingerprints at all. The
+  # writer dropped every record with no content fingerprint, so the whole
+  # dataset left the catalog: no identity row, no version link, nothing saying
+  # the package ships it.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  read   <- .mk_ds_row("p", "1.0", TRUE, "C1", name = "small")
+  read$column_detail   <- "full"
+  unread <- .mk_ds_row("p", "1.0", TRUE, NA_character_, name = "huge")
+  unread$schema_fp     <- NA_character_
+  unread$shape_fp      <- NA_character_
+  unread$row_sketch    <- NA_character_
+  unread$nrow          <- 9000000L
+  unread$confidence    <- "degraded"
+  unread$notes         <- "value scan skipped (size cap)"
+  unread$column_detail <- "structural"
+  # And the run says how many it kept that way, because a catalog entry with
+  # nothing behind it is a coverage figure and a shard where the number climbs
+  # is the reader losing objects it used to measure.
+  expect_output(
+    DBI::dbWithTransaction(
+      con, .write_datasets_normalized(con, rbind(read, unread), "p")),
+    "kept 1 dataset with no profile")
+
+  ident <- DBI::dbGetQuery(con, "SELECT name FROM cran_datasets ORDER BY name")
+  expect_equal(ident$name, c("huge", "small"))
+
+  got <- DBI::dbGetQuery(con,
+    "SELECT name, content_id, confidence, notes, column_detail
+       FROM cran_dataset_versions ORDER BY name")
+  expect_equal(got$name, c("huge", "small"))
+  # No profile to point at, and the row says why rather than pointing at
+  # somebody else's: a fingerprint the reader did not take cannot be invented
+  # without telling two objects it never compared that they are the same data.
+  expect_true(is.na(got$content_id[[1L]]))
+  expect_false(is.na(got$content_id[[2L]]))
+  expect_equal(got$confidence[[1L]], "degraded")
+  expect_equal(got$notes[[1L]], "value scan skipped (size cap)")
+  expect_equal(got$column_detail[[1L]], "structural")
+
+  # And only the fingerprinted one has a profile.
+  expect_equal(
+    DBI::dbGetQuery(con, "SELECT count(*) n FROM cran_dataset_contents")$n, 1L)
+})
+
+test_that("the profile GC is not stopped by a version link with no profile", {
+  # NOT IN over a column holding a NULL is NULL for every row, so one
+  # unfingerprinted dataset anywhere in the table would quietly retire the GC
+  # and the contents table would grow without bound.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  unread <- .mk_ds_row("q", "1.0", TRUE, NA_character_, name = "huge")
+  unread$schema_fp <- NA_character_
+  DBI::dbWithTransaction(con, .write_datasets_normalized(
+    con, rbind(.mk_ds_row("p", "1.0", TRUE, "C1"), unread), c("p", "q")))
+  # p's data changes, orphaning the profile it used to point at.
+  DBI::dbWithTransaction(con, .write_datasets_normalized(
+    con, .mk_ds_row("p", "1.1", TRUE, "C2"), "p"))
+  expect_equal(
+    DBI::dbGetQuery(con, "SELECT count(*) n FROM cran_dataset_contents")$n, 2L)
+
+  .gc_dataset_contents(con)
+  expect_equal(
+    DBI::dbGetQuery(con, "SELECT content_fp FROM cran_dataset_contents")$content_fp, "C2")
+})
+
+test_that("a database whose version links must name a profile is given one that need not", {
+  # The published database carries the NOT NULL, so the record that has no
+  # profile to name has to become writable under a run that opens an older
+  # release rather than only in one built from nothing.
+  path <- withr::local_tempfile(fileext = ".db")
+  con  <- DBI::dbConnect(RSQLite::SQLite(), path)
+  DBI::dbExecute(con, "CREATE TABLE cran_dataset_versions (
+      package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
+      content_id INTEGER NOT NULL, format TEXT, compression TEXT, confidence TEXT,
+      is_current INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (package, name, version))")
+  DBI::dbExecute(con, "ALTER TABLE cran_dataset_versions ADD COLUMN notes TEXT")
+  DBI::dbExecute(con, "INSERT INTO cran_dataset_versions
+      (package, name, version, content_id, format, is_current, notes)
+      VALUES ('p', 'kept', '1.0', 7, 'rda', 1, 'from before')")
+  DBI::dbDisconnect(con)
+
+  con <- open_or_init_data_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  # The rows that were there are still there, columns and all.
+  kept <- DBI::dbGetQuery(con, "SELECT * FROM cran_dataset_versions")
+  expect_equal(kept$name, "kept")
+  expect_equal(kept$content_id, 7L)
+  expect_equal(kept$notes, "from before")
+  # And a link with nothing behind it is now writable.
+  expect_silent(DBI::dbExecute(con, "INSERT INTO cran_dataset_versions
+      (package, name, version, content_id, format, is_current)
+      VALUES ('p', 'huge', '1.0', NULL, 'rda', 1)"))
+  # The rebuild takes the table's indexes down with it, so they have to come
+  # back or every join onto a profile turns into a scan.
+  expect_true("idx_cran_dsv_content" %in%
+    DBI::dbGetQuery(con, "SELECT name FROM sqlite_master WHERE type = 'index'")$name)
+})
+
 test_that("what the analyzer describes reaches the tables that hold it", {
   # Every one of these was read, carried through the frame, and then dropped at
   # the write because the column list had not heard of it. A scan that costs

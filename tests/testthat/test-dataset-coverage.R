@@ -88,6 +88,74 @@ test_that("dataset_coverage_alerts stays quiet on an empty table", {
   expect_identical(dataset_coverage_alerts(dataset_column_coverage(con)), character(0L))
 })
 
+test_that("the marker on a list the reader cut short is one of the columns watched", {
+  # The defect this canary exists for, in the form it actually took. The
+  # analyzer emits levels_truncated and the writer used to drop it, so the
+  # column would be declared and empty in every release; the canary is what
+  # says so out loud rather than letting it read as an honest NA.
+  row <- .mk_cov_row()
+  row$levels_truncated <- TRUE
+  con <- .cov_con(row)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  cov <- dataset_column_coverage(con)
+  pick <- function(col) cov[cov$table == "cran_dataset_contents" & cov$column == col, ]
+  expect_equal(pick("levels_truncated")$measured, 1L)
+  # Its sibling is watched too, and this row does not carry it, so it is named.
+  expect_true(any(grepl("cran_dataset_contents.level_counts_truncated",
+                        dataset_coverage_alerts(cov), fixed = TRUE)))
+})
+
+test_that(".dataset_fields_dropped names a field the frame carries and no table takes", {
+  # The other direction, and the one the fixture-driven contract test cannot
+  # reach: a field the reader emits for a shape no fixture package builds is
+  # invisible to that test, arrives in the frame anyway on the real archive,
+  # and is dropped by the writer's intersect against the specs without a word.
+  # That is exactly how the two truncation markers were lost. This is asked of
+  # the records themselves, so a shape nobody thought to build is still seen
+  # the first time a package in the archive has one.
+  row <- .mk_cov_row()
+  expect_identical(.dataset_fields_dropped(row), character(0L))
+
+  row$something_the_reader_started_saying <- 1L
+  expect_identical(.dataset_fields_dropped(row),
+                   "something_the_reader_started_saying")
+})
+
+test_that(".dataset_fields_dropped leaves the writer's own columns alone", {
+  # The identity and file fields are named one by one in the writer's INSERT
+  # lists rather than declared in a spec, and the sketch has a table of its
+  # own. None of them is dropped, so none of them is a finding.
+  row <- .mk_cov_row()
+  for (f in c("package", "version", "is_current", "name", "file", "internal",
+              "format", "compression", "confidence", "content_fp", "schema_fp",
+              "fp_algo_version", "row_sketch")) {
+    expect_true(f %in% names(row), info = f)
+  }
+  expect_identical(.dataset_fields_dropped(row), character(0L))
+})
+
+test_that("the writer says out loud which fields it had to drop", {
+  row <- .mk_cov_row()
+  row$a_new_marker <- TRUE
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  out <- capture.output(
+    DBI::dbWithTransaction(con, .write_datasets_normalized(con, row, "p")))
+  expect_true(any(grepl("a_new_marker", out, fixed = TRUE)))
+  # And the row is still written: a field with no home is a thing to report,
+  # never a reason to lose the dataset.
+  expect_equal(DBI::dbGetQuery(con, "SELECT count(*) n FROM cran_datasets")$n, 1L)
+})
+
+test_that("the writer is quiet when every field has a home", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  out <- capture.output(
+    DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_cov_row(), "p")))
+  expect_false(any(grepl("no column", out, fixed = TRUE)))
+})
+
 test_that("build_manifest carries the count of columns nobody fills", {
   row <- .mk_cov_row()
   con <- .cov_con(row)

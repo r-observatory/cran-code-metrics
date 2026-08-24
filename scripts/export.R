@@ -409,6 +409,41 @@ metrics_fingerprint <- function(summary_df) {
 # share a row, which is the guarantee the old key gave and this one keeps.
 .DATASET_CONTENT_KEY_COLS <- c("content_fp", "schema_fp", "fp_algo_version")
 
+# Fields of a dataset record that no spec declares and that are stored anyway.
+# Each is in a table's own CREATE and addressed by name in the writer's INSERT
+# lists, rather than arriving by ALTER the way a spec column does, so none of
+# them is at risk of the drop below. profile_fp and content_id are on the list
+# because the writer puts them on the frame as it goes.
+.DATASET_WRITER_COLS <- c(
+  "package", "version", "is_current",
+  "name", "file", "internal", "format", "compression", "confidence",
+  "row_sketch", "profile_fp", "content_id")
+
+#' Fields a dataset frame carries that nothing will store.
+#'
+#' The writer routes a record into the three tables by name, and a field no
+#' spec claims is computed by the reader, carried across the fork and then
+#' dropped on the way into SQLite without a word. The contract test holds the
+#' specs to what the reader emits, but it can only compare against fields a
+#' fixture package provokes: a field that arrives only for a shape no fixture
+#' builds is invisible there, which is how the two markers that say a level
+#' list is a window came to be dropped for as long as they were.
+#'
+#' This is the same question asked of the records themselves. It costs a set
+#' difference over column names, once per shard, and it is asked of every
+#' package in the archive rather than of fifty objects, so a shape nobody
+#' thought to build is seen the first time one is scanned.
+#'
+#' @param df One row per dataset record, as the reader handed it over.
+#' @return Sorted names, or character(0) when every field has a home.
+.dataset_fields_dropped <- function(df) {
+  if (is.null(df) || is.null(names(df))) return(character(0L))
+  sort(setdiff(names(df),
+               c(.DATASET_WRITER_COLS, .DATASET_CONTENT_KEY_COLS,
+                 names(.DATASET_CONTENT_COLS), names(.DATASET_VERSION_COLS),
+                 names(.DATASET_IDENTITY_COLS))))
+}
+
 #' The digest a profile row is keyed by: one value per record, over every field
 #' that record stores on the profile.
 #'
@@ -986,6 +1021,22 @@ metrics_fingerprint <- function(summary_df) {
   .delete_by_package(con, "cran_dataset_versions", pkgs)
   .delete_by_package(con, "cran_datasets",         pkgs)
   if (is.null(df) || nrow(df) == 0L) return(invisible(NULL))
+
+  # What the reader measured and no table has a column for. Said before the
+  # writer touches the frame, so it describes what arrived. A field with no
+  # home is reported and not refused: the rest of the record is still true and
+  # the dataset still belongs in the catalog.
+  dropped <- .dataset_fields_dropped(df)
+  if (length(dropped) > 0L) {
+    shown <- head(dropped, 20L)
+    cat(sprintf("no column for %d field%s the reader sent: %s%s\n",
+                length(dropped), if (length(dropped) == 1L) "" else "s",
+                paste(shown, collapse = ", "),
+                if (length(dropped) > length(shown))
+                  sprintf(" and %d more", length(dropped) - length(shown)) else ""),
+        file = stdout())
+    flush(stdout())
+  }
 
   df$fp_algo_version <- as.integer(df$fp_algo_version)
   df$internal        <- as.integer(df$internal)

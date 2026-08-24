@@ -15,6 +15,14 @@
 # every object under fixtures/dataset-contract/pkg/data is there to make one
 # family of fields come back, and fixtures/dataset-contract/make.R regenerates
 # them.
+#
+# It has one blind spot, and it is the whole of what this file can do about it:
+# a field that arrives only for a shape no fixture builds is a field this test
+# never sees. That is how the two markers saying a level list is a window were
+# dropped for as long as they were, so the specs are held to the real archive
+# as well as to this corpus. .dataset_fields_dropped() names a field the frame
+# carries and no table takes, on every shard, and dataset_column_coverage()
+# names a declared column no package in the release fills.
 
 .contract_fixture_pkg <- function() {
   test_path("fixtures", "dataset-contract", "pkg")

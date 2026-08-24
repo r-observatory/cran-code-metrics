@@ -129,6 +129,24 @@ VACUUM_MIN_RECLAIM_BYTES <- 64 * 1024^2
 # not at wide data.
 MAX_DATASET_COLUMNS_BYTES <- 4 * 1024^2
 
+# What the catalog says beside a dataset the reader took no measurement of.
+#
+# Such a record keeps its place in the catalog with no profile behind it, and
+# the confidence and the note on its version link are the whole of what can be
+# said about it. Neither said it. The analyzer's confidence is about the file
+# it opened rather than about the values inside it, so these records arrive
+# calling themselves `exact` with no note (an rda holding no object) or
+# `degraded` with one (an S4 class the reader has no representation for, an R
+# script only R can run), and `degraded` claims a part was read where no part
+# was. One value for all of them, so a reader can ask the question once, with
+# whatever the analyzer did say kept after the note as the reason.
+#
+# `unmeasured` is a value the deployed viewer has never seen, which is the
+# point: it renders the confidence as text and compares it against `exact`
+# alone, so an unfamiliar value reads as not-exact, which is true.
+DATASET_UNMEASURED_CONFIDENCE <- "unmeasured"
+DATASET_UNMEASURED_NOTE <- "no fingerprint was taken, so this record has no profile"
+
 # VACUUM builds the compacted database beside the original and then copies it
 # back over it under a rollback journal, so at its peak the file exists about
 # twice over on top of itself. Ask for that much free space and skip the

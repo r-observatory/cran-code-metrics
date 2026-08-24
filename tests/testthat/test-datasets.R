@@ -958,8 +958,12 @@ test_that("a dataset the reader could not fingerprint keeps its place in the cat
   # without telling two objects it never compared that they are the same data.
   expect_true(is.na(got$content_id[[1L]]))
   expect_false(is.na(got$content_id[[2L]]))
-  expect_equal(got$confidence[[1L]], "degraded")
-  expect_equal(got$notes[[1L]], "value scan skipped (size cap)")
+  # `degraded` is what the reader called it, and it says a part of the object
+  # was read. No part of it was, so the link says that instead and keeps the
+  # reader's own words after it as the reason.
+  expect_equal(got$confidence[[1L]], "unmeasured")
+  expect_true(grepl("no profile", got$notes[[1L]], fixed = TRUE))
+  expect_true(grepl("value scan skipped (size cap)", got$notes[[1L]], fixed = TRUE))
 
   # And only the fingerprinted one has a profile, so only it carries a depth.
   # A record with nothing behind it carries no depth either: confidence and
@@ -1011,7 +1015,125 @@ test_that("a dataset read only for its structure is told apart from one nobody c
   expect_equal(got$name, c("generated", "tall"))
   expect_true(is.na(got$content_id[[1L]]))
   expect_false(is.na(got$content_id[[2L]]))
-  expect_equal(got$notes, rep("value scan skipped (size cap)", 2L))
+  # The reader gave both the same words, and they no longer read the same: the
+  # one with a profile keeps them, and the one without carries them as the
+  # reason it has none. Which is the second place these two are told apart.
+  expect_equal(got$notes[[2L]], "value scan skipped (size cap)")
+  expect_true(grepl("no profile", got$notes[[1L]], fixed = TRUE))
+  expect_true(grepl("value scan skipped (size cap)", got$notes[[1L]], fixed = TRUE))
+  expect_equal(got$confidence, c("unmeasured", "degraded"))
+})
+
+test_that("a record with no profile does not reach the catalog calling itself exact", {
+  # The reader's confidence is about the file it opened, not about the values
+  # inside it. DAAG ships data/dumpdata.rda, an rda holding no object at all,
+  # and v0.4.0 describes it as class `object`, length 0, confidence `exact`,
+  # with no note. Nothing about that record was measured, and it arrives here
+  # with no fingerprint, so it gets no profile row and its version link names
+  # nobody. `exact` beside an empty content_id tells a reader the object was
+  # read through and the catalog simply has nothing to show, which is the
+  # opposite of what happened.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  read <- .mk_ds_row("DAAG", "1.25", TRUE, "C1", name = "ais")
+  none <- .mk_ds_row("DAAG", "1.25", TRUE, NA_character_, name = "dumpdata")
+  none$schema_fp  <- NA_character_
+  none$shape_fp   <- NA_character_
+  none$row_sketch <- NA_character_
+  none$class      <- "object"
+  none$kind       <- "object"
+  none$nrow       <- NA_integer_
+  none$ncol       <- NA_integer_
+  none$length     <- 0L
+  none$confidence <- "exact"
+  none$notes      <- NA_character_
+  expect_output(
+    DBI::dbWithTransaction(
+      con, .write_datasets_normalized(con, rbind(read, none), "DAAG")),
+    "kept 1 dataset with no profile")
+
+  got <- DBI::dbGetQuery(con,
+    "SELECT name, content_id, confidence, notes
+       FROM cran_dataset_versions ORDER BY name")
+  expect_equal(got$name, c("ais", "dumpdata"))
+  expect_true(is.na(got$content_id[[2L]]))
+  # Not exact, and not silent: the two fields beside the empty content_id are
+  # the whole of what the catalog can say about this record, so they have to
+  # say that nothing was read rather than leaving the reader to infer it from
+  # an absence.
+  expect_false(identical(got$confidence[[2L]], "exact"))
+  expect_true(nzchar(got$notes[[2L]] %||% ""))
+  expect_false(is.na(got$notes[[2L]]))
+
+  # And the record beside it, which the reader did measure, keeps the answer
+  # the reader gave: this states what was not read, it does not restate what
+  # was.
+  expect_false(is.na(got$content_id[[1L]]))
+  expect_equal(got$confidence[[1L]], "exact")
+  expect_true(is.na(got$notes[[1L]]))
+})
+
+test_that("what the reader did say about a record it could not measure is kept", {
+  # Three shapes reach this path carrying a note of their own, and each names a
+  # different reason: an R script under data/ that only R can run, an S4 object
+  # the reader holds no representation for, and a file whose values were
+  # skipped and whose columns hold no bytes to hash. Saying there is no profile
+  # must not cost the reason there is none.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  rows <- list(
+    list(name = "CAex",  conf = "needs_r",  note = "R script data (requires R)"),
+    list(name = "DE_RB", conf = "degraded", note = "s4-assay-dims"),
+    list(name = "gen",   conf = "degraded", note = "value scan skipped (size cap)"))
+  df <- do.call(rbind, lapply(rows, function(r) {
+    row <- .mk_ds_row("p", "1.0", TRUE, NA_character_, name = r$name)
+    row$schema_fp  <- NA_character_
+    row$shape_fp   <- NA_character_
+    row$row_sketch <- NA_character_
+    row$confidence <- r$conf
+    row$notes      <- r$note
+    row
+  }))
+  expect_output(
+    DBI::dbWithTransaction(con, .write_datasets_normalized(con, df, "p")),
+    "kept 3 datasets with no profile")
+
+  got <- DBI::dbGetQuery(con,
+    "SELECT name, confidence, notes FROM cran_dataset_versions ORDER BY name")
+  expect_equal(got$name, c("CAex", "DE_RB", "gen"))
+  # One answer for every record nothing was measured on, whatever the reader
+  # called it on the way in. `degraded` says part of it was read, and on these
+  # rows no part of it was.
+  expect_equal(length(unique(got$confidence)), 1L)
+  expect_false("degraded" %in% got$confidence)
+  expect_false("needs_r" %in% got$confidence)
+  # And each keeps the reason the reader gave.
+  expect_true(grepl("requires R", got$notes[[1L]], fixed = TRUE))
+  expect_true(grepl("s4-assay-dims", got$notes[[2L]], fixed = TRUE))
+  expect_true(grepl("size cap", got$notes[[3L]], fixed = TRUE))
+})
+
+test_that("a shard where nothing carried a note still says what was not read", {
+  # The dataset frame carries whatever fields the records in front of it
+  # mentioned, so a shard in which no record had a note has no notes column at
+  # all. The note is the half of this that cannot be inferred from anywhere
+  # else, so it has to be written even when there is nothing to write it
+  # beside.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  none <- .mk_ds_row("p", "1.0", TRUE, NA_character_, name = "d")
+  none$schema_fp  <- NA_character_
+  none$shape_fp   <- NA_character_
+  none$row_sketch <- NA_character_
+  none$notes      <- NULL
+  expect_output(
+    DBI::dbWithTransaction(con, .write_datasets_normalized(con, none, "p")),
+    "kept 1 dataset with no profile")
+
+  got <- DBI::dbGetQuery(con,
+    "SELECT confidence, notes FROM cran_dataset_versions")
+  expect_false(identical(got$confidence[[1L]], "exact"))
+  expect_true(nzchar(got$notes[[1L]] %||% ""))
 })
 
 test_that("the profile GC is not stopped by a version link with no profile", {

@@ -693,9 +693,10 @@ metrics_fingerprint <- function(summary_df) {
   # comes back with no fingerprints, so there is no profile row for it to point
   # at and none can be invented without telling two objects that were never
   # compared that they hold the same data. The link still says the package
-  # ships this dataset at this version, and confidence and notes beside it say
-  # what was and was not read. How many links stand like this is published in
-  # the manifest.
+  # ships this dataset at this version, and confidence and notes beside it are
+  # made to say that nothing was measured, by the writer rather than by the
+  # reader: see DATASET_UNMEASURED_CONFIDENCE. How many links stand like this
+  # is published in the manifest.
   if (!"cran_dataset_versions" %in% tables) {
     DBI::dbExecute(con, "CREATE TABLE cran_dataset_versions (
       package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
@@ -858,12 +859,37 @@ metrics_fingerprint <- function(summary_df) {
   # never compared on one row whenever the little that is known about them
   # agrees, and the page that row feeds says "the same data in N packages".
   # They get the identity row and the version link, with no content_id, and
-  # confidence and notes beside it say what was read and what was not. How many
-  # of them there are is published in the manifest, because a catalog entry
-  # with nothing behind it is a coverage figure and a shard where the number
-  # climbs is the reader losing objects it used to measure.
+  # confidence and notes beside it are rewritten just below to say that nothing
+  # was measured. How many of them there are is published in the manifest,
+  # because a catalog entry with nothing behind it is a coverage figure and a
+  # shard where the number climbs is the reader losing objects it used to
+  # measure.
   fingerprinted <- !is.na(df$content_fp) & nzchar(df$content_fp)
   if (any(!fingerprinted)) {
+    # The two fields that are supposed to say what was and was not read do not
+    # say it on their own. The reader's confidence is about the file it opened
+    # rather than about the values inside it, so a record it took no
+    # measurement of can arrive here calling itself `exact` with no note at
+    # all: DAAG ships data/dumpdata.rda, an rda holding no object, and the
+    # analyzer describes it as an object of length 0, exact, unremarked. Others
+    # arrive `degraded`, which says part of it was read when no part of it was.
+    # Beside an empty content_id every one of them reads as a dataset the
+    # catalog happens to be quiet about rather than as one nothing measured.
+    #
+    # So the writer states it, once, in the same words whatever the record is:
+    # the confidence becomes the one value that means no measurement was taken,
+    # and the note says there is no profile. Whatever the reader did manage to
+    # say is kept after it, because that is the reason there is none and it is
+    # the part this cannot reconstruct. Rows that were fingerprinted are not
+    # touched: this says what was not read, it does not restate what was.
+    if (!"notes" %in% names(df)) df$notes <- NA_character_
+    df$notes <- as.character(df$notes)
+    had <- !is.na(df$notes) & nzchar(df$notes)
+    keep <- !fingerprinted & had
+    df$notes[!fingerprinted & !had] <- DATASET_UNMEASURED_NOTE
+    df$notes[keep] <- paste0(DATASET_UNMEASURED_NOTE, ": ", df$notes[keep])
+    df$confidence[!fingerprinted] <- DATASET_UNMEASURED_CONFIDENCE
+
     # Said out loud for the same reason the refusal above is: a dataset in the
     # catalog with nothing behind it is a coverage figure, and a shard where
     # that number climbs is the reader losing objects it used to measure.

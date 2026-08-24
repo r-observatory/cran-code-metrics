@@ -199,25 +199,27 @@ metrics_fingerprint <- function(summary_df) {
 # those here would give two identical datasets two content rows and break the
 # dedup the table exists for.
 #
+# The test of "identical bytes" is the row's own key, (content_fp, schema_fp,
+# fp_algo_version), and the analyzer takes both digests over the column list
+# alone: content_fp over each column's base type and its cell bytes, schema_fp
+# over each column's name and base type. Nothing else in the object reaches
+# either of them. So a field read off an attribute rather than off the values
+# is not a property of the bytes this row is addressed by, however much it
+# reads like one, and it lives on the version link instead. See
+# .DATASET_VERSION_COLS for what that covers and why each one is there.
+#
 # Types are declared rather than inferred from whatever a shard happens to
 # carry. A shard whose every density is missing would otherwise fix that column
 # as text for good, and the column would then read back as text forever.
 .DATASET_CONTENT_COLS <- c(
-  class = "TEXT", kind = "TEXT", nrow = "INTEGER", ncol = "INTEGER",
+  nrow = "INTEGER", ncol = "INTEGER",
   length = "INTEGER", n_cols = "INTEGER", n_unique = "INTEGER",
-  n_missing_total = "INTEGER", columns = "TEXT", has_rownames = "INTEGER",
+  n_missing_total = "INTEGER", columns = "TEXT",
   shape_fp = "TEXT",
-  dim = "TEXT", n_dim = "INTEGER", has_dimnames = "INTEGER",
+  dim = "TEXT", n_dim = "INTEGER",
   n_stored = "INTEGER", n_cells = "INTEGER", density = "REAL",
-  matrix_value_type = "TEXT", matrix_shape = "TEXT", matrix_storage = "TEXT",
-  matrix_uplo = "TEXT", matrix_diag = "TEXT",
-  ts_start = "REAL", ts_end = "REAL", ts_frequency = "REAL", frequency = "REAL",
-  index_start = "TEXT", index_end = "TEXT", index_n = "INTEGER", index_class = "TEXT",
   geom_type = "TEXT", is_geometry = "INTEGER", n_geometries = "INTEGER",
-  is_spatial = "INTEGER",
-  crs_input = "TEXT", crs_epsg = "INTEGER", crs_wkt = "TEXT", bbox = "TEXT",
-  n_layers = "INTEGER", object_system = "TEXT", s4_package = "TEXT",
-  label = "TEXT", comment = "TEXT", units = "TEXT", attrs_other = "TEXT",
+  is_spatial = "INTEGER", bbox = "TEXT",
 
   # What a column or a grid holds, on the same terms summary() reports it.
   type = "TEXT", mean = "REAL", median = "REAL", q1 = "REAL", q3 = "REAL",
@@ -234,37 +236,27 @@ metrics_fingerprint <- function(summary_df) {
   max_missing_run = "INTEGER",
   summary_over = "TEXT",
 
-  # Written down beside the values rather than computed from them.
+  # A factor's labels, which the reader hashes in place of the codes, so two
+  # factors over the same labels are the same bytes and these are the same
+  # answer. Whether those labels are ranked is not: that is in the class chain,
+  # and it sits on the version link.
   levels = "TEXT", n_levels = "INTEGER", level_counts = "TEXT",
-  is_factor = "INTEGER", is_ordered = "INTEGER",
-
-  # Which kind of table, and how it is keyed and grouped.
-  frame_class = "TEXT", is_grouped = "INTEGER",
-  dt_key = "TEXT", dt_indices = "TEXT",
-  group_vars = "TEXT", n_groups = "INTEGER",
+  is_factor = "INTEGER",
 
   # What a list holds. The inner row count is the one that matters: a nested
-  # table reports its group count as its rows.
-  element_names = "TEXT", element_class = "TEXT", element_classes = "TEXT",
+  # table reports its group count as its rows. The names of the slots and of a
+  # nested frame's columns are not here: the schema digest is taken over a
+  # frame's columns and never descends into a list.
+  element_class = "TEXT", element_classes = "TEXT",
   element_len_min = "INTEGER", element_len_max = "INTEGER",
   element_len_total = "INTEGER", max_depth = "INTEGER",
-  inner_nrow_total = "INTEGER", inner_ncol = "INTEGER", inner_names = "TEXT",
+  inner_nrow_total = "INTEGER", inner_ncol = "INTEGER",
   inner_schema_varies = "INTEGER",
 
-  # The labels along the margins of a grid, without which a table of counts
-  # cannot be read.
-  dimnames = "TEXT",
-
-  # How evenly a series is observed.
-  ts_span = "REAL", index_span = "REAL", index_tz = "TEXT",
-  index_delta = "REAL", index_regular = "INTEGER",
-  index_n_gaps = "INTEGER", index_max_gap = "REAL",
-  index_sorted = "INTEGER", index_has_duplicates = "INTEGER",
-
-  # Spatial and raster detail.
+  # Where a geometry column's coordinates reach and what shape they draw. Read
+  # off the coordinates, which are hashed; the projection they are declared in
+  # is not, and sits on the version link.
   geom_dimension = "TEXT", n_empty = "INTEGER",
-  resolution = "TEXT", nodata_value = "REAL", in_memory = "INTEGER",
-  layer_names = "TEXT", layer_min = "TEXT", layer_max = "TEXT",
 
   # Which kind of missing, and which end an infinity runs to. Both are
   # column-level too and ride in the columns JSON; these are for the objects
@@ -282,8 +274,6 @@ metrics_fingerprint <- function(summary_df) {
   # A list's elements profiled the way a frame's columns are, in the same
   # shape, so one renderer serves both.
   elements = "TEXT",
-  # dplyr's rowwise state, which was in the class chain and never recorded.
-  is_rowwise = "INTEGER",
 
   # Per element rather than reduced across the list. The aggregates cannot say
   # how big any one slot was, which is the question a list of folds raises.
@@ -304,12 +294,6 @@ metrics_fingerprint <- function(summary_df) {
   # they draw as nothing, so a list of ten with four of them empty is not the
   # list its length says it is.
   n_empty_slots = "INTEGER",
-  # The time zone an instant is stored in. It belongs to the object rather than
-  # to the file: the same moment written in two zones reads as two different
-  # local times. index_tz above it is the zone of a series' index, which is a
-  # different field on a different kind of object, and declaring one was not
-  # declaring the other.
-  tz = "TEXT",
 
   # How deeply this profile's columns were read: full, reduced, none or
   # structural. It is the legend for the rest of the row. At `none` there is no
@@ -339,11 +323,81 @@ metrics_fingerprint <- function(summary_df) {
 # The same table saved twice can differ in all of these: R's serialization
 # format has versions, and version 3 cannot be read by R before 3.5.0, so this
 # is the difference between a dataset a reader can open and one they cannot.
+#
+# And everything the content row's key does not cover. That key is
+# (content_fp, schema_fp, fp_algo_version), and both digests are taken over the
+# column list alone: content_fp over each column's base type and its cell
+# bytes, schema_fp over each column's name and base type. A field the reader
+# lifts off an attribute instead reaches neither, so two records that share a
+# content row can disagree about it, and the content row can hold only one
+# answer. The writer keeps the first, decided by a sort on
+# (package, name, version, internal), so the answer a reader gets would be
+# whichever dataset the shard happened to reach first. Every group below was
+# demonstrated by building two objects over the same values under different
+# attributes and watching them come back with one pair of digests and two
+# answers.
 .DATASET_VERSION_COLS <- c(
   format_version = "INTEGER", compressed_bytes = "INTEGER", notes = "TEXT",
   # A file that is not what its name says: which separator would work, and how
   # many columns it would give. A property of this file, not of the data.
-  delimiter_looks_like = "TEXT", delimiter_would_give_ncol = "INTEGER"
+  delimiter_looks_like = "TEXT", delimiter_would_give_ncol = "INTEGER",
+
+  # The class chain, and what is read out of it. A data.frame and a tibble of
+  # the same columns are one fingerprint, and so are an S4 object of one class
+  # and an S4 object of another over the same slot values.
+  class = "TEXT", kind = "TEXT", frame_class = "TEXT",
+  object_system = "TEXT", s4_package = "TEXT",
+
+  # Labels along the margins. Neither row names nor dimnames are hashed, so a
+  # frame with named rows and one without are the same bytes.
+  has_rownames = "INTEGER", has_dimnames = "INTEGER", dimnames = "TEXT",
+
+  # How a Matrix declares itself. Two triangular matrices holding the same x
+  # differ only in uplo; a general and a symmetric one differ only in class.
+  matrix_value_type = "TEXT", matrix_shape = "TEXT", matrix_storage = "TEXT",
+  matrix_uplo = "TEXT", matrix_diag = "TEXT",
+
+  # The calendar a series is placed on. Its observations are hashed; the tsp
+  # attribute and the index vector beside them are not, so the same four
+  # numbers are a 1980 monthly series and a 2000 quarterly one at once.
+  ts_start = "REAL", ts_end = "REAL", ts_frequency = "REAL",
+  ts_span = "REAL", frequency = "REAL",
+  index_start = "TEXT", index_end = "TEXT", index_n = "INTEGER",
+  index_class = "TEXT", index_span = "REAL", index_tz = "TEXT",
+  index_delta = "REAL", index_regular = "INTEGER",
+  index_n_gaps = "INTEGER", index_max_gap = "REAL",
+  index_sorted = "INTEGER", index_has_duplicates = "INTEGER",
+
+  # The projection coordinates are declared in. The coordinates themselves are
+  # hashed, so the extent and the geometry counts stay on the profile; which
+  # datum they are read against does not reach the digest at all.
+  crs_input = "TEXT", crs_epsg = "INTEGER", crs_wkt = "TEXT",
+
+  # A raster's bands and their metadata, all of it read off slots.
+  n_layers = "INTEGER", resolution = "TEXT", nodata_value = "REAL",
+  in_memory = "INTEGER", layer_names = "TEXT",
+  layer_min = "TEXT", layer_max = "TEXT",
+
+  # Written down beside the values rather than computed from them, the time
+  # zone included: the same moment stored in two zones is the same bytes and
+  # two different local times.
+  label = "TEXT", comment = "TEXT", units = "TEXT", attrs_other = "TEXT",
+  tz = "TEXT",
+
+  # Whether a factor's levels are ranked. The labels are hashed in place of the
+  # codes and the ranking is in the class chain, so an ordered factor and a
+  # plain one over the same labels are one fingerprint.
+  is_ordered = "INTEGER",
+
+  # Grouping and keying state, all of it in attributes. A grouped tibble and
+  # the tibble it was grouped from hold the same columns.
+  is_grouped = "INTEGER", group_vars = "TEXT", n_groups = "INTEGER",
+  is_rowwise = "INTEGER", dt_key = "TEXT", dt_indices = "TEXT",
+
+  # Names of things the schema digest never sees. It is taken over a frame's
+  # columns and never descends, so a list's slot names and the column names of
+  # a frame nested inside one are outside it.
+  element_names = "TEXT", inner_names = "TEXT"
 )
 
 # Where a dataset was found. Not a property of its contents: the same data can
@@ -370,7 +424,24 @@ metrics_fingerprint <- function(summary_df) {
 # version, content_id and every other field the writer names one by one, and a
 # migration that dropped those would empty the database.
 .DATASET_COLS_THAT_MOVED <- list(
-  cran_dataset_versions = c("column_detail")
+  cran_dataset_versions = c("column_detail"),
+  cran_dataset_contents = c(
+    "class", "kind", "frame_class", "object_system", "s4_package",
+    "has_rownames", "has_dimnames", "dimnames",
+    "matrix_value_type", "matrix_shape", "matrix_storage", "matrix_uplo",
+    "matrix_diag",
+    "ts_start", "ts_end", "ts_frequency", "ts_span", "frequency",
+    "index_start", "index_end", "index_n", "index_class", "index_span",
+    "index_tz", "index_delta", "index_regular", "index_n_gaps",
+    "index_max_gap", "index_sorted", "index_has_duplicates",
+    "crs_input", "crs_epsg", "crs_wkt",
+    "n_layers", "resolution", "nodata_value", "in_memory", "layer_names",
+    "layer_min", "layer_max",
+    "label", "comment", "units", "attrs_other", "tz",
+    "is_ordered",
+    "is_grouped", "group_vars", "n_groups", "is_rowwise",
+    "dt_key", "dt_indices",
+    "element_names", "inner_names")
 )
 
 #' Drop the copy a moved dataset column left behind on the table it came from.
@@ -386,7 +457,16 @@ metrics_fingerprint <- function(summary_df) {
   for (tbl in names(.DATASET_COLS_THAT_MOVED)) {
     if (!tbl %in% present) next
     gone <- setdiff(.DATASET_COLS_THAT_MOVED[[tbl]], names(specs[[tbl]]))
-    for (col in intersect(gone, DBI::dbListFields(con, tbl))) {
+    drop <- intersect(gone, DBI::dbListFields(con, tbl))
+    if (!length(drop)) next
+    # SQLite rewrites every row once per dropped column, so on a published
+    # database this is minutes rather than milliseconds, once. Said out loud
+    # because a run that stops here otherwise looks like a run that hung.
+    cat(sprintf("moving %d column%s off %s: %s\n", length(drop),
+                if (length(drop) == 1L) "" else "s", tbl,
+                paste(drop, collapse = ", ")), file = stdout())
+    flush(stdout())
+    for (col in drop) {
       DBI::dbExecute(con, sprintf('ALTER TABLE "%s" DROP COLUMN "%s"', tbl, col))
     }
   }
@@ -472,7 +552,7 @@ metrics_fingerprint <- function(summary_df) {
     DBI::dbExecute(con, "CREATE TABLE cran_dataset_contents (
       content_id INTEGER PRIMARY KEY,
       content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
-      class TEXT, kind TEXT, nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
+      nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
       UNIQUE (content_fp, schema_fp, fp_algo_version))")
   }
   if (!"cran_dataset_sketches" %in% tables) {

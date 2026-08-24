@@ -1381,9 +1381,9 @@ upsert_datasets <- function(data_con, datasets_df, pkgs) {
 #' @param stat_table  Table to probe for stat_cols.
 #' @param stat_cols   Character vector of numeric columns to summarise.
 #' @param bootstrap   list(n_analyzed, n_universe, n_remaining,
-#'   bootstrap_complete, n_datasets_unscanned, n_datasets_unreadable).
-#'   n_universe/n_remaining, n_datasets_unscanned and n_datasets_unreadable may
-#'   be NULL, in which case they are left out.
+#'   bootstrap_complete, n_datasets_unscanned, n_datasets_unreadable,
+#'   n_datasets_unmeasured). n_universe/n_remaining and the three dataset
+#'   counts may be NULL, in which case they are left out.
 #' @param coverage    Optional frame from dataset_column_coverage(). When given,
 #'   the manifest carries how many declared columns hold nothing for anybody,
 #'   so the finding outlives the run that made it. NULL leaves the block out,
@@ -1481,7 +1481,15 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
       # down as the backfill drains and this one does not, so it is the one
       # that says what the corpus is missing for good, until a build that can
       # read them arrives.
-      n_datasets_unreadable = bootstrap$n_datasets_unreadable
+      n_datasets_unreadable = bootstrap$n_datasets_unreadable,
+      # How many datasets are in the catalog with nothing behind them: the
+      # reader described them and could not fingerprint them, so they have an
+      # identity row and a version link and no profile. Unlike the two counts
+      # above it is per dataset rather than per package, and the table count
+      # beside it in this same file is its denominator. It is here rather than
+      # only in a line the shard prints because that line scrolls away with the
+      # run, and a shard where this number jumps is the one worth seeing.
+      n_datasets_unmeasured = bootstrap$n_datasets_unmeasured
     )
   )
 

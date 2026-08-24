@@ -260,3 +260,43 @@ test_that("a dataset with no profile does not unsettle the manifest fingerprint"
   expect_identical(with_null$n_packages, 3L)
   expect_identical(with_null$n_versions, 3L)
 })
+
+test_that("the bootstrap block counts the datasets the reader could not measure", {
+  # A catalog entry with no profile behind it: the reader described the file
+  # and could not fingerprint it, so it keeps its identity row and its version
+  # link and gets none. An S4 object with no reader, a raster packed into
+  # bytes, an .R script under data/, a compressed archive data() will not open.
+  # That is a coverage figure, not a row count, and a shard where it climbs is
+  # the reader losing objects it used to measure. It only lived in a line the
+  # shard printed, which scrolls away with the run.
+  db  <- withr::local_tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), db); on.exit(DBI::dbDisconnect(con))
+  .ensure_dataset_tables(con)
+  DBI::dbExecute(con,
+    "INSERT INTO cran_dataset_versions (package, name, version, content_id, is_current)
+     VALUES ('a', 'd', '1.0', 1, 1),
+            ('b', 'e', '1.0', NULL, 1),
+            ('c', 'f', '1.0', NULL, 1)")
+
+  expect_identical(.n_datasets_unmeasured(con), 2L)
+
+  m <- build_manifest(
+    con, series = "data", repo = "r-observatory/cran-code-metrics",
+    db_filename = "cran-data-metrics.db", db_bytes = 4096L,
+    tables = "cran_dataset_versions",
+    fp_table = "cran_datasets", fp_cols = c("package", "name", "current_content_id"),
+    pkg_table = "cran_datasets", ver_table = "cran_dataset_versions",
+    stat_table = "cran_dataset_contents", stat_cols = character(0L),
+    bootstrap = list(n_analyzed = 3L, n_universe = 3L, n_remaining = 0L,
+                     bootstrap_complete = TRUE, n_datasets_unmeasured = 2L))
+
+  expect_identical(m$bootstrap$n_datasets_unmeasured, 2L)
+  # The denominator is beside it in the same file: the links the table holds.
+  expect_identical(m$tables$cran_dataset_versions, 3L)
+})
+
+test_that("a database with no dataset links counts nothing unmeasured", {
+  db  <- withr::local_tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), db); on.exit(DBI::dbDisconnect(con))
+  expect_identical(.n_datasets_unmeasured(con), 0L)
+})

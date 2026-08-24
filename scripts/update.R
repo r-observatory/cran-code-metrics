@@ -292,6 +292,32 @@
     params = list(MAX_ANALYZER_READ_ATTEMPTS))$n %||% 0L)
 }
 
+#' How many datasets are in the catalog with no profile behind them.
+#'
+#' A dataset the analyzer described and could not fingerprint keeps its identity
+#' row and its version link and gets no profile row, because a profile invented
+#' for it would put two objects that were never compared on the row that says
+#' "the same data in N packages". That is the right answer and it is also a
+#' coverage figure: an S4 object with no reader, a raster packed into bytes, an
+#' .R script under data/, a compressed archive data() will not open, a frame
+#' whose every column is a generated sequence. A shard where the number climbs
+#' is the reader losing objects it used to measure.
+#'
+#' Taken over every version link rather than the current ones alone, because a
+#' version that stopped being measurable is the same finding as a package that
+#' never was, and the denominator beside it in the manifest is the count of
+#' links the same table holds.
+#'
+#' Reads the dataset database, not the code one. Zero where the link table does
+#' not exist yet, which is a database built from nothing before its first write.
+#'
+#' @return Count of version links naming no profile.
+.n_datasets_unmeasured <- function(con) {
+  if (!"cran_dataset_versions" %in% DBI::dbListTables(con)) return(0L)
+  as.integer(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM cran_dataset_versions WHERE content_id IS NULL")$n %||% 0L)
+}
+
 #' Clear the dataset-scan marker on rows produced by a different analyzer build.
 #'
 #' The marker records that a package was scanned, not what scanned it, so after
@@ -961,7 +987,11 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                     n_remaining = length(remaining_after),
                     bootstrap_complete = bootstrap_complete,
                     n_datasets_unscanned = .n_datasets_unscanned(con),
-                    n_datasets_unreadable = .n_datasets_unreadable(con))
+                    n_datasets_unreadable = .n_datasets_unreadable(con),
+                    # The dataset database, not the code one: this is the only
+                    # figure in the block counted per dataset rather than per
+                    # package, and it is counted where the datasets are.
+                    n_datasets_unmeasured = .n_datasets_unmeasured(data_con))
   code_db_bytes <- as.numeric(file.info(db_path)$size %||% 0)
   data_db_bytes <- as.numeric(file.info(data_db_path)$size %||% 0)
 

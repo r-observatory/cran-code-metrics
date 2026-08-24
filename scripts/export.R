@@ -604,11 +604,37 @@ metrics_fingerprint <- function(summary_df) {
 #' after the links that name them are rewritten, which the generation bump asks
 #' for on every package in the archive.
 #'
+#' The whole rebuild runs inside a savepoint. CREATE, INSERT, DROP and RENAME
+#' are four statements and nothing tied them together, so a run killed between
+#' them left the rebuild table in the file, and the next run met its own
+#' leftover on the CREATE and stopped. So did every run after it, permanently,
+#' on a pipeline that keeps its state in its own release asset. Inside a
+#' savepoint an interrupted run leaves the file exactly as it found it.
+#'
+#' A savepoint and not a transaction: this is also reached from inside the
+#' writer's own transaction, where a second BEGIN is an error.
+#'
 #' A one-time no-op once the column is there.
 .rekey_dataset_contents <- function(con) {
   if (!"cran_dataset_contents" %in% DBI::dbListTables(con)) return(invisible(NULL))
   info <- DBI::dbGetQuery(con, "PRAGMA table_info(cran_dataset_contents)")
   if ("profile_fp" %in% info$name) return(invisible(NULL))
+  DBI::dbExecute(con, "SAVEPOINT rekey_dataset_contents")
+  done <- FALSE
+  on.exit({
+    if (!done) {
+      try(DBI::dbExecute(con, "ROLLBACK TO rekey_dataset_contents"), silent = TRUE)
+    }
+    try(DBI::dbExecute(con, "RELEASE rekey_dataset_contents"), silent = TRUE)
+  }, add = TRUE)
+
+  # A rebuild table from a run that died before this was atomic. The guard
+  # above has already established that the real table is here and still carries
+  # the old key, so this is an abandoned attempt and not the only copy of
+  # anything. Only ever dropped on that footing: were the original the one
+  # missing, this function returns above and leaves the leftover alone.
+  DBI::dbExecute(con, "DROP TABLE IF EXISTS cran_dataset_contents_new")
+
   # Rebuilt from what the table declares rather than from what this file's
   # CREATE says, so every column it has picked up by ALTER since keeps its type
   # and its NOT NULL, and content_id keeps being the rowid the version links
@@ -643,6 +669,7 @@ metrics_fingerprint <- function(summary_df) {
   DBI::dbExecute(con, "DROP TABLE cran_dataset_contents")
   DBI::dbExecute(con,
     "ALTER TABLE cran_dataset_contents_new RENAME TO cran_dataset_contents")
+  done <- TRUE
   invisible(NULL)
 }
 
@@ -655,6 +682,10 @@ metrics_fingerprint <- function(summary_df) {
 #' and every row, come across untouched. The index it carries is recreated by
 #' the caller.
 #'
+#' Held together the same way the profile re-key is, and for the same reason:
+#' four untied statements leave a rebuild table behind on a run that is killed
+#' between them, and every run after it stops on the leftover.
+#'
 #' A one-time no-op once the constraint is gone.
 .relax_dataset_version_content_id <- function(con) {
   if (!"cran_dataset_versions" %in% DBI::dbListTables(con)) return(invisible(NULL))
@@ -665,6 +696,18 @@ metrics_fingerprint <- function(summary_df) {
   if (length(sql) != 1L || is.na(sql) || !grepl(notnull, sql, fixed = TRUE)) {
     return(invisible(NULL))
   }
+  DBI::dbExecute(con, "SAVEPOINT relax_dataset_versions")
+  done <- FALSE
+  on.exit({
+    if (!done) {
+      try(DBI::dbExecute(con, "ROLLBACK TO relax_dataset_versions"), silent = TRUE)
+    }
+    try(DBI::dbExecute(con, "RELEASE relax_dataset_versions"), silent = TRUE)
+  }, add = TRUE)
+  # The guard above has established that the real table is here and still
+  # carries the constraint, so anything under this name is an abandoned
+  # attempt.
+  DBI::dbExecute(con, "DROP TABLE IF EXISTS cran_dataset_versions_new")
   cols   <- paste(sprintf('"%s"', DBI::dbListFields(con, "cran_dataset_versions")),
                   collapse = ", ")
   create <- sub(notnull, "content_id INTEGER", sql, fixed = TRUE)
@@ -677,6 +720,7 @@ metrics_fingerprint <- function(summary_df) {
   DBI::dbExecute(con, "DROP TABLE cran_dataset_versions")
   DBI::dbExecute(con,
     "ALTER TABLE cran_dataset_versions_new RENAME TO cran_dataset_versions")
+  done <- TRUE
   invisible(NULL)
 }
 

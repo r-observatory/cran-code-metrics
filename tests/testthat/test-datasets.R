@@ -657,6 +657,106 @@ test_that("a database keyed on the fingerprints is put onto the digest", {
     got$profile_fp)
 })
 
+# A database in the shape the published one is in: the old key on the contents
+# table, and a version table whose links must name a profile. Both rebuilds run
+# on the first open of it.
+.mk_old_key_db <- function(path, rows = 5L) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbExecute(con, "CREATE TABLE cran_dataset_contents (
+      content_id INTEGER PRIMARY KEY,
+      content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
+      nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
+      UNIQUE (content_fp, schema_fp, fp_algo_version))")
+  DBI::dbExecute(con, "CREATE TABLE cran_dataset_versions (
+      package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
+      content_id INTEGER NOT NULL, format TEXT, compression TEXT, confidence TEXT,
+      is_current INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (package, name, version))")
+  for (i in seq_len(rows)) {
+    DBI::dbExecute(con,
+      "INSERT INTO cran_dataset_contents
+         (content_id, content_fp, schema_fp, fp_algo_version, nrow, columns)
+         VALUES (?, ?, ?, 2, ?, ?)",
+      params = list(i, paste0("C", i), paste0("S", i), i,
+                    sprintf('[{"name":"a%d","type":"integer"}]', i)))
+    DBI::dbExecute(con,
+      "INSERT INTO cran_dataset_versions (package, name, version, content_id, is_current)
+         VALUES ('p', ?, '1.0', ?, 1)", params = list(paste0("d", i), i))
+  }
+  path
+}
+
+test_that("a re-key that died part-way through leaves a database that still opens", {
+  # The rebuild is a CREATE, a copy, a DROP and a RENAME, and nothing tied them
+  # together. A run killed between them leaves the rebuild table in the file,
+  # and the next run meets its own leftover on the CREATE and stops. So does
+  # every run after it: the database never migrates, and a pipeline that keeps
+  # its state in its own release asset never publishes again.
+  path <- withr::local_tempfile(fileext = ".db")
+  .mk_old_key_db(path)
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  DBI::dbExecute(con, "CREATE TABLE cran_dataset_contents_new (
+      content_id INTEGER PRIMARY KEY, content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL,
+      fp_algo_version INTEGER NOT NULL, nrow INTEGER, ncol INTEGER,
+      n_missing_total INTEGER, columns TEXT, profile_fp TEXT NOT NULL,
+      UNIQUE (profile_fp))")
+  DBI::dbExecute(con, "INSERT INTO cran_dataset_contents_new
+      (content_id, content_fp, schema_fp, fp_algo_version, profile_fp)
+      VALUES (1, 'C1', 'S1', 2, 'half written')")
+  DBI::dbDisconnect(con)
+
+  con <- open_or_init_data_db(path)
+  on.exit(DBI::dbDisconnect(con))
+  expect_true("profile_fp" %in% DBI::dbListFields(con, "cran_dataset_contents"))
+  # Every row of the real table, and none of the abandoned attempt's.
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM cran_dataset_contents")$n, 5L)
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM cran_dataset_contents WHERE profile_fp = 'half written'")$n, 0L)
+  expect_false("cran_dataset_contents_new" %in% DBI::dbListTables(con))
+})
+
+test_that("a version table rebuilt part-way through leaves a database that still opens", {
+  # The same four untied statements relax the NOT NULL on the version links,
+  # and they wedge the same way.
+  path <- withr::local_tempfile(fileext = ".db")
+  .mk_old_key_db(path)
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  DBI::dbExecute(con, "CREATE TABLE cran_dataset_versions_new (
+      package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
+      content_id INTEGER, format TEXT, compression TEXT, confidence TEXT,
+      is_current INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (package, name, version))")
+  DBI::dbDisconnect(con)
+
+  con <- open_or_init_data_db(path)
+  on.exit(DBI::dbDisconnect(con))
+  sql <- DBI::dbGetQuery(con, "SELECT sql FROM sqlite_master
+      WHERE type = 'table' AND name = 'cran_dataset_versions'")$sql
+  expect_false(grepl("content_id INTEGER NOT NULL", sql, fixed = TRUE))
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM cran_dataset_versions")$n, 5L)
+  expect_false("cran_dataset_versions_new" %in% DBI::dbListTables(con))
+})
+
+test_that("the re-key holds together from inside the writer's own transaction", {
+  # The writer opens a transaction and the migration runs under it, so the
+  # rebuild cannot open one of its own: a second BEGIN is an error and would
+  # take the shard down on the one run that matters. A savepoint nests, which
+  # is what makes the rebuild all of it or none of it here as well.
+  path <- withr::local_tempfile(fileext = ".db")
+  .mk_old_key_db(path)
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con))
+  expect_silent(DBI::dbWithTransaction(con, {
+    .write_datasets_normalized(con, .mk_ds_row("q", "1.0", TRUE, "C9"), "q")
+  }))
+  expect_true("profile_fp" %in% DBI::dbListFields(con, "cran_dataset_contents"))
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM cran_dataset_contents")$n, 6L)
+})
+
 # --- what the reader records beside the values -------------------------------
 # content_fp is taken over the column values alone: a factor's labels stand in
 # for its codes, and an attribute written beside the values reaches it not at

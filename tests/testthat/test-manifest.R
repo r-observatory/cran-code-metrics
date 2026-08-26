@@ -171,3 +171,132 @@ test_that("an empty but present fp_table yields a stable 64-hex fingerprint with
   expect_identical(m$fingerprint, digest::digest("", algo = "sha256", serialize = FALSE))
   expect_identical(m$fingerprint, db_fingerprint(con))
 })
+
+test_that("the bootstrap block counts the packages no dataset scan ever reached", {
+  # bootstrap_complete answers a different question: it is about the code
+  # analysis, and it reads true while packages sit permanently without a
+  # dataset scan. Two of the three below are in that state and nothing said so.
+  db <- withr::local_tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), db); on.exit(DBI::dbDisconnect(con))
+  DBI::dbWriteTable(con, "cran_code_summary", data.frame(
+    package = c("a", "a", "b", "c"),
+    version = c("1.0", "1.1", "2.0", "3.0"),
+    latest_release_date = c(NA, "2026-01-01", "2026-01-02", "2026-01-03"),
+    datasets_scanned = c(NA, 1L, NA, NA),
+    stringsAsFactors = FALSE))
+
+  expect_identical(.n_datasets_unscanned(con), 2L)
+
+  m <- build_manifest(
+    con, series = "code", repo = "r-observatory/cran-code-metrics",
+    db_filename = "cran-code-metrics.db", db_bytes = 4096L,
+    tables = "cran_code_summary",
+    fp_table = "cran_code_summary", fp_cols = c("package", "version"),
+    pkg_table = "cran_code_summary", ver_table = "cran_code_summary",
+    stat_table = "cran_code_summary", stat_cols = character(0L),
+    bootstrap = list(n_analyzed = 3L, n_universe = 3L, n_remaining = 0L,
+                     bootstrap_complete = TRUE, n_datasets_unscanned = 2L))
+
+  expect_true(m$bootstrap$bootstrap_complete)
+  expect_identical(m$bootstrap$n_datasets_unscanned, 2L)
+})
+
+test_that("a database with no dataset marker at all counts every package as unscanned", {
+  # The column arrives on the first write that carries it, so before that run
+  # nothing in the database has been scanned and the count has to say so
+  # rather than reading zero.
+  db <- withr::local_tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), db); on.exit(DBI::dbDisconnect(con))
+  DBI::dbWriteTable(con, "cran_code_summary", data.frame(
+    package = c("a", "b"), version = c("1.0", "2.0"),
+    latest_release_date = c("2026-01-01", "2026-01-02"),
+    stringsAsFactors = FALSE))
+
+  expect_identical(.n_datasets_unscanned(con), 2L)
+})
+
+test_that("a dataset with no profile does not unsettle the manifest fingerprint", {
+  # cran_datasets.current_content_id is part of the data series' fingerprint
+  # key, and it is NULL for every dataset the reader could not fingerprint: an
+  # S4 object it holds no representation for, a packed raster, an R script, a
+  # frame whose one column is a generated sequence. The digest is what tells
+  # the pipeline whether a run changed anything, so a NULL that renders
+  # differently from one call to the next would report a change on every run
+  # for ever, and a NULL that renders as some content_id would hide a real one.
+  mk <- function(ids, pkgs = c("a", "b", "c")) {
+    db <- withr::local_tempfile(fileext = ".db", .local_envir = parent.frame())
+    con <- DBI::dbConnect(RSQLite::SQLite(), db)
+    withr::defer(DBI::dbDisconnect(con), envir = parent.frame())
+    DBI::dbWriteTable(con, "cran_datasets", data.frame(
+      package = pkgs, name = rep("d", length(pkgs)),
+      current_content_id = ids, stringsAsFactors = FALSE))
+    DBI::dbWriteTable(con, "cran_dataset_versions", data.frame(
+      package = pkgs, content_id = ids, stringsAsFactors = FALSE))
+    build_manifest(
+      con, series = "data", repo = "r-observatory/cran-code-metrics",
+      db_filename = "cran-data-metrics.db", db_bytes = 4096L,
+      tables = c("cran_datasets", "cran_dataset_versions"),
+      fp_table = "cran_datasets",
+      fp_cols = c("package", "name", "current_content_id"),
+      pkg_table = "cran_datasets", ver_table = "cran_dataset_versions",
+      stat_table = "cran_dataset_contents", stat_cols = c("nrow", "ncol"),
+      bootstrap = list(n_analyzed = 3L, n_universe = 3L, n_remaining = 0L,
+                       bootstrap_complete = TRUE))
+  }
+
+  with_null <- mk(c(1L, NA_integer_, 3L))
+  expect_true(grepl("^[0-9a-f]{64}$", with_null$fingerprint))
+  # Same database, same answer: the run that follows this one has to be able to
+  # see that nothing moved.
+  expect_identical(mk(c(1L, NA_integer_, 3L))$fingerprint, with_null$fingerprint)
+  # And a profile arriving where there was none is a change, not a no-op.
+  expect_false(identical(mk(c(1L, 2L, 3L))$fingerprint, with_null$fingerprint))
+  # So is the dataset itself arriving or leaving. A key that skipped the rows
+  # naming no profile would read the same either way, and those are exactly the
+  # rows this pipeline just stopped dropping.
+  expect_false(identical(mk(c(1L, 3L), c("a", "c"))$fingerprint,
+                         with_null$fingerprint))
+  # The row is counted, whether or not it names a profile.
+  expect_identical(with_null$n_packages, 3L)
+  expect_identical(with_null$n_versions, 3L)
+})
+
+test_that("the bootstrap block counts the datasets the reader could not measure", {
+  # A catalog entry with no profile behind it: the reader described the file
+  # and could not fingerprint it, so it keeps its identity row and its version
+  # link and gets none. An S4 object with no reader, a raster packed into
+  # bytes, an .R script under data/, a compressed archive data() will not open.
+  # That is a coverage figure, not a row count, and a shard where it climbs is
+  # the reader losing objects it used to measure. It only lived in a line the
+  # shard printed, which scrolls away with the run.
+  db  <- withr::local_tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), db); on.exit(DBI::dbDisconnect(con))
+  .ensure_dataset_tables(con)
+  DBI::dbExecute(con,
+    "INSERT INTO cran_dataset_versions (package, name, version, content_id, is_current)
+     VALUES ('a', 'd', '1.0', 1, 1),
+            ('b', 'e', '1.0', NULL, 1),
+            ('c', 'f', '1.0', NULL, 1)")
+
+  expect_identical(.n_datasets_unmeasured(con), 2L)
+
+  m <- build_manifest(
+    con, series = "data", repo = "r-observatory/cran-code-metrics",
+    db_filename = "cran-data-metrics.db", db_bytes = 4096L,
+    tables = "cran_dataset_versions",
+    fp_table = "cran_datasets", fp_cols = c("package", "name", "current_content_id"),
+    pkg_table = "cran_datasets", ver_table = "cran_dataset_versions",
+    stat_table = "cran_dataset_contents", stat_cols = character(0L),
+    bootstrap = list(n_analyzed = 3L, n_universe = 3L, n_remaining = 0L,
+                     bootstrap_complete = TRUE, n_datasets_unmeasured = 2L))
+
+  expect_identical(m$bootstrap$n_datasets_unmeasured, 2L)
+  # The denominator is beside it in the same file: the links the table holds.
+  expect_identical(m$tables$cran_dataset_versions, 3L)
+})
+
+test_that("a database with no dataset links counts nothing unmeasured", {
+  db  <- withr::local_tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), db); on.exit(DBI::dbDisconnect(con))
+  expect_identical(.n_datasets_unmeasured(con), 0L)
+})

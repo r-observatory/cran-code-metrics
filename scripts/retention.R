@@ -26,12 +26,27 @@
 # one-sided, why a release that published no manifest gets a baseline measured
 # from its database rather than a refusal that repeats every run, and why
 # retention_repair_advice() names the release-level repair and rules force_full
-# out.
+# out. It is also why a refusal is assembled by retention_refusal() from the
+# kind of guard that tripped rather than from one fixed wording: this file
+# holds one check that fires when nothing was lost at all, and telling that
+# operator to delete a release would be worse than saying nothing.
 
 # The floor for a field is the MORE PERMISSIVE of a ratio and a flat row
 # allowance: max_loss = 0 means "ratio only". A flat allowance matters on a
 # small corpus, where a legitimate per-package delete-then-insert is a large
 # fraction of a small total.
+#
+# One field runs the other way. A check carrying max_gain instead is a CEILING:
+# rows it may gain, not rows it may lose. Only cran_metrics_failures has one,
+# because it is the only count here that grows when the pipeline is going wrong
+# rather than when it is working.
+#
+# The two also measure different spans, and the same downloaded baseline serves
+# both. A floor asks what the previous RELEASE published: rows lost are lost
+# however many shards ago it happened, so every shard of a run is measured
+# against the same release. A ceiling asks what one SHARD failed, which is what
+# its calibration below is written in, and advance_ceiling_baseline() is what
+# makes the number it reads say that.
 .RETENTION_CHECKS <- list(
   code = list(
     # No tolerance. The only paths that remove summary rows are force_full's
@@ -58,17 +73,44 @@
     list(path = "tables.cran_call_edges",    min_ratio = 0.98,  max_loss = 0),
     list(path = "tables.cran_code_churn",    min_ratio = 0.98,  max_loss = 0),
     # Monotone by construction on the scheduled path: SQLite does not shrink a
-    # file on DELETE, and the only VACUUM in the tree is in export_metrics(),
-    # which nothing under scripts/ or .github/ calls. Never fell across 30
+    # file on DELETE, it moves the page to the free list. Never fell across 30
     # releases (1.163 GB -> 1.256 GB). It is also what tolerates force_full,
-    # whose DELETEs leave the file size where it was.
+    # whose DELETEs leave the file size where it was. The one legitimate
+    # shrink is the reclaim on the publish path, and that one does not arrive
+    # here as a fall: credit_reclaim_to_baseline() takes the bytes it returned
+    # off `was` first, so both sides are measured the same way.
     list(path = "db_bytes",                  min_ratio = 0.90,  max_loss = 0),
     # n_universe is network-derived and degrades silently: package_list()
     # returns an empty frame with only a warning when a fetch fails, and it is
     # the denominator of bootstrap_complete, so a collapsed universe makes
     # "complete" true exactly when the database is empty. A single failed fetch
     # is a 26% or 74% drop; the largest measured is -1 (-0.003%).
-    list(path = "bootstrap.n_universe",      min_ratio = 0.90,  max_loss = 0)
+    list(path = "bootstrap.n_universe",      min_ratio = 0.90,  max_loss = 0),
+    # The ceiling, and the only one. A package enters this table when its
+    # clone or its analysis fails and leaves it the moment either succeeds, so
+    # a run that suddenly cannot analyse anything shows up here first and
+    # nowhere else: the row counts it did not write are not a fall, they are an
+    # absence of a rise, and no floor can see that.
+    #
+    # 100 is a quarter of a shard. A shard that newly fails that many packages
+    # has something wrong with it rather than a bad day, and publishing it
+    # would make its baseline the one tomorrow is measured against.
+    #
+    # A shard, and not a day. The re-scan a new analyzer generation asks for
+    # walks the whole catalog at 400 packages a shard over weeks, so a day
+    # whose shards each fail a handful is what that looks like, and a ceiling
+    # read straight off the downloaded baseline would charge shard 5 for what
+    # shards 1 to 4 already published and were passed for.
+    # advance_ceiling_baseline() is what keeps the span the one written here.
+    #
+    # It is deliberately a per-shard ceiling and not an absolute cap. This
+    # table only sheds a package when that package is analysed successfully
+    # again, and a package that has failed MAX_CLONE_FAILURES times is excluded
+    # from the queue, so its row can never leave on its own. An absolute cap on
+    # a count that cannot come down is a refusal that repeats every run
+    # forever, which is the state this whole file is written to avoid. The
+    # standing level is reported by retention_warnings() instead.
+    list(path = "tables.cran_metrics_failures", max_gain = 100)
   ),
   data = list(
     # The dataset database is downloaded by its own request and can be lost
@@ -145,7 +187,10 @@ read_manifest_file <- function(path) {
 #'   and is not.
 #' @param force_full TRUE for an operator-requested full rebuild, which is the
 #'   one path that legitimately empties tables.
-#' @return Character vector of violations, empty when the run may publish.
+#' @return Character vector of violations, empty when the run may publish. Each
+#'   element is NAMED with the kind of guard that produced it, "floor" or
+#'   "ceiling", because the two are opposite failures with opposite repairs and
+#'   retention_refusal() has to tell them apart without reading the text.
 retention_violations <- function(series, current, prior, prior_tag = "",
                                  force_full = FALSE) {
   # --bootstrap wipes three code tables before re-analysing, so its first shard
@@ -162,11 +207,13 @@ retention_violations <- function(series, current, prior, prior_tag = "",
 
   if (is.null(prior) || length(prior) == 0L) {
     if (nzchar(prior_tag)) {
-      return(sprintf(
+      # A release whose manifest we cannot read is the lost-download state, so
+      # it belongs to the floor family however differently it is worded.
+      return(c(floor = sprintf(
         paste0("no %s baseline to compare against: release %s exists but its ",
                "manifest was not read, which is the state a lost download ",
                "leaves behind"),
-        series, prior_tag))
+        series, prior_tag)))
     }
     return(character(0L))  # genuinely the first release
   }
@@ -176,15 +223,49 @@ retention_violations <- function(series, current, prior, prior_tag = "",
     was <- .ret_at(prior, chk$path)
     if (is.null(was)) next          # the prior manifest predates this field
     now <- .ret_at(current, chk$path) %||% 0
-    floor_v <- min(was * chk$min_ratio, was - chk$max_loss)
-    if (now < floor_v) {
-      out <- c(out, sprintf("%s %s fell to %s from %s (floor %s)",
-                            series, chk$path, .ret_fmt(now), .ret_fmt(was),
-                            .ret_fmt(floor_v)))
+    # A check carries a floor, a ceiling, or one day both. Each is read on its
+    # own so adding the second to an existing entry cannot quietly disable the
+    # first.
+    if (!is.null(chk$max_gain)) {
+      ceiling_v <- was + chk$max_gain
+      if (now > ceiling_v) {
+        out <- c(out, ceiling = sprintf("%s %s rose to %s from %s (ceiling %s)",
+                                        series, chk$path, .ret_fmt(now),
+                                        .ret_fmt(was), .ret_fmt(ceiling_v)))
+      }
+    }
+    if (!is.null(chk$min_ratio)) {
+      floor_v <- min(was * chk$min_ratio, was - chk$max_loss)
+      if (now < floor_v) {
+        out <- c(out, floor = sprintf("%s %s fell to %s from %s (floor %s)",
+                                      series, chk$path, .ret_fmt(now),
+                                      .ret_fmt(was), .ret_fmt(floor_v)))
+      }
     }
   }
   out
 }
+
+# The share of the universe that may sit in cran_metrics_failures before the
+# run says so.
+#
+# The ceiling in .RETENTION_CHECKS compares one shard to the next, so a table
+# that creeps up two packages at a time passes it every time, which is exactly
+# how this one reached 200 rows from 3 inside a month with nothing said. The
+# level itself is the other half of that finding, and it is a warning rather
+# than a gate because a package failing is not history being lost: its stored
+# rows are still there, and refusing to publish over it would throw away the
+# collection of every package that did work.
+#
+# 0.5% of 33,307 is 166. A package leaves this table the moment it is analysed
+# successfully, so anything standing at that level is not a bad afternoon, it
+# is a part of the catalog nobody is collecting any more.
+#
+# The share needs a floor under it as well, because a share on its own says
+# nothing about a small corpus: one failing package out of five is 20% and is
+# not a finding. Both have to be met.
+FAILURE_SHARE_WARN <- 0.005
+FAILURE_COUNT_WARN <- 25L
 
 #' Figures worth saying out loud without halting the run.
 #'
@@ -199,14 +280,29 @@ retention_violations <- function(series, current, prior, prior_tag = "",
 #' @return Character vector of warnings, possibly empty.
 retention_warnings <- function(series, current) {
   if (!identical(series, "code")) return(character(0L))
+  out <- character(0L)
+
+  fails    <- .ret_at(current, "tables.cran_metrics_failures")
+  universe <- .ret_at(current, "bootstrap.n_universe")
+  if (!is.null(fails) && !is.null(universe) && universe > 0 &&
+      fails >= FAILURE_COUNT_WARN && fails > universe * FAILURE_SHARE_WARN) {
+    out <- c(out, sprintf(paste0(
+      "cran_metrics_failures holds %s packages, %.2f%% of the %s in the ",
+      "universe: that many packages are failing to clone or to analyse and ",
+      "the ones past %d attempts have been dropped from the queue for good"),
+      .ret_fmt(fails), 100 * fails / universe, .ret_fmt(universe),
+      MAX_CLONE_FAILURES))
+  }
+
   n_ver <- .ret_at(current, "n_versions")
   summ  <- .ret_at(current, "tables.cran_code_summary")
   api   <- .ret_at(current, "tables.cran_api_history")
-  if (is.null(n_ver) || is.null(summ) || is.null(api)) return(character(0L))
-  if (api == summ && summ == n_ver) return(character(0L))
-  sprintf(paste0("cran_api_history holds %s rows and cran_code_summary %s ",
-                 "(n_versions %s): a version was written without its api row"),
-          .ret_fmt(api), .ret_fmt(summ), .ret_fmt(n_ver))
+  if (is.null(n_ver) || is.null(summ) || is.null(api)) return(out)
+  if (api == summ && summ == n_ver) return(out)
+  c(out, sprintf(
+    paste0("cran_api_history holds %s rows and cran_code_summary %s ",
+           "(n_versions %s): a version was written without its api row"),
+    .ret_fmt(api), .ret_fmt(summ), .ret_fmt(n_ver)))
 }
 
 #' What an operator should actually do when one of these guards refuses.
@@ -239,6 +335,72 @@ retention_repair_advice <- function() {
     "cran_code_churn and cran_api_history and republishes a 400-package ",
     "catalog as latest, which is the outcome this check exists to prevent. ",
     "Use it only for a rebuild of the whole catalog that you actually want.")
+}
+
+#' What an operator should actually do when the failures ceiling refuses.
+#'
+#' The ceiling needs its own text because the advice above would actively harm
+#' here. Nothing was lost when this guard fires: the packages that failed still
+#' have every row they had, and the repair above opens with the previous
+#' release and offers deleting it, which in the middle of a mirror outage means
+#' throwing away a release that is perfectly fine while the 250 packages that
+#' actually failed go unmentioned.
+#'
+#' @return A single string, ready to append to a refusal.
+retention_failure_advice <- function() {
+  sprintf(paste0(
+    "\nNothing was dropped. Every row these packages had is still in the ",
+    "database. What this run recorded is that they would not clone or would ",
+    "not analyse, and cran_metrics_failures counts them.\n",
+    "Look at the run log first: each failing package prints its name and the ",
+    "reason it failed on one line, and a jump this size is usually one cause ",
+    "shared by all of them and upstream of the pipeline (the cran mirror ",
+    "refusing clones, the runner losing the network, an analyzer meeting a ",
+    "shape it did not handle before). `SELECT package, consecutive_failures, ",
+    "last_attempt FROM cran_metrics_failures ORDER BY last_attempt DESC` in ",
+    "this run's database lists them.\n",
+    "A package leaves this table the moment it is analysed successfully, so ",
+    "the repair is to fix that cause and re-run. Leaving it is not free: a ",
+    "package that fails %d times in a row is dropped from the queue for good. ",
+    "Do not reach for the previous release, which did not cause this, and do ",
+    "not reach for force_full, which re-analyses through the same failure and ",
+    "republishes a 400-package catalog while doing it."),
+    MAX_CLONE_FAILURES)
+}
+
+#' The whole refusal a run stops with, worded for the guards that tripped.
+#'
+#' retention_violations() reports two opposite failures through one vector, and
+#' one fixed headline cannot cover both: told that a burst of failures "would
+#' drop history the previous release carried" and handed the release-level
+#' repair, an operator deletes a good release during an incident whose cause is
+#' entirely upstream. The kinds present in the vector pick both the headline
+#' and which advice is appended, and a run that managed both gets both.
+#'
+#' @param violations Character vector from retention_violations(), named by
+#'   guard kind. An unnamed element is treated as a floor, which is what every
+#'   check but one is.
+#' @return A single string, ready to pass to stop().
+retention_refusal <- function(violations) {
+  kinds <- names(violations) %||% rep("", length(violations))
+  kinds[!nzchar(kinds)] <- "floor"
+
+  headline <- character(0L)
+  advice   <- character(0L)
+  if ("floor" %in% kinds) {
+    headline <- c(headline,
+                  "this run would drop history the previous release carried")
+    advice   <- c(advice, retention_repair_advice())
+  }
+  if ("ceiling" %in% kinds) {
+    headline <- c(headline,
+                  "this shard failed far more packages than the shard before it did")
+    advice   <- c(advice, retention_failure_advice())
+  }
+
+  paste0("refusing to publish: ", paste(headline, collapse = ", and "), ".\n  ",
+         paste(violations, collapse = "\n  "),
+         paste(advice, collapse = ""))
 }
 
 #' Whether a downloaded prior database has LESS in it than the manifest that
@@ -450,6 +612,119 @@ ensure_prior_baseline <- function(out_dir) {
       .RETENTION_KEY_TABLES[[spec$series]]$ver_table))
   }
   notes
+}
+
+#' Restate a baseline in the units the reclaimed database is now measured in.
+#'
+#' The db_bytes check reads a smaller file as history that went missing, and
+#' that is right for every cause but one: a VACUUM makes the file smaller while
+#' changing nothing that is in it. The pages it hands back were free pages in
+#' the file this run inherited, so the previous release's database, vacuumed,
+#' would have been exactly that much smaller too. Subtracting the measured
+#' reclaim from the baseline is therefore not an exemption, it is the same
+#' number expressed the same way on both sides, and it excuses precisely the
+#' shrink the run caused and not one byte more: a run that reclaims 630 MB and
+#' also loses half its rows is still refused.
+#'
+#' It is written to the downloaded prev-*-manifest.json rather than held in
+#' memory because the check runs once per shard and the reclaim happens on the
+#' first one. Later shards of the same run re-read that file, and a run only
+#' ever sees a baseline it downloaded itself, so the credit expires when the
+#' run does. Nothing else reads db_bytes out of it: prior_db_violations()
+#' compares rows.
+#'
+#' @param path      Path to a prev-<series>-manifest.json. An absent file is
+#'   the cold-start case and is not an error.
+#' @param reclaimed Bytes the vacuum actually returned to the filesystem.
+#' @return TRUE when the baseline was rewritten, FALSE when there was nothing
+#'   to credit.
+credit_reclaim_to_baseline <- function(path, reclaimed) {
+  reclaimed <- as.numeric(reclaimed %||% 0)
+  if (!is.finite(reclaimed) || reclaimed <= 0) return(invisible(FALSE))
+  prior <- read_manifest_file(path)
+  was <- .ret_at(prior, "db_bytes")
+  if (is.null(was)) return(invisible(FALSE))
+  prior$db_bytes <- max(0, round(was - reclaimed))
+  jsonlite::write_json(prior, path, auto_unbox = TRUE, pretty = TRUE)
+  invisible(TRUE)
+}
+
+# The paths in a series' checks that carry a ceiling rather than a floor. Read
+# off .RETENTION_CHECKS rather than named here, so a second ceiling added there
+# is measured the same way as the first without anyone remembering this.
+.ret_ceiling_paths <- function(series) {
+  checks <- .RETENTION_CHECKS[[series]]
+  if (is.null(checks)) return(character(0L))
+  has <- vapply(checks, function(chk) !is.null(chk$max_gain), logical(1L))
+  vapply(checks[has], function(chk) chk$path, character(1L))
+}
+
+# Write one dotted path into a parsed manifest. The caller settles whether the
+# field is there to write; this only reaches it.
+.ret_set_at <- function(x, path, value) {
+  parts <- strsplit(path, ".", fixed = TRUE)[[1L]]
+  if (length(parts) == 1L) {
+    x[[parts[[1L]]]] <- value
+    return(x)
+  }
+  x[[parts[[1L]]]] <- .ret_set_at(x[[parts[[1L]]]],
+                                  paste(parts[-1L], collapse = "."), value)
+  x
+}
+
+#' Restate a baseline's ceilings as what the shard that just passed published.
+#'
+#' A floor and a ceiling measure different spans. A floor asks what the
+#' previous RELEASE published, because losing rows is losing them however many
+#' shards ago it happened, and every shard of a run is rightly measured against
+#' the same release. A ceiling asks what one SHARD newly failed: 100 is a
+#' quarter of a shard, and a shard that newly fails that many has something
+#' wrong with it rather than a bad day.
+#'
+#' Nothing made that difference true. prev-*-manifest.json is downloaded once
+#' per run, by the step before the shard loop, and every shard re-reads that
+#' same file, so the ceiling measured the whole day: shard 5 was charged for
+#' the packages shards 1 to 4 already failed, published, and were passed for.
+#' The re-scan behind a new analyzer generation walks the whole catalog over
+#' weeks, so a day whose shards each fail a handful is its ordinary shape, and
+#' a guard that refuses it is a guard that stops the re-scan.
+#'
+#' Moving the baseline forward after each shard passes is what makes the
+#' comparison the one the calibration describes, and it is not an exemption:
+#' the next shard may still fail only max_gain packages more than the table
+#' holds when it starts. It moves down as readily as up, because a shard that
+#' finally analysed a pile of failing packages empties their rows, and a
+#' baseline left where the day started would let the shard after it fail that
+#' many again without a word.
+#'
+#' Written to the downloaded file for the same reason credit_reclaim_to_baseline()
+#' writes there: each shard is a fresh R process, and a run only ever sees a
+#' baseline it downloaded itself, so the restatement expires when the run does.
+#' Only the ceiling fields move. Every floor keeps measuring the release the
+#' run started from, and a baseline that carries no such field is left without
+#' one, so a release published before a count existed keeps the ceiling off for
+#' the whole run rather than switching it on at shard 2.
+#'
+#' @param path    Path to a prev-<series>-manifest.json. An absent file is the
+#'   cold-start case and is not an error.
+#' @param series  "code" or "data".
+#' @param current Manifest the shard just passed the check with.
+#' @return TRUE when the baseline was rewritten, FALSE when there was nothing
+#'   to move.
+advance_ceiling_baseline <- function(path, series, current) {
+  prior <- read_manifest_file(path)
+  if (is.null(prior) || length(prior) == 0L) return(invisible(FALSE))
+  moved <- FALSE
+  for (p in .ret_ceiling_paths(series)) {
+    was <- .ret_at(prior, p)
+    now <- .ret_at(current, p)
+    if (is.null(was) || is.null(now) || was == now) next
+    prior <- .ret_set_at(prior, p, now)
+    moved <- TRUE
+  }
+  if (!moved) return(invisible(FALSE))
+  jsonlite::write_json(prior, path, auto_unbox = TRUE, pretty = TRUE)
+  invisible(TRUE)
 }
 
 #' Check both downloaded prior databases against their manifests.

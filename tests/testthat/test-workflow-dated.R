@@ -11,3 +11,16 @@ test_that("update.yml publishes dated code and data releases, not rolling curren
   expect_true(grepl("prune.R", yml, fixed = TRUE))
   expect_true(grepl("render_notes.R", yml, fixed = TRUE))
 })
+
+test_that("the run and the tests that vet it install the same analyzer", {
+  # A pin that drifts between the two is the quiet version of a broken run: the
+  # tests pass against one reader while the nightly writes what a different one
+  # produced, and nothing in the output says the two disagree.
+  pin_of <- function(name) {
+    yml <- readLines(file.path("..", "..", ".github", "workflows", name))
+    line <- grep("gh release download .*rpkg-analyzer", yml, value = TRUE)
+    expect_equal(length(line), 1L)
+    sub(".*gh release download +([^ ]+).*", "\\1", line)
+  }
+  expect_equal(pin_of("test.yml"), pin_of("update.yml"))
+})

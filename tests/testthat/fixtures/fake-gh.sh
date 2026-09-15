@@ -18,6 +18,8 @@
 #     draft again if an upload fails, and that delete can fail too.
 #   - `upload --clobber` deletes the old copy before uploading the new one, so
 #     a failed upload leaves the release without that asset.
+#   - `upload` refuses a file that is not there before it looks the release up,
+#     with "no matches found for `FILE`", so every retry of it fails the same.
 #   - a draft has no git tag, so `delete --cleanup-tag` on one deletes the
 #     release and then exits non-zero.
 #
@@ -233,6 +235,12 @@ case "$sub" in
         *) files+=("$1") ;;
       esac
       shift
+    done
+    for f in "${files[@]}"; do
+      if [ ! -e "$f" ]; then
+        echo "no matches found for \`$f\`" >&2
+        exit 1
+      fi
     done
     id=$(resolve "$tag") || exit 1
     rc=0

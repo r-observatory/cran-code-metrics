@@ -288,8 +288,14 @@ publish_metrics() {  # $1=tag $2=title
 # Replace one asset of a release that is already out, for the harvest run.
 # Only a published release: uploading into a draft publishes nothing, and a
 # missing release means the normal update has not run today.
+#
+# The file is checked before the release is read, as publish_release checks
+# its own. gh refuses a missing file without calling GitHub, so the upload
+# retries could not change the answer: it took five attempts and about 300 s
+# of backoff to fail, and the error named the upload rather than the file.
 replace_published_asset() {  # $1=tag $2=file
   local tag="$1" file="$2" state
+  file_bytes "$file" >/dev/null || return 1
   state=$(release_state "$tag") || return 1
   case "$state" in
     published) ;;

@@ -551,6 +551,25 @@ test_that("the harvest upload goes only into a published release", {
   expect_equal(sizes[["cran-data-metrics.db"]], 2993L)
 })
 
+test_that("the harvest names a database missing from out/ before the release is touched", {
+  # The harvest went straight to the listing and the upload, so a database the
+  # harvest did not leave behind cost five upload attempts, about 300 s of
+  # backoff on the runner, and an error that named the upload, not the file.
+  harvest <- 'replace_published_asset metrics-2026-09-13 out/cran-code-metrics.db || exit 1'
+  world <- .pub_world(list(
+    .pub_0912(),
+    .pub_release(2L, "metrics-2026-09-13", assets = .pub_assets - 7L, latest = TRUE)))
+  .pub_gnu_stat(world)
+  unlink(file.path(world$work, "out", "cran-code-metrics.db"))
+  res <- .pub_run(world, harvest)
+  expect_false(res$status == 0L)
+  expect_true(any(grepl("::error::out/cran-code-metrics.db does not exist",
+                        res$output, fixed = TRUE)), info = res$output)
+  expect_false(any(grepl("invalid option", res$output, fixed = TRUE)))
+  expect_false(any(grepl("did not upload", res$output, fixed = TRUE)))
+  expect_length(.pub_log(world), 0L)
+})
+
 test_that("the harvest refuses two releases under one tag and names them by id", {
   # The refusal is the only thing that tells the operator how to clear the
   # tag, and a delete by tag can take the published release and keep the draft.

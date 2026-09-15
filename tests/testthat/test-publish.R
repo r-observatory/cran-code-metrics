@@ -295,6 +295,21 @@ test_that("an asset that lands the wrong size is refused and today's release sta
   expect_true(any(grepl("cran-data-metrics.db at 3000 bytes", res$output, fixed = TRUE)))
   expect_true(isTRUE(.pub_only(world, "metrics-2026-09-13")$isDraft))
   expect_false(any(grepl("--draft=false", .pub_log(world), fixed = TRUE)))
+  # Read five times first, in case the release had not caught up.
+  expect_length(grep("^gh release view", .pub_log(world)), 5L)
+})
+
+test_that("a read-back that has not caught up with the uploads is read again, not refused", {
+  # Nothing promises that a release lists an asset the moment its upload
+  # returns. Refusing on the first read that disagrees fails a publish whose
+  # assets are all there, and the next run repeats the whole day's work.
+  world <- .pub_world(list(.pub_0912()),
+                      faults = c("stale-data-manifest.json" = 2L))
+  res <- .pub_run(world, .pub_today)
+  expect_equal(res$status, 0L)
+  r <- .pub_expect_whole(world, "metrics-2026-09-13")
+  expect_true(isTRUE(r$isLatest))
+  expect_length(grep("^gh release view", .pub_log(world)), 3L)
 })
 
 test_that("two releases under today's tag are refused before anything is touched", {

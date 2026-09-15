@@ -116,29 +116,41 @@ upload_asset() {  # $1=tag $2=file
 
 # Every file must be attached to the release, fully uploaded, at the size it has
 # here. An upload that exits 0 is gh's word; this is the release's.
+#
+# A read that disagrees is read again, like one that failed. Nothing promises
+# that a release lists an asset the moment its upload returns, and refusing on
+# the first read that lags leaves a complete draft unpublished, so the next run
+# repeats the day's analysis. Only the last of five reads decides, so an asset
+# that really landed short takes about a hundred seconds longer to refuse.
 verify_assets() {  # $1=tag, then the files
-  local tag="$1" n got f size
+  local tag="$1" n got f size wrong
   shift
   for n in 1 2 3 4 5; do
+    wrong=""
     if got=$(gh release view "$tag" --json assets \
                -q '.assets[] | select(.state == "uploaded") | "\(.name) \(.size)"'); then
-      break
+      for f in "$@"; do
+        size=$(file_bytes "$f") || return 1
+        if ! printf '%s\n' "$got" | grep -qxF "$(basename "$f") ${size}"; then
+          wrong="$(basename "$f") at ${size} bytes"
+          break
+        fi
+      done
+      if [ -z "$wrong" ]; then return 0; fi
+      echo "attempt ${n}: ${tag} does not list ${wrong} yet"
+    else
+      got=""
+      echo "attempt ${n}: could not read the assets of ${tag}"
     fi
-    echo "attempt ${n}: could not read the assets of ${tag}"
-    if [ "$n" -eq 5 ]; then
-      echo "::error::five attempts failed to read back the assets of ${tag}."
-      return 1
-    fi
-    publish_backoff "$n" 10
+    if [ "$n" -lt 5 ]; then publish_backoff "$n" 10; fi
   done
-  for f in "$@"; do
-    size=$(file_bytes "$f") || return 1
-    if ! printf '%s\n' "$got" | grep -qxF "$(basename "$f") ${size}"; then
-      echo "::error::${tag} does not carry $(basename "$f") at ${size} bytes after the upload; it has:"
-      printf '%s\n' "$got" | sed 's/^/  /'
-      return 1
-    fi
-  done
+  if [ -z "$wrong" ]; then
+    echo "::error::five attempts failed to read back the assets of ${tag}."
+  else
+    echo "::error::${tag} does not carry ${wrong} after the upload; it has:"
+    printf '%s\n' "$got" | sed 's/^/  /'
+  fi
+  return 1
 }
 
 # Publish the files as the release under a tag, in the order given.

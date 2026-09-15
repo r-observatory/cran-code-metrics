@@ -28,6 +28,8 @@
 # many more times it fires:
 #   upload-<asset>  that asset's upload returns HTTP 500
 #   short-<asset>   that asset's upload succeeds but lands one byte short
+#   stale-<asset>   `release view` leaves that asset out, as a read that has
+#                   not caught up with its upload would
 #   create          create returns HTTP 500 and creates nothing
 #   create-after    create makes the release, then returns HTTP 500
 #   cleanup         create's own delete of its draft returns HTTP 500
@@ -165,6 +167,13 @@ case "$sub" in
     if fault view; then http500 "view"; fi
     id=$(resolve "$tag") || exit 1
     one=$(state | jq --argjson id "$id" '.[] | select(.id == $id)')
+    for f in "$GH_FAULTS"/stale-*; do
+      [ -e "$f" ] || continue
+      name="${f##*/stale-}"
+      if fault "stale-$name"; then
+        one=$(printf '%s\n' "$one" | jq --arg n "$name" '.assets |= map(select(.name != $n))')
+      fi
+    done
     if [ -n "$query" ]; then printf '%s\n' "$one" | jq -r "$query"; else printf '%s\n' "$one"; fi
     ;;
 

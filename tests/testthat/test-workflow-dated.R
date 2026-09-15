@@ -24,3 +24,81 @@ test_that("the run and the tests that vet it install the same analyzer", {
   }
   expect_equal(pin_of("test.yml"), pin_of("update.yml"))
 })
+
+# ---------------------------------------------------------------------------
+# Resolving and publishing releases
+# ---------------------------------------------------------------------------
+# On 2026-09-13 a failed `gh release create <tag> <assets>` left a draft holding
+# two manifests and no databases. `gh release list` hands drafts to this
+# repository's token, and the draft's tag sorted above every real release, so
+# every run after it built on the draft and was refused. test-publish.R drives
+# the helpers; these hold the workflow to using them.
+
+.update_yml <- function() {
+  readLines(file.path("..", "..", ".github", "workflows", "update.yml"))
+}
+
+.publish_sh <- function() {
+  readLines(file.path("..", "..", "scripts", "publish.sh"))
+}
+
+# The body of one shell function in publish.sh, from its opening line to the
+# first line that closes it.
+.sh_function <- function(lines, name) {
+  start <- grep(sprintf("^%s\\(\\) \\{", name), lines)
+  expect_length(start, 1L)
+  end <- start - 1L + grep("^\\}", lines[start:length(lines)])[1L]
+  lines[start:end]
+}
+
+test_that("every release listing in update.yml leaves drafts out", {
+  yml <- .update_yml()
+  lists <- grep("gh release list", yml, value = TRUE, fixed = TRUE)
+  expect_gte(length(lists), 1L)   # the prune, whose KEEP a draft must not take
+  expect_true(all(grepl("--exclude-drafts", lists, fixed = TRUE)))
+
+  latest <- .sh_function(.publish_sh(), "latest_tag")
+  expect_true(any(grepl("gh release list --exclude-drafts", latest, fixed = TRUE)))
+})
+
+test_that("the steps that resolve or publish a release source the shared helpers", {
+  yml <- .update_yml()
+  expect_false(any(grepl("latest_tag() {", yml, fixed = TRUE)))
+  expect_false(any(grepl("publish_metrics() {", yml, fixed = TRUE)))
+
+  starts <- grep("^      - ", yml)
+  steps <- split(yml, findInterval(seq_along(yml), starts))
+  users <- Filter(function(s) {
+    any(grepl("latest_tag|publish_metrics|replace_published_asset", s))
+  }, steps)
+  expect_length(users, 2L)   # the download step and the shard step
+  for (s in users) {
+    expect_true(any(grepl("source scripts/publish.sh", s, fixed = TRUE)))
+  }
+  # The shard loop still stops the run when a publish fails.
+  expect_true(any(grepl("publish_metrics .*\\|\\| exit 1", yml)))
+})
+
+test_that("no release is created with its assets attached", {
+  # gh makes that release a draft while the assets upload, and a failure there
+  # is what stranded the 09-13 draft.
+  expect_false(any(grepl("gh release create", .update_yml(), fixed = TRUE)))
+  creates <- grep("gh release create", .publish_sh(), value = TRUE, fixed = TRUE)
+  creates <- creates[!grepl("^\\s*#", creates)]
+  expect_gte(length(creates), 1L)
+  expect_true(all(grepl("--draft", creates, fixed = TRUE)))
+  expect_false(any(grepl("\\.db|manifest\\.json|\\$@|\\$\\{assets", creates)))
+})
+
+test_that("the harvest upload requires a published release", {
+  yml <- .update_yml()
+  start <- grep("inputs.harvest_descriptions }}\" = \"true\"", yml, fixed = TRUE)
+  expect_length(start, 1L)
+  end <- start - 1L + grep("exit 0", yml[start:length(yml)], fixed = TRUE)[1L]
+  harvest <- yml[start:end]
+  expect_true(any(grepl("replace_published_asset .*\\|\\| exit 1", harvest)))
+  expect_false(any(grepl("gh release (upload|view)", harvest)))
+
+  body <- .sh_function(.publish_sh(), "replace_published_asset")
+  expect_true(any(grepl("published", body, fixed = TRUE)))
+})

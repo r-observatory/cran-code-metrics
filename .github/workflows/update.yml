@@ -78,7 +78,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          latest_tag() { gh release list --limit 1000 --json tagName -q '.[].tagName' | { grep "^$1-" || true; } | sort -r | head -1; }
+          # latest_tag: the newest PUBLISHED release in a series. A draft left
+          # by a failed publish is not one, and resolving it wedged every run.
+          # shellcheck source=scripts/publish.sh
+          source scripts/publish.sh
 
           # A single consolidated release per day (metrics-YYYY-MM-DD) carries both
           # the code and data DBs as assets. Fall back to the legacy split code-/data-
@@ -119,7 +122,7 @@ jobs:
             for n in 1 2 3 4 5; do
               rm -f "out/$name"
               if gh release download "$tag" --pattern "$name" --dir out && [ -s "out/$name" ]; then
-                echo "fetched ${name} from ${tag} ($(stat -c%s "out/$name") bytes)"
+                echo "fetched ${name} from ${tag} ($(file_bytes "out/$name") bytes)"
                 return 0
               fi
               echo "attempt ${n}: ${name} did not arrive from ${tag}, or arrived empty"
@@ -196,6 +199,8 @@ jobs:
           FORCE_FULL_REBUILD: ${{ inputs.force_full }}
         run: |
           set -euo pipefail
+          # shellcheck source=scripts/publish.sh
+          source scripts/publish.sh
           TODAY="$(date -u +%Y-%m-%d)"
           METRICS_TAG="metrics-${TODAY}"
 
@@ -204,16 +209,13 @@ jobs:
           # (the code metrics + data DB + manifests are untouched), so we clobber
           # just the code-DB asset in today's release. Idempotent (title-IS-NULL
           # selection) and resumable, so a re-run continues where it left off.
+          # Only into a PUBLISHED release: `gh release view` also finds a draft,
+          # and uploading into one publishes nothing.
           if [ "${{ inputs.harvest_descriptions }}" = "true" ]; then
             echo "=== harvest-descriptions (elapsed ${SECONDS}s) ==="
             Rscript scripts/update.R out/ --harvest-descriptions
-            if gh release view "$METRICS_TAG" >/dev/null 2>&1; then
-              gh release upload "$METRICS_TAG" out/cran-code-metrics.db --clobber
-              echo "clobbered cran-code-metrics.db in ${METRICS_TAG}"
-            else
-              echo "::error::no ${METRICS_TAG} release to update; run the normal update first."
-              exit 1
-            fi
+            replace_published_asset "$METRICS_TAG" out/cran-code-metrics.db || exit 1
+            echo "clobbered cran-code-metrics.db in ${METRICS_TAG}"
             exit 0
           fi
 
@@ -222,37 +224,18 @@ jobs:
           RECOLLECT=""; [ "${{ inputs.recollect }}" = "true" ] && RECOLLECT="--recollect"
           TODAY="$(date -u +%Y-%m-%d)"
           METRICS_TAG="metrics-${TODAY}"
-          MAX_BYTES=2040109465
 
           # Publish ONE dated release carrying both the code and data metrics DBs
           # (plus both manifests) as assets, with a single notes body. render_notes.R
           # writes the same catalog to release-notes-code.md/-data.md, so either is
-          # the combined body; we attach the code one.
+          # the combined body; we attach the code one. publish_metrics lives in
+          # scripts/publish.sh, which says how it avoids leaving a draft behind.
           #
-          # Size is the only refusal made here. The refusal that matters more,
+          # Size is the only refusal made there. The refusal that matters more,
           # a run whose figures fell below what the previous release published,
           # is made in scripts/update.R (see "Retention guard"), which exits
           # non-zero and therefore stops the shard below before it ever reaches
-          # this function.
-          publish_metrics() {
-            local f bytes
-            for f in cran-code-metrics.db cran-data-metrics.db; do
-              bytes=$(stat -c%s "out/$f")
-              if [ "$bytes" -gt "$MAX_BYTES" ]; then
-                echo "::error::out/$f is ${bytes} bytes (> ${MAX_BYTES}); refusing to publish ${METRICS_TAG}."
-                return 1
-              fi
-            done
-            local assets=(out/cran-code-metrics.db out/cran-data-metrics.db out/code-manifest.json out/data-manifest.json)
-            if gh release view "$METRICS_TAG" >/dev/null 2>&1; then
-              # Today's release already exists (an earlier shard this run): clobber ONLY today.
-              gh release upload "$METRICS_TAG" "${assets[@]}" --clobber
-              gh release edit "$METRICS_TAG" --notes-file out/release-notes-code.md
-            else
-              gh release create "$METRICS_TAG" "${assets[@]}" \
-                --title "CRAN Metrics - ${TODAY}" --notes-file out/release-notes-code.md --latest
-            fi
-          }
+          # the publish.
 
           shard=0
           while :; do
@@ -267,7 +250,7 @@ jobs:
 
             if [ "$CHANGED" = "true" ]; then
               Rscript scripts/render_notes.R out/
-              publish_metrics || exit 1
+              publish_metrics "$METRICS_TAG" "CRAN Metrics - ${TODAY}" || exit 1
             fi
 
             if [ "$COMPLETE" = "true" ] || [ "$CHANGED" != "true" ]; then
@@ -286,8 +269,9 @@ jobs:
           set -euo pipefail
           # Prune only the consolidated metrics- series. Legacy code-/data- releases
           # are left untouched here and removed by a one-time cleanup once the new
-          # scheme is confirmed.
-          gh release list --limit 1000 --json tagName -q '.[].tagName' \
+          # scheme is confirmed. Drafts are left out so one cannot take a KEEP
+          # slot from a real release; a draft has no tag for --cleanup-tag either.
+          gh release list --exclude-drafts --limit 1000 --json tagName -q '.[].tagName' \
             | { grep "^metrics-" || true; } \
             | Rscript scripts/prune.R \
             | while read -r tag; do

@@ -320,13 +320,18 @@ retention_warnings <- function(series, current) {
 #' @return A single string, ready to append to a refusal.
 retention_repair_advice <- function() {
   paste0(
-    "\nLook at the PREVIOUS release first. publish_metrics uploads four assets ",
-    "in one `gh release upload --clobber`, which deletes each existing asset ",
-    "before uploading its replacement and cannot do so atomically, so an ",
-    "interrupted publish can leave one shard's database beside another ",
-    "shard's manifest.\n",
-    "If that is what happened, open the release the download step resolved as ",
-    "code src / data src and make its assets agree again: re-upload the ",
+    "\nLook at the PREVIOUS release first. A later shard on the same day ",
+    "replaces the four assets one `gh release upload --clobber` at a time, ",
+    "which deletes each existing asset before uploading its replacement, so ",
+    "an interrupted publish can leave one shard's database beside another ",
+    "shard's manifest, or a manifest whose database is gone.\n",
+    "If `gh release list` marks the release the download step resolved as ",
+    "code src / data src as Draft, it was never published and should not have ",
+    "been resolved: a failed publish left it. Delete it with ",
+    "`gh release delete <tag> --yes`, without --cleanup-tag (a draft has no ",
+    "tag, so that flag fails after the delete), and re-run; the run redoes ",
+    "whatever work it held.\n",
+    "Otherwise open that release and make its assets agree again: re-upload the ",
     "database and the manifest that belong together, or delete that release ",
     "so the day before it becomes latest again. Then re-run.\n",
     "If that release is consistent, this run really did lose the rows, and ",
@@ -540,8 +545,8 @@ prior_db_notes <- function(series, counts, prior) {
 #' A baseline measured from a downloaded database, for a release that
 #' published no manifest.
 #'
-#' The publish is not atomic (four assets, one --clobber, each existing asset
-#' deleted before its replacement lands), so a run that died in that window can
+#' A same-day republish is not atomic (four assets, each existing one deleted by
+#' --clobber before its replacement lands), so a run that died in that window can
 #' leave a release carrying its database and no code-manifest.json. Refusing on
 #' that was a permanent outage: the same release stays latest, so every later
 #' run refused too, and the only recovery the refusal named was the wipe.
@@ -753,7 +758,9 @@ preflight_prior_dbs <- function(out_dir) {
     dbpath <- file.path(out_dir, spec$db)
     size <- if (file.exists(dbpath)) as.numeric(file.info(dbpath)$size) else 0
     if (size <= 0) {
-      out <- c(out, sprintf(
+      # Named, so preflight_refusal() can say the database is missing rather
+      # than smaller.
+      out <- c(out, absent = sprintf(
         "%s came back from the prior release but %s did not",
         spec$manifest, spec$db))
       next
@@ -764,4 +771,35 @@ preflight_prior_dbs <- function(out_dir) {
     notes <- c(notes, prior_db_notes(spec$series, counts, prior))
   }
   list(violations = out, notes = notes)
+}
+
+#' The refusal preflight stops with, headed for what actually came back.
+#'
+#' "The prior database holds less than the manifest recorded" describes a
+#' truncated file. After 2026-09-13 every scheduled run stopped under that
+#' headline about a database that had not arrived at all: a draft left by a
+#' failed publish carried the two manifests and nothing else. The advice below
+#' it named the right repair, but a headline about a smaller file sends an
+#' operator looking at row counts. A violation named "absent" gets its own
+#' headline; every other one keeps the old headline, and a run with both gets
+#' both.
+#'
+#' @param violations Character vector from preflight_prior_dbs().
+#' @return A single string, ready to pass to stop().
+preflight_refusal <- function(violations) {
+  kinds <- names(violations) %||% rep("", length(violations))
+  headline <- character(0L)
+  if ("absent" %in% kinds) {
+    headline <- c(headline, paste0(
+      "the prior release handed back a manifest without the database it ",
+      "describes"))
+  }
+  if (any(kinds != "absent")) {
+    headline <- c(headline, paste0(
+      "the prior database holds less than the manifest published with it ",
+      "recorded"))
+  }
+  paste0(paste(headline, collapse = ", and "),
+         "; refusing to build a release on top of it.",
+         retention_repair_advice())
 }

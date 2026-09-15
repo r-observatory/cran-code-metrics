@@ -32,7 +32,15 @@
 PUBLISH_MAX_BYTES="${PUBLISH_MAX_BYTES:-2040109465}"
 
 # Size in bytes: GNU stat on the runner, BSD stat where the tests run on macOS.
+# A missing file is named before either is asked. GNU stat reads the BSD form
+# as a usage error, so on the runner a missing file used to print nothing but
+# "stat: invalid option -- '%'". The error goes to stderr, since callers read the
+# size from stdout.
 file_bytes() {
+  if [ ! -f "$1" ]; then
+    echo "::error::$1 does not exist." >&2
+    return 1
+  fi
   stat -c%s "$1" 2>/dev/null || stat -f%z "$1"
 }
 
@@ -171,6 +179,12 @@ verify_assets() {  # $1=tag, then the files
 publish_release() {  # $1=tag $2=title $3=notes file, then the files
   local tag="$1" title="$2" notes="$3" state f
   shift 3
+  # Every file is here before the release is touched. publish_metrics measures
+  # only the databases, and a missing manifest got as far as an empty draft and
+  # five failed uploads before anything said which file it was.
+  for f in "$@"; do
+    file_bytes "$f" >/dev/null || return 1
+  done
   state=$(release_state "$tag") || return 1
   case "$state" in
     ""|published) ;;

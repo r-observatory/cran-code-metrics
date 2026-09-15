@@ -351,6 +351,39 @@ test_that("the refusal over two releases under one tag names them by id, not by 
   expect_length(.pub_state(world), 3L)
 })
 
+# A `stat` that answers the way GNU coreutils does on the runner, whatever this
+# machine has: -c takes a format, and -f means --file-system and takes none, so
+# the BSD form `-f%z` is a usage error.
+.pub_gnu_stat <- function(world) {
+  writeLines(c(
+    "#!/usr/bin/env bash",
+    'case "$1" in',
+    '  -c%s)',
+    '    [ -e "$2" ] || { echo "stat: cannot statx $2: No such file or directory" >&2; exit 1; }',
+    '    wc -c < "$2" | tr -d " " ;;',
+    "  *) echo \"stat: invalid option -- '%'\" >&2; exit 1 ;;",
+    "esac"), file.path(world$bin, "stat"))
+  Sys.chmod(file.path(world$bin, "stat"), mode = "0755")
+}
+
+test_that("a file missing from out/ is named before the release is touched", {
+  # file_bytes tries GNU stat and then BSD stat, and on the runner the BSD form
+  # is a usage error, so a missing database failed the step with nothing but
+  # "stat: invalid option -- '%'". A missing manifest is not measured for the
+  # size budget at all: it got as far as an empty draft and five uploads.
+  for (missing in c("cran-data-metrics.db", "data-manifest.json")) {
+    world <- .pub_world(list(.pub_0912()))
+    .pub_gnu_stat(world)
+    unlink(file.path(world$work, "out", missing))
+    res <- .pub_run(world, .pub_today)
+    expect_false(res$status == 0L)
+    expect_true(any(grepl(sprintf("::error::out/%s does not exist", missing),
+                          res$output, fixed = TRUE)))
+    expect_false(any(grepl("invalid option", res$output, fixed = TRUE)))
+    expect_length(.pub_log(world), 0L)
+  }
+})
+
 test_that("a database over the size budget is refused before the release is touched", {
   world <- .pub_world(list(.pub_0912()))
   res <- .pub_run(world, .pub_today, env = c(PUBLISH_MAX_BYTES = "4000"))

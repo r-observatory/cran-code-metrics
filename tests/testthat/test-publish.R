@@ -290,15 +290,66 @@ test_that("an upload that never lands fails the step, keeps yesterday as the bas
   .pub_expect_whole(world, "metrics-2026-09-13")
 })
 
-test_that("a failed publish edit leaves a draft that the next attempt replaces", {
+test_that("a publish edit that fails once is made again, and the release is published", {
+  # The edit comes after every asset has uploaded and been checked, so one 500
+  # on it threw away a verified upload, left a complete draft, and the next
+  # run repeated the day's analysis.
   world <- .pub_world(list(.pub_0912()), faults = c(edit = 1L))
+  res <- .pub_run(world, .pub_today)
+  expect_equal(res$status, 0L)
+  r <- .pub_expect_whole(world, "metrics-2026-09-13")
+  expect_true(isTRUE(r$isLatest))
+  log <- .pub_log(world)
+  expect_length(grep("--draft=false", log, fixed = TRUE), 2L)
+  expect_length(grep("^gh release create", log), 1L)
+  expect_false(any(grepl("^gh release delete", log)))
+})
+
+test_that("a publish edit that applied but reported failure is safe to make again", {
+  # A PATCH that returns 500 can still have landed. The next attempt finds the
+  # now published release under the tag and sets the same fields on it.
+  world <- .pub_world(list(.pub_0912()), faults = c("edit-after" = 1L))
+  res <- .pub_run(world, .pub_today)
+  expect_equal(res$status, 0L)
+  r <- .pub_expect_whole(world, "metrics-2026-09-13")
+  expect_true(isTRUE(r$isLatest))
+  expect_false(isTRUE(.pub_only(world, "metrics-2026-09-12")$isLatest))
+  expect_length(grep("--draft=false", .pub_log(world), fixed = TRUE), 2L)
+})
+
+test_that("a publish edit that never lands leaves a draft that the next attempt replaces", {
+  world <- .pub_world(list(.pub_0912()), faults = c(edit = 99L))
   expect_false(.pub_run(world, .pub_today)$status == 0L)
+  expect_length(grep("--draft=false", .pub_log(world), fixed = TRUE), 5L)
   expect_true(isTRUE(.pub_only(world, "metrics-2026-09-13")$isDraft))
   res <- .pub_run(world, 'echo "metrics=$(latest_tag metrics)"')
   expect_true("metrics=metrics-2026-09-12" %in% res$output)
 
+  .pub_set_faults(world, integer(0L))
   expect_equal(.pub_run(world, .pub_today)$status, 0L)
   .pub_expect_whole(world, "metrics-2026-09-13")
+})
+
+test_that("an edit waits ten seconds longer after each failed attempt", {
+  world <- .pub_world(list(.pub_0912()), faults = c(edit = 2L))
+  slept <- file.path(world$dir, "slept")
+  res <- .pub_run(world,
+    "unset PUBLISH_RETRY_SECONDS",
+    sprintf('sleep() { echo "$1" >> %s; }', shQuote(slept)),
+    .pub_today)
+  expect_equal(res$status, 0L)
+  expect_equal(readLines(slept), c("10", "20"))
+})
+
+test_that("a draft that will not delete is not deleted again in the same call", {
+  # The delete goes by tag, and when the listing has not caught up with a
+  # release published under the same tag it can take that release instead, so
+  # it is not repeated. The draft is left to the next publish.
+  world <- .pub_world(list(.pub_0912(), .pub_stranded_0913()),
+                      faults = c(delete = 1L))
+  expect_false(.pub_run(world, .pub_today)$status == 0L)
+  expect_length(grep("^gh release delete", .pub_log(world)), 1L)
+  expect_false(any(grepl("^gh release (create|upload|edit)", .pub_log(world))))
 })
 
 test_that("a create that failed after making the draft is not retried, and the next attempt replaces it", {
@@ -434,6 +485,18 @@ test_that("a later shard replaces today's published assets in place", {
   expect_false(any(grepl("^gh release (create|delete)", .pub_log(world))))
 })
 
+test_that("a same-day notes edit that fails once is made again", {
+  world <- .pub_world(list(
+    .pub_0912(),
+    .pub_release(2L, "metrics-2026-09-13", assets = .pub_assets - 7L, latest = TRUE)),
+    faults = c(edit = 1L))
+  res <- .pub_run(world, .pub_today)
+  expect_equal(res$status, 0L)
+  r <- .pub_expect_whole(world, "metrics-2026-09-13")
+  expect_identical(r$body, "notes for today")
+  expect_length(grep("^gh release edit", .pub_log(world)), 2L)
+})
+
 test_that("a failed clobber of today's published release fails the step", {
   # bash ignores `set -e` inside a function called as `f || exit 1`, which is
   # how the shard loop calls publish_metrics. A failed upload followed by a
@@ -538,8 +601,9 @@ test_that("a draft a failed publish left on an earlier day is deleted once a lat
   # day leaves its draft, databases and all, under a tag nothing publishes
   # again.
   world <- .pub_world(list(.pub_0912(), .pub_stranded_0913()),
-                      faults = c(edit = 1L))
+                      faults = c(edit = 99L))
   expect_false(.pub_run(world, .pub_day("2026-09-14"))$status == 0L)
+  .pub_set_faults(world, integer(0L))
   expect_equal(.pub_run(world, .pub_day("2026-09-15"))$status, 0L)
   expect_equal(.pub_tags(world, drafts = TRUE),
                c("metrics-2026-09-13", "metrics-2026-09-14"))

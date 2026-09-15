@@ -33,7 +33,8 @@
 #   create          create returns HTTP 500 and creates nothing
 #   create-after    create makes the release, then returns HTTP 500
 #   cleanup         create's own delete of its draft returns HTTP 500
-#   list, view, edit, delete   that call returns HTTP 500
+#   list, view, edit, delete   that call returns HTTP 500 and changes nothing
+#   edit-after      `release edit` applies, then returns HTTP 500
 #   api, api-delete  `gh api` listing the releases, or deleting one by id,
 #                    returns HTTP 500
 set -u
@@ -276,6 +277,7 @@ case "$sub" in
       state | jq --argjson id "$id" --arg b "$notes" 'map(if .id == $id then .body = $b else . end)' | save
     fi
     if [ "$latest" = true ]; then make_latest "$id"; fi
+    if fault edit-after; then http500 "edit"; fi
     ;;
 
   delete)

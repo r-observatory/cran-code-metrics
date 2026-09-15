@@ -185,6 +185,29 @@ verify_assets() {  # $1=tag, then the files
   return 1
 }
 
+# Edit a release with the gh release edit flags that follow, up to five times,
+# 10 s, then 20 s and so on apart.
+#
+# Both edits a publish makes come after every asset has landed and been
+# checked, so one 500 on either would throw that upload away, leave the day's
+# release unpublished or its notes stale, and fail the run, which repeats the
+# day's analysis. Each is one PATCH that sets the same fields however many
+# times it lands, so repeating one that returned 500 and applied anyway changes
+# nothing: gh finds the release by its tag again and sets the fields again.
+edit_release() {  # $1=tag, then the flags
+  local tag="$1" n
+  shift
+  for n in 1 2 3 4 5; do
+    if gh release edit "$tag" "$@"; then
+      return 0
+    fi
+    echo "attempt ${n}: could not edit ${tag}"
+    if [ "$n" -lt 5 ]; then publish_backoff "$n" 10; fi
+  done
+  echo "::error::five attempts failed to edit ${tag}."
+  return 1
+}
+
 # Publish the files as the release under a tag, in the order given.
 #
 # No release yet: create an empty draft, upload, verify, then publish it as
@@ -193,7 +216,15 @@ verify_assets() {  # $1=tag, then the files
 # rather than trusting whatever it holds. Never with --cleanup-tag: a draft
 # has no git tag, so that flag deletes the release and then fails. Create is
 # never retried within a call either, because a POST that came back 500 may
-# still have made the release, and the next call finds and replaces it.
+# still have made the release, and the next call finds and replaces it. Nor is
+# the delete of the draft, which goes by tag: gh resolves a tag to a published
+# release as readily as to a draft (release_rows), so when the listing has not
+# caught up with a release published under the same tag, the delete can take
+# that release instead, and each repeat is another chance to. A draft left by
+# the one attempt is deleted by the next publish under the tag, or by
+# delete_stale_drafts once the day has passed. The listing, the uploads, the
+# read-back and the edits land the same however often they run, and each is
+# retried.
 #
 # Already published (an earlier shard today): replace its assets in place and
 # refresh the notes, as before, but with the retries and the check. That path
@@ -229,9 +260,9 @@ publish_release() {  # $1=tag $2=title $3=notes file, then the files
   done
   verify_assets "$tag" "$@" || return 1
   if [ -z "$state" ]; then
-    gh release edit "$tag" --draft=false --latest --notes-file "$notes" || return 1
+    edit_release "$tag" --draft=false --latest --notes-file "$notes" || return 1
   else
-    gh release edit "$tag" --notes-file "$notes" || return 1
+    edit_release "$tag" --notes-file "$notes" || return 1
   fi
 }
 

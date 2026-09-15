@@ -306,6 +306,34 @@ test_that("two releases under today's tag are refused before anything is touched
   expect_false(res$status == 0L)
   expect_true(any(grepl("more than one release", res$output, fixed = TRUE)))
   expect_false(any(grepl("^gh release (upload|create|delete|edit)", .pub_log(world))))
+  expect_false(any(grepl("-X DELETE", .pub_log(world), fixed = TRUE)))
+})
+
+test_that("the refusal over two releases under one tag names them by id, not by tag", {
+  # `gh release delete TAG` looks the tag up as a published release and as a
+  # draft at the same time and deletes whichever answer arrives first, so the
+  # advice to run it could take the published release and keep the draft.
+  twins <- list(
+    .pub_0912(),
+    .pub_release(2L, "metrics-2026-09-13", assets = .pub_assets),
+    .pub_stranded_0913(id = 3L))
+  world <- .pub_world(twins)
+  res <- .pub_run(world, .pub_today)
+  expect_false(res$status == 0L)
+  expect_true(any(grepl("id 2: published", res$output, fixed = TRUE)))
+  expect_true(any(grepl("id 3: draft", res$output, fixed = TRUE)))
+  expect_false(any(grepl("id 1:", res$output, fixed = TRUE)))
+  expect_true(any(grepl("gh api -X DELETE repos/{owner}/{repo}/releases/<id>",
+                        res$output, fixed = TRUE)))
+  expect_false(any(grepl("gh release delete", res$output, fixed = TRUE)))
+  expect_length(.pub_state(world), 3L)
+
+  # The ids could not be read: still refused, and it says where to find them.
+  world <- .pub_world(twins, faults = c(api = 1L))
+  res <- .pub_run(world, .pub_today)
+  expect_false(res$status == 0L)
+  expect_true(any(grepl("could not list their ids", res$output, fixed = TRUE)))
+  expect_length(.pub_state(world), 3L)
 })
 
 test_that("a database over the size budget is refused before the release is touched", {

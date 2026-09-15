@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# tests/testthat/fixtures/fake-gh.sh: a stand-in for the `gh release` calls
-# scripts/publish.sh makes. test-publish.R copies it onto PATH as `gh`.
+# tests/testthat/fixtures/fake-gh.sh: a stand-in for the `gh release` and
+# `gh api` calls scripts/publish.sh makes. test-publish.R copies it onto PATH as `gh`.
 #
 # It models the parts of gh 2.100.0 that decide whether a publish can strand a
 # draft, not the whole CLI:
@@ -32,6 +32,8 @@
 #   create-after    create makes the release, then returns HTTP 500
 #   cleanup         create's own delete of its draft returns HTTP 500
 #   list, view, edit, delete   that call returns HTTP 500
+#   api, api-delete  `gh api` listing the releases, or deleting one by id,
+#                    returns HTTP 500
 set -u
 
 echo "gh $*" >> "$GH_LOG"
@@ -89,6 +91,44 @@ drop_release() { state | jq --argjson id "$1" 'map(select(.id != $id))' | save; 
 make_latest() {
   state | jq --argjson id "$1" 'map(.isLatest = (.id == $id))' | save
 }
+
+# `gh api` for the two REST calls that address a release by id: list them all,
+# newest first as REST orders them, and delete one. The {owner}/{repo}
+# placeholders stay literal, since there is no repository here to fill them.
+if [ "${1:-}" = api ]; then
+  shift
+  method=GET; path=""; query=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -X|--method) method="$2"; shift ;;
+      -q|--jq) query="$2"; shift ;;
+      -*) ;;
+      *) path="$1" ;;
+    esac
+    shift
+  done
+  case "$method $path" in
+    "GET repos/{owner}/{repo}/releases"|"GET repos/{owner}/{repo}/releases?"*)
+      if fault api; then http500 "api releases"; fi
+      rest=$(state | jq '[reverse[] | {id, tag_name: .tagName, draft: .isDraft,
+                                       prerelease: (.isPrerelease // false),
+                                       name, assets}]')
+      if [ -n "$query" ]; then printf '%s\n' "$rest" | jq -r "$query"; else printf '%s\n' "$rest"; fi
+      ;;
+    "DELETE repos/{owner}/{repo}/releases/"*)
+      id="${path##*/}"
+      if fault api-delete; then http500 "api delete"; fi
+      state | jq -e --argjson id "$id" 'any(.[]; .id == $id)' >/dev/null ||
+        { echo "HTTP 404: Not Found (releases/$id)" >&2; exit 1; }
+      drop_release "$id"
+      ;;
+    *)
+      echo "fake gh: unsupported api call: $method $path" >&2
+      exit 2
+      ;;
+  esac
+  exit 0
+fi
 
 [ "${1:-}" = release ] || { echo "fake gh: unsupported command: $*" >&2; exit 2; }
 sub="${2:-}"

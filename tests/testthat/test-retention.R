@@ -670,15 +670,23 @@ test_that("the refusal names a repair and does not offer force_full as one", {
   expect_true(grepl("delete", msg, fixed = TRUE))
 })
 
-test_that("the repair names a draft release, and deleting one without a tag to clean up", {
+test_that("the repair deletes a draft beside the resolved release by id, never by tag", {
   # The 09-13 draft that wedged the pipeline carried manifests and no
-  # databases, and it was never published. A draft has no git tag, so
-  # `gh release delete --cleanup-tag` deletes it and then fails.
+  # databases, and it was never published. Resolution now skips drafts, so the
+  # only draft this advice can meet shares its tag with the published release
+  # the download step resolved. `gh release delete TAG` looks the tag up both
+  # ways at once and deletes whichever answer arrives first, so following
+  # advice to run it could take the published release and keep the draft.
   advice <- retention_repair_advice()
   expect_true(grepl("Draft", advice, fixed = TRUE))
   expect_true(grepl("never published", advice, fixed = TRUE))
-  expect_true(grepl("gh release delete", advice, fixed = TRUE))
-  expect_true(grepl("without --cleanup-tag", advice, fixed = TRUE))
+  expect_true(grepl(paste0(
+    "gh api 'repos/{owner}/{repo}/releases?per_page=100' --paginate ",
+    "-q '.[] | select(.tag_name == \"<tag>\") | \"\\(.id) draft=\\(.draft)\"'"),
+    advice, fixed = TRUE))
+  expect_true(grepl("gh api -X DELETE repos/{owner}/{repo}/releases/<id>",
+                    advice, fixed = TRUE))
+  expect_false(grepl("gh release delete", advice, fixed = TRUE))
   expect_true(nchar(retention_refusal(c(floor = "a", ceiling = "b"))) < 8000L)
 })
 

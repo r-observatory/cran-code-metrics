@@ -77,6 +77,25 @@ release_state() {
   return 1
 }
 
+# Every release as "<id> <tag> draft|published", newest first. REST rather than
+# `gh release list`, which has no id to give. An id is the only safe way to name
+# one of two releases under the same tag: `gh release delete TAG` looks the tag
+# up as a published release and as a draft at the same time and acts on
+# whichever answer comes back first.
+release_rows() {
+  gh api "repos/{owner}/{repo}/releases?per_page=100" --paginate \
+    -q '.[] | "\(.id) \(.tag_name) \(if .draft then "draft" else "published" end)"'
+}
+
+# "  id <id>: draft|published" for each release under a tag, for the operator.
+release_ids() {  # $1=tag
+  local rows id t kind
+  rows=$(release_rows) || return 1
+  while read -r id t kind; do
+    if [ "$t" = "$1" ]; then echo "  id ${id}: ${kind}"; fi
+  done <<< "$rows"
+}
+
 # gh retries an upload 3 times, 200 ms apart, which does not outlast an outage:
 # on 09-13 the database uploads were failing for at least two minutes. --clobber
 # on every attempt, because a failed attempt can leave a partial asset under the
@@ -147,7 +166,10 @@ publish_release() {  # $1=tag $2=title $3=notes file, then the files
       gh release delete "$tag" --yes || return 1
       state="" ;;
     *)
-      echo "::error::more than one release is named ${tag} ($(printf '%s' "$state" | tr '\n' ' ')). Delete the draft ones (gh release delete without --cleanup-tag) and re-run."
+      # Not by tag: the delete could take the published one and keep the draft.
+      echo "::error::more than one release is named ${tag} ($(printf '%s' "$state" | tr '\n' ' ')). Delete the draft ones by id, with gh api -X DELETE repos/{owner}/{repo}/releases/<id>, and re-run. A delete by tag can take the published one."
+      release_ids "$tag" ||
+        echo "  could not list their ids; gh api 'repos/{owner}/{repo}/releases?per_page=100' --paginate shows them."
       return 1 ;;
   esac
 

@@ -177,12 +177,38 @@ test_that("latest_tag keeps a pre-release as a baseline", {
 test_that("a listing latest_tag could not read stops the step instead of reading as no release", {
   # An empty answer is a cold start, and a cold start publishes an empty
   # database as latest.
-  world <- .pub_world(list(.pub_0912()), faults = c(list = 1L))
+  world <- .pub_world(list(.pub_0912()), faults = c(list = 99L))
   res <- .pub_run(world,
     'METRICS_TAG=$(latest_tag metrics)',
     'echo "resolved:${METRICS_TAG}"')
   expect_false(res$status == 0L)
   expect_false(any(grepl("^resolved:", res$output)))
+  expect_length(grep("^gh release list", .pub_log(world)), 5L)
+})
+
+test_that("a listing latest_tag could not read once is read again", {
+  # It is the first call to GitHub in every run, in the download step, so one
+  # 500 on it stopped the run before anything else had a chance. The tag is
+  # the function's stdout, so the attempt messages must stay out of it.
+  world <- .pub_world(list(.pub_0912(), .pub_stranded_0913()),
+                      faults = c(list = 1L))
+  res <- .pub_run(world,
+    'METRICS_TAG=$(latest_tag metrics)',
+    'echo "resolved:<${METRICS_TAG}>"')
+  expect_equal(res$status, 0L)
+  expect_true("resolved:<metrics-2026-09-12>" %in% res$output)
+  expect_true(any(grepl("attempt 1: could not list", res$output, fixed = TRUE)))
+  expect_length(grep("^gh release list", .pub_log(world)), 2L)
+
+  # 10 s, then 20 s, as release_state waits.
+  world <- .pub_world(list(.pub_0912()), faults = c(list = 2L))
+  slept <- file.path(world$dir, "slept")
+  res <- .pub_run(world,
+    "unset PUBLISH_RETRY_SECONDS",
+    sprintf('sleep() { echo "$1" >> %s; }', shQuote(slept)),
+    "latest_tag metrics >/dev/null || exit 1")
+  expect_equal(res$status, 0L)
+  expect_equal(readLines(slept), c("10", "20"))
 })
 
 # ---------------------------------------------------------------------------

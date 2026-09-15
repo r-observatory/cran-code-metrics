@@ -60,10 +60,24 @@ publish_backoff() {
 # that as latest, so a listing that failed must never read as empty. The list
 # is read into a variable first for that reason: in a pipeline its exit status
 # would depend on whether the caller set pipefail.
+#
+# This is the first call to GitHub in every run, so the listing is read up to
+# five times, 10 s, then 20 s and so on apart, as release_state reads it. One
+# 500 here stopped the download step before the run did anything. The tag is
+# this function's stdout, so the attempt messages go to stderr, and a listing
+# that fails all five times still fails the call rather than answering empty.
 latest_tag() {
-  local tags
-  tags=$(gh release list --exclude-drafts --limit 1000 --json tagName -q '.[].tagName') || return 1
-  printf '%s\n' "$tags" | { grep "^$1-" || true; } | sort -r | head -1
+  local tags n
+  for n in 1 2 3 4 5; do
+    if tags=$(gh release list --exclude-drafts --limit 1000 --json tagName -q '.[].tagName'); then
+      printf '%s\n' "$tags" | { grep "^$1-" || true; } | sort -r | head -1
+      return 0
+    fi
+    echo "attempt ${n}: could not list the releases to find the newest $1 release" >&2
+    if [ "$n" -lt 5 ]; then publish_backoff "$n" 10; fi
+  done
+  echo "::error::five attempts failed to list the releases; cannot tell whether a $1 release exists." >&2
+  return 1
 }
 
 # What exists under a tag: nothing (empty), "published", "draft", or one line

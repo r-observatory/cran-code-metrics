@@ -4,7 +4,8 @@
 #
 # It models the parts of gh 2.100.0 that decide whether a publish can strand a
 # draft, not the whole CLI:
-#   - `release list` returns drafts unless told --exclude-drafts.
+#   - `release list` returns drafts unless told --exclude-drafts, and
+#     pre-releases unless told --exclude-pre-releases.
 #   - `release view/upload/edit/delete TAG` look the tag up as a published
 #     release and as a draft at the same time and act on whichever answers
 #     first, the way shared.FetchRelease does: gh 2.100.0
@@ -21,7 +22,7 @@
 #     release and then exits non-zero.
 #
 # State is $GH_STATE, a JSON array of releases, oldest first:
-#   {id, tagName, isDraft, isLatest, hasTag, name, body,
+#   {id, tagName, isDraft, isPrerelease, isLatest, hasTag, name, body,
 #    assets: [{name, size, state}]}
 # Every call is appended to $GH_LOG. A fault is a file in $GH_FAULTS holding how
 # many more times it fires:
@@ -95,17 +96,20 @@ shift 2
 
 case "$sub" in
   list)
-    exclude=false; query=""
+    exclude=false; exclude_pre=false; query=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --exclude-drafts) exclude=true ;;
+        --exclude-pre-releases) exclude_pre=true ;;
         -q|--jq) query="$2"; shift ;;
         -L|--limit|--json) shift ;;
       esac
       shift
     done
     if fault list; then http500 "list"; fi
-    listed=$(state | jq --argjson e "$exclude" '[reverse[] | select(($e and .isDraft) | not)]')
+    listed=$(state | jq --argjson e "$exclude" --argjson p "$exclude_pre" '
+      [reverse[] | select(($e and .isDraft) | not)
+                 | select(($p and (.isPrerelease // false)) | not)]')
     if [ -n "$query" ]; then printf '%s\n' "$listed" | jq -r "$query"; else printf '%s\n' "$listed"; fi
     ;;
 
@@ -145,7 +149,8 @@ case "$sub" in
     fi
     id=$(( $(state | jq 'map(.id) | max // 0') + 1 ))
     state | jq --argjson id "$id" --arg t "$tag" --arg ti "$title" --arg b "$notes" '
-      . + [{id: $id, tagName: $t, isDraft: true, isLatest: false, hasTag: false,
+      . + [{id: $id, tagName: $t, isDraft: true, isPrerelease: false,
+            isLatest: false, hasTag: false,
             name: $ti, body: $b, assets: []}]' | save
     if [ "$draft" = false ]; then
       # gh keeps the release a draft while it uploads, and publishes it last.

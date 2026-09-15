@@ -24,8 +24,9 @@
 
 # A release as the fake keeps it. `assets` is a named integer vector of sizes.
 .pub_release <- function(id, tag, draft = FALSE, assets = integer(0L),
-                         latest = FALSE) {
-  list(id = id, tagName = tag, isDraft = draft, isLatest = latest,
+                         latest = FALSE, prerelease = FALSE) {
+  list(id = id, tagName = tag, isDraft = draft, isPrerelease = prerelease,
+       isLatest = latest,
        hasTag = !draft, name = tag, body = "",
        assets = unname(lapply(names(assets), function(n) {
          list(name = n, size = assets[[n]], state = "uploaded")
@@ -161,12 +162,15 @@ test_that("latest_tag skips a draft that sorts above every published release", {
 })
 
 test_that("latest_tag keeps a pre-release as a baseline", {
-  # gh publishes a pre-release only once every asset is attached, so it is a
-  # complete release; skipping it would move the baseline back a day.
-  pre <- .pub_release(3L, "metrics-2026-09-13", assets = .pub_assets)
-  pre$isPrerelease <- TRUE
-  world <- .pub_world(list(.pub_0912(), pre))
+  # This pipeline never makes a pre-release, so one here was marked by hand,
+  # and skipping it would move the baseline back a day.
+  # The fake drops pre-releases when told --exclude-pre-releases, so a listing
+  # that leaves them out resolves 09-12 here and fails this.
+  world <- .pub_world(list(
+    .pub_0912(),
+    .pub_release(3L, "metrics-2026-09-13", assets = .pub_assets, prerelease = TRUE)))
   res <- .pub_run(world, 'echo "metrics=$(latest_tag metrics)"')
+  expect_equal(res$status, 0L)
   expect_true("metrics=metrics-2026-09-13" %in% res$output)
 })
 

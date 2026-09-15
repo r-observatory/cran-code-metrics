@@ -488,6 +488,37 @@ test_that("the harvest upload goes only into a published release", {
   expect_equal(sizes[["cran-data-metrics.db"]], 2993L)
 })
 
+test_that("the harvest refuses two releases under one tag and names them by id", {
+  # The refusal is the only thing that tells the operator how to clear the
+  # tag, and a delete by tag can take the published release and keep the draft.
+  harvest <- 'replace_published_asset metrics-2026-09-13 out/cran-code-metrics.db || exit 1'
+  twins <- list(
+    .pub_0912(),
+    .pub_release(2L, "metrics-2026-09-13", assets = .pub_assets - 7L),
+    .pub_stranded_0913(id = 3L))
+  world <- .pub_world(twins)
+  res <- .pub_run(world, harvest)
+  expect_false(res$status == 0L)
+  expect_true(any(grepl("more than one release", res$output, fixed = TRUE)))
+  expect_true(any(grepl("id 2: published", res$output, fixed = TRUE)))
+  expect_true(any(grepl("id 3: draft", res$output, fixed = TRUE)))
+  expect_false(any(grepl("id 1:", res$output, fixed = TRUE)))
+  expect_true(any(grepl("gh api -X DELETE repos/{owner}/{repo}/releases/<id>",
+                        res$output, fixed = TRUE)))
+  expect_false(any(grepl("gh release delete", res$output, fixed = TRUE)))
+  expect_false(any(grepl("^gh release (upload|create|delete|edit)", .pub_log(world))))
+  expect_false(any(grepl("-X DELETE", .pub_log(world), fixed = TRUE)))
+  expect_length(.pub_state(world), 3L)
+
+  # The ids could not be read: still refused, and it says where to find them.
+  world <- .pub_world(twins, faults = c(api = 1L))
+  res <- .pub_run(world, harvest)
+  expect_false(res$status == 0L)
+  expect_true(any(grepl("could not list their ids", res$output, fixed = TRUE)))
+  expect_false(any(grepl("^gh release upload", .pub_log(world))))
+  expect_length(.pub_state(world), 3L)
+})
+
 # ---------------------------------------------------------------------------
 # Drafts no publish comes back for
 # ---------------------------------------------------------------------------

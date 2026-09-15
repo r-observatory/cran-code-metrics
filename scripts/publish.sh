@@ -119,6 +119,16 @@ release_ids() {  # $1=tag
   done <<< "$rows"
 }
 
+# Refuse a tag that more than one release carries, and say how to clear it,
+# naming each release under it by id. Not by tag: the delete could take the
+# published one and keep the draft. $2 says what is refused. Always returns 1.
+refuse_doubled_tag() {  # $1=tag $2=what is refused
+  echo "::error::more than one release is named $1; $2 Delete the draft ones by id, with gh api -X DELETE repos/{owner}/{repo}/releases/<id>, and re-run. A delete by tag can take the published one."
+  release_ids "$1" ||
+    echo "  could not list their ids; gh api 'repos/{owner}/{repo}/releases?per_page=100' --paginate shows them."
+  return 1
+}
+
 # gh retries an upload 3 times, 200 ms apart, which does not outlast an outage:
 # on 09-13 the database uploads were failing for at least two minutes. --clobber
 # on every attempt, because a failed attempt can leave a partial asset under the
@@ -207,10 +217,7 @@ publish_release() {  # $1=tag $2=title $3=notes file, then the files
       gh release delete "$tag" --yes || return 1
       state="" ;;
     *)
-      # Not by tag: the delete could take the published one and keep the draft.
-      echo "::error::more than one release is named ${tag} ($(printf '%s' "$state" | tr '\n' ' ')). Delete the draft ones by id, with gh api -X DELETE repos/{owner}/{repo}/releases/<id>, and re-run. A delete by tag can take the published one."
-      release_ids "$tag" ||
-        echo "  could not list their ids; gh api 'repos/{owner}/{repo}/releases?per_page=100' --paginate shows them."
+      refuse_doubled_tag "$tag" "refusing to publish into it."
       return 1 ;;
   esac
 
@@ -262,7 +269,7 @@ replace_published_asset() {  # $1=tag $2=file
       echo "::error::${tag} is a draft that was never published; run the normal update first, which replaces it."
       return 1 ;;
     *)
-      echo "::error::more than one release is named ${tag}; refusing to guess which one to update."
+      refuse_doubled_tag "$tag" "refusing to guess which one to update."
       return 1 ;;
   esac
   upload_asset "$tag" "$file" || return 1

@@ -69,9 +69,9 @@ test_that("the steps that resolve or publish a release source the shared helpers
   starts <- grep("^      - ", yml)
   steps <- split(yml, findInterval(seq_along(yml), starts))
   users <- Filter(function(s) {
-    any(grepl("latest_tag|publish_metrics|replace_published_asset", s))
+    any(grepl("latest_tag|publish_metrics|replace_published_asset|delete_stale_drafts", s))
   }, steps)
-  expect_length(users, 2L)   # the download step and the shard step
+  expect_length(users, 3L)   # the download, shard and prune steps
   for (s in users) {
     expect_true(any(grepl("source scripts/publish.sh", s, fixed = TRUE)))
   }
@@ -101,4 +101,22 @@ test_that("the harvest upload requires a published release", {
 
   body <- .sh_function(.publish_sh(), "replace_published_asset")
   expect_true(any(grepl("published", body, fixed = TRUE)))
+})
+
+test_that("the prune clears the drafts a failed publish left on an earlier day", {
+  # Publishing replaces a draft only under today's tag, and the prune's listing
+  # leaves drafts out, so without this a draft from a failed last run of a day
+  # stays for good.
+  yml <- .update_yml()
+  start <- grep("- name: Prune old dated releases", yml, fixed = TRUE)
+  expect_length(start, 1L)
+  prune <- yml[start:length(yml)]
+  expect_true(any(grepl("source scripts/publish.sh", prune, fixed = TRUE)))
+  expect_true(any(grepl(
+    'delete_stale_drafts metrics "metrics-$(date -u +%Y-%m-%d)" || exit 1',
+    prune, fixed = TRUE)))
+
+  body <- .sh_function(.publish_sh(), "delete_stale_drafts")
+  expect_true(any(grepl("gh api -X DELETE", body, fixed = TRUE)))
+  expect_false(any(grepl("gh release delete", body[!grepl("^\\s*#", body)], fixed = TRUE)))
 })

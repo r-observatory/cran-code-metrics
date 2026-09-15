@@ -16,8 +16,9 @@
 # So a draft is never a baseline here, and the publish is spelled out rather
 # than left to one gh call: an empty draft, one asset at a time with retries of
 # our own, a check of what landed, and only then the publish. On a new day's
-# release a failure at any point leaves at most a draft that nothing resolves,
-# and the next publish under that tag deletes it and starts again.
+# release a failure at any point leaves at most a draft that nothing resolves.
+# A later publish the same day deletes it and starts again; once the day has
+# passed, the prune step deletes it (delete_stale_drafts).
 #
 # Every gh call inside a function ends in `|| return 1` or sits in an `if`. The
 # shard loop calls `publish_metrics ... || exit 1`, and bash ignores `set -e`
@@ -226,4 +227,31 @@ replace_published_asset() {  # $1=tag $2=file
   esac
   upload_asset "$tag" "$file" || return 1
   verify_assets "$tag" "$file" || return 1
+}
+
+# Delete the drafts in a series that no publish will come back for.
+#
+# publish_release replaces a draft only under the tag it is publishing, and the
+# prune lists without drafts. So a publish that fails in the last run of a day,
+# or in a dispatch, leaves its draft under a tag nothing uses again, holding up
+# to both databases, for good. The prune step runs this once the run's own
+# publish has gone through, under the workflow's concurrency group, so no
+# publish is part way through a draft. Today's tag is skipped all the same: the
+# next publish today replaces that draft itself.
+#
+# By id, for the reason release_rows gives: a draft can share its tag with a
+# published release. A delete that fails is left for the next scheduled run. A
+# listing that fails stops the step, as the prune's own listing does, rather
+# than reading as no drafts.
+delete_stale_drafts() {  # $1=series $2=tag to leave alone
+  local rows id t kind
+  rows=$(release_rows) || return 1
+  while read -r id t kind; do
+    case "$t" in "$1"-*) ;; *) continue ;; esac
+    if [ "$kind" != draft ] || [ "$t" = "$2" ]; then continue; fi
+    echo "deleting the draft ${t} (release ${id}), left by a publish that did not finish"
+    if ! gh api -X DELETE "repos/{owner}/{repo}/releases/${id}"; then
+      echo "::warning::could not delete the draft ${t} (release ${id}); the next scheduled run tries again."
+    fi
+  done <<< "$rows"
 }

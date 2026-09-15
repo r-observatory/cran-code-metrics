@@ -413,3 +413,76 @@ test_that("the harvest upload goes only into a published release", {
   expect_equal(sizes[["cran-code-metrics.db"]], 5000L)
   expect_equal(sizes[["cran-data-metrics.db"]], 2993L)
 })
+
+# ---------------------------------------------------------------------------
+# Drafts no publish comes back for
+# ---------------------------------------------------------------------------
+
+.pub_tags <- function(world, drafts) {
+  rs <- Filter(function(r) isTRUE(r$isDraft) == drafts, .pub_state(world))
+  sort(vapply(rs, function(r) r$tagName, character(1L)))
+}
+
+.pub_day <- function(d) {
+  sprintf('publish_metrics metrics-%s "CRAN Metrics - %s" || exit 1', d, d)
+}
+
+test_that("a draft a failed publish left on an earlier day is deleted once a later day is out", {
+  # A publish replaces a draft only under the tag it publishes, and the prune
+  # leaves drafts out of its listing. A publish that fails in the last run of a
+  # day leaves its draft, databases and all, under a tag nothing publishes
+  # again.
+  world <- .pub_world(list(.pub_0912(), .pub_stranded_0913()),
+                      faults = c(edit = 1L))
+  expect_false(.pub_run(world, .pub_day("2026-09-14"))$status == 0L)
+  expect_equal(.pub_run(world, .pub_day("2026-09-15"))$status, 0L)
+  expect_equal(.pub_tags(world, drafts = TRUE),
+               c("metrics-2026-09-13", "metrics-2026-09-14"))
+
+  res <- .pub_run(world, "delete_stale_drafts metrics metrics-2026-09-15 || exit 1")
+  expect_equal(res$status, 0L)
+  expect_length(.pub_tags(world, drafts = TRUE), 0L)
+  expect_equal(.pub_tags(world, drafts = FALSE),
+               c("metrics-2026-09-12", "metrics-2026-09-15"))
+  deletes <- grep("-X DELETE", .pub_log(world), value = TRUE, fixed = TRUE)
+  expect_equal(sub(".*/", "", deletes), c("3", "2"))
+})
+
+test_that("clearing drafts leaves today's draft, other series and every published release alone", {
+  # By id, so a draft beside a published release under the same tag goes and
+  # the published one stays, which a delete by tag cannot promise.
+  world <- .pub_world(list(
+    .pub_release(10L, "code-2026-07-01", draft = TRUE),
+    .pub_0912(),
+    .pub_release(4L, "metrics-2026-09-12", draft = TRUE,
+                 assets = .pub_assets[c("code-manifest.json", "data-manifest.json")]),
+    .pub_release(5L, "metrics-2026-09-13", assets = .pub_assets, latest = TRUE),
+    .pub_release(6L, "metrics-2026-09-14", draft = TRUE)))
+  res <- .pub_run(world, "delete_stale_drafts metrics metrics-2026-09-14 || exit 1")
+  expect_equal(res$status, 0L)
+  expect_equal(vapply(.pub_state(world), function(r) r$id, integer(1L)),
+               c(10L, 1L, 5L, 6L))
+  expect_false(any(grepl("^gh release delete", .pub_log(world))))
+})
+
+test_that("a draft that will not delete waits for the next run, and a listing that fails stops the step", {
+  stale <- list(.pub_0912(), .pub_stranded_0913(),
+                .pub_release(3L, "metrics-2026-09-14", draft = TRUE),
+                .pub_release(4L, "metrics-2026-09-15", assets = .pub_assets))
+  step <- c("delete_stale_drafts metrics metrics-2026-09-15 || exit 1",
+            'echo "went on past the drafts"')
+
+  world <- .pub_world(stale, faults = c("api-delete" = 1L))
+  res <- .pub_run(world, step)
+  expect_equal(res$status, 0L)
+  expect_true(any(grepl("::warning::could not delete the draft metrics-2026-09-14",
+                        res$output, fixed = TRUE)))
+  expect_equal(.pub_tags(world, drafts = TRUE), "metrics-2026-09-14")
+
+  # A listing that cannot be read is not "no drafts".
+  world <- .pub_world(stale, faults = c(api = 1L))
+  res <- .pub_run(world, step)
+  expect_false(res$status == 0L)
+  expect_false("went on past the drafts" %in% res$output)
+  expect_length(.pub_tags(world, drafts = TRUE), 2L)
+})

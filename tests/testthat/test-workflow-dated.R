@@ -103,6 +103,96 @@ test_that("the harvest upload requires a published release", {
   expect_true(any(grepl("published", body, fixed = TRUE)))
 })
 
+test_that("an asset of a release that is already out is replaced by name, never clobbered", {
+  # `gh release upload --clobber` deletes the live asset and only then uploads
+  # its replacement, so a failure that outlasts the retries left today's
+  # release without its database, and every run after it was refused.
+  sh <- .publish_sh()
+  code <- function(name) {
+    body <- .sh_function(sh, name)
+    body[!grepl("^\\s*#", body)]
+  }
+  harvest <- code("replace_published_asset")
+  expect_true(any(grepl("swap_asset", harvest, fixed = TRUE)))
+  expect_false(any(grepl("upload_asset", harvest, fixed = TRUE)))
+
+  # The new day's draft is the one path that still uploads under the real
+  # names: nothing resolves a draft, so there is no reader to protect.
+  publish <- code("publish_release")
+  expect_true(any(grepl("swap_asset", publish, fixed = TRUE)))
+  expect_true(any(grepl("upload_asset", publish, fixed = TRUE)))
+
+  swap <- code("swap_asset")
+  expect_true(any(grepl('repair_asset "$tag" "$rel" "$name"', swap, fixed = TRUE)))
+  expect_true(any(grepl('upload_asset "$tag" "$link"', swap, fixed = TRUE)))
+  # The copy it replaces is renamed out of the way, never deleted: a delete
+  # cuts off a download of that asset that is already running.
+  expect_false(any(grepl("delete_asset", swap, fixed = TRUE)))
+  expect_true(any(grepl('rename_asset_retrying "$old_id" "${name}.prev"', swap, fixed = TRUE)))
+})
+
+test_that("the download step puts right what an interrupted replacement left on the release it reads", {
+  # Nothing publishes under an earlier day's tag again, so a replacement
+  # stopped between its two renames leaves that release without the asset,
+  # with the bytes under NAME.prev and no publish coming back for them. The
+  # run that reads the release is what comes back.
+  yml <- .update_yml()
+  start <- grep("- name: Download the latest databases", yml, fixed = TRUE)
+  expect_length(start, 1L)
+  end <- start - 1L +
+    grep("- name: Analyze shards", yml[start:length(yml)], fixed = TRUE)[1L]
+  download <- yml[start:end]
+
+  repairs <- grep("repair_release_assets", download)
+  expect_length(repairs, 2L)
+  # Each call, with the line it is continued onto, stops the step when it fails.
+  statements <- strsplit(gsub("\\\\\n\\s*", " ", paste(download, collapse = "\n")),
+                         "\n")[[1L]]
+  statements <- grep("repair_release_assets", statements, value = TRUE)
+  expect_length(statements, 2L)
+  expect_true(all(grepl("|| exit 1", statements, fixed = TRUE)))
+  # Before the run reads what the release carries, not after.
+  expect_lt(max(repairs), min(grep('list_assets "\\$(CODE|DATA)_SRC"', download)))
+})
+
+test_that("the prune clears the copies a replacement left on releases nothing publishes again", {
+  # Every replacement leaves the copy it replaced behind, and the last one of
+  # a day is never revisited, so each kept release would otherwise carry a
+  # second copy of both databases for good.
+  yml <- .update_yml()
+  start <- grep("- name: Prune old dated releases", yml, fixed = TRUE)
+  expect_length(start, 1L)
+  prune <- yml[start:length(yml)]
+  expect_true(any(grepl('sweep_swap_leftovers metrics "$METRICS_TAG" || exit 1',
+                        prune, fixed = TRUE)))
+})
+
+test_that("the cleanup leaves alone the tag the run published, not a day it works out again", {
+  # The shard step runs for hours, and the prune comes after it. A run that
+  # started late enough works out tomorrow's date there and sweeps the release
+  # it published minutes earlier, cutting off the downloads the copies it
+  # leaves behind exist to carry, and no longer spares a draft under the tag it
+  # was publishing. So the tag is settled once, where the release is made.
+  yml <- .update_yml()
+  shard <- grep("- name: Analyze shards", yml, fixed = TRUE)
+  prune <- grep("- name: Prune old dated releases", yml, fixed = TRUE)
+  expect_length(shard, 1L)
+  expect_length(prune, 1L)
+
+  publishing <- yml[shard:prune]
+  expect_true(any(grepl('echo "METRICS_TAG=${METRICS_TAG}" >> "$GITHUB_ENV"',
+                        publishing, fixed = TRUE)))
+  # One date for the run, worked out before the first publish.
+  expect_length(grep("date -u", publishing, fixed = TRUE), 1L)
+
+  cleanup <- yml[prune:length(yml)]
+  expect_false(any(grepl("date -u", cleanup, fixed = TRUE)))
+  expect_true(any(grepl('delete_stale_drafts metrics "$METRICS_TAG" || exit 1',
+                        cleanup, fixed = TRUE)))
+  expect_true(any(grepl('sweep_swap_leftovers metrics "$METRICS_TAG" || exit 1',
+                        cleanup, fixed = TRUE)))
+})
+
 test_that("the prune clears the drafts a failed publish left on an earlier day", {
   # Publishing replaces a draft only under today's tag, and the prune's listing
   # leaves drafts out, so without this a draft from a failed last run of a day
@@ -112,9 +202,8 @@ test_that("the prune clears the drafts a failed publish left on an earlier day",
   expect_length(start, 1L)
   prune <- yml[start:length(yml)]
   expect_true(any(grepl("source scripts/publish.sh", prune, fixed = TRUE)))
-  expect_true(any(grepl(
-    'delete_stale_drafts metrics "metrics-$(date -u +%Y-%m-%d)" || exit 1',
-    prune, fixed = TRUE)))
+  expect_true(any(grepl('delete_stale_drafts metrics "$METRICS_TAG" || exit 1',
+                        prune, fixed = TRUE)))
 
   body <- .sh_function(.publish_sh(), "delete_stale_drafts")
   expect_true(any(grepl("gh api -X DELETE", body, fixed = TRUE)))

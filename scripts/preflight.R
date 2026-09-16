@@ -8,10 +8,12 @@
 #
 # Two things happen here, in this order. A release that published a database
 # and no manifest gets a baseline measured from that database, because a
-# same-day republish replaces four assets one non-atomic --clobber at a time
-# and can be interrupted between them; refusing on the resulting pair made a
-# transient upload failure permanent, since the same release stays latest
-# tomorrow. Then each database is compared against the manifest that shipped
+# same-day republish replaces four assets one at a time and can be interrupted
+# between them; refusing on the resulting pair made a transient upload failure
+# permanent, since the same release stays latest tomorrow. The download step
+# repairs a replacement that was cut off mid-swap before this runs, so what
+# reaches here is a release whose assets are each whole and possibly of
+# different ages. Then each database is compared against the manifest that shipped
 # with it, and only a database holding LESS than its manifest recorded, or a
 # manifest whose database never arrived, stops the run.
 

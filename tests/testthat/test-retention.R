@@ -548,13 +548,16 @@ test_that("update.yml fails the run when a prior asset does not arrive", {
 # ---------------------------------------------------------------------------
 # The publish is not atomic, and the guard must not turn that into an outage
 # ---------------------------------------------------------------------------
-# A same-day publish_metrics() replaces four assets with `gh release upload
-# --clobber`, which deletes each existing asset before uploading its
-# replacement. gh cannot do that atomically, so a 502, a dropped connection,
-# the 350-minute job timeout or an operator cancel can leave a release carrying
-# shard N's database next to shard N-1's manifest, or no manifest at all. Both
-# states are read by every later run, because the same release stays
-# `latest_tag metrics` tomorrow and the day after.
+# A same-day publish_metrics() replaces four assets, one at a time. Each one
+# goes up under a temporary name and is given its own by a rename, so no reader
+# meets a half-written asset under the name it asked for, but the four still
+# land one after another: a 502, a dropped connection, the 350-minute job
+# timeout or an operator cancel can leave a release carrying shard N's database
+# next to shard N-1's manifest. A run that died between the two renames of one
+# asset leaves that name on nothing, its bytes under NAME.prev, until the next
+# run's repair puts the name back, and until then the release reads as carrying
+# no manifest. Both states are read by every later run, because the same
+# release stays `latest_tag metrics` tomorrow and the day after.
 
 test_that("a database ahead of its manifest proceeds, and one short of it refuses", {
   m <- .code_manifest_0814()

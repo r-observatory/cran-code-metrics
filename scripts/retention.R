@@ -321,10 +321,15 @@ retention_warnings <- function(series, current) {
 retention_repair_advice <- function() {
   paste0(
     "\nLook at the PREVIOUS release first. A later shard on the same day ",
-    "replaces the four assets one `gh release upload --clobber` at a time, ",
-    "which deletes each existing asset before uploading its replacement, so ",
-    "an interrupted publish can leave one shard's database beside another ",
-    "shard's manifest, or a manifest whose database is gone.\n",
+    "replaces the four assets one at a time, so an interrupted publish can ",
+    "leave one shard's database beside another shard's manifest.\n",
+    "Each asset is replaced by uploading it as `<name>.next` and then moving ",
+    "the name over, so an asset the release seems to have lost is usually ",
+    "still on it: its bytes are under `<name>.prev`, and the run that reads ",
+    "the release puts the name back before it reads it. ",
+    "`gh api repos/{owner}/{repo}/releases/<id>/assets` is the listing that ",
+    "shows all of them, an upload that was cut off included; `gh release ",
+    "view` and `gh release download` do not.\n",
     "If `gh release list` also shows a Draft under the tag the download step ",
     "resolved as code src / data src, a failed publish left it beside the ",
     "published release. It was never published, but a download by that tag ",
@@ -416,16 +421,17 @@ retention_refusal <- function(violations) {
 #'
 #' One-sided on purpose. Only `now < was` is the signature this guard is for: a
 #' truncated file, or a database from before the rows the manifest counted. The
-#' other direction, a database with MORE rows than its manifest, is what an
-#' interrupted `gh release upload --clobber` leaves when shard N's database
-#' lands and shard N-1's manifest is still attached, and it costs nothing: a
+#' other direction, a database with MORE rows than its manifest, is what a
+#' publish interrupted between two of its four assets leaves when shard N's
+#' database lands and shard N-1's manifest is still attached, and it costs
+#' nothing: a
 #' smaller baseline only makes the retention floor more permissive, never less.
 #' Demanding equality in both directions made that mishap permanent, because
 #' the same release is still `latest_tag metrics` tomorrow and the day after,
 #' so every scheduled run failed in the download step before analysing a single
 #' package. See prior_db_notes() for how the stale side is reported instead.
 #'
-#' In rows rather than bytes: a --harvest-descriptions run clobbers the
+#' In rows rather than bytes: a --harvest-descriptions run replaces the
 #' database asset while leaving the published manifest stale, so the file size
 #' can legitimately differ from db_bytes, but harvest only ever writes
 #' cran_archived_meta and can never move these two counts.
@@ -548,11 +554,14 @@ prior_db_notes <- function(series, counts, prior) {
 #' A baseline measured from a downloaded database, for a release that
 #' published no manifest.
 #'
-#' A same-day republish is not atomic (four assets, each existing one deleted by
-#' --clobber before its replacement lands), so a run that died in that window can
-#' leave a release carrying its database and no code-manifest.json. Refusing on
-#' that was a permanent outage: the same release stays latest, so every later
-#' run refused too, and the only recovery the refusal named was the wipe.
+#' A same-day republish is not atomic (four assets, one at a time), so a run
+#' that died between two of them can leave a release carrying a database newer
+#' than its manifest, and one that died between the two renames that give an
+#' asset its name can leave the release with no code-manifest.json at all until
+#' something puts the name back on the bytes under code-manifest.json.prev.
+#' Refusing on that was a permanent outage: the same release stays latest, so
+#' every later run refused too, and the only recovery the refusal named was the
+#' wipe.
 #'
 #' The database is right there and it is the thing worth protecting, so measure
 #' it. The result is a real floor for retention_violations(): a run that then
@@ -610,8 +619,8 @@ ensure_prior_baseline <- function(out_dir) {
     if (is.null(derived)) next
     jsonlite::write_json(derived, mpath, auto_unbox = TRUE, pretty = TRUE)
     notes <- c(notes, sprintf(paste0(
-      "the prior release carries %s but no %s manifest, which is what an ",
-      "interrupted `gh release upload --clobber` leaves. The baseline for ",
+      "the prior release carries %s but no %s manifest, which is what a ",
+      "publish interrupted between two of its assets leaves. The baseline for ",
       "this run was measured from the database instead: %s packages, %s rows ",
       "in %s. Re-upload the manifest that belongs with that database so the ",
       "next run has a published record to check against."),

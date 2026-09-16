@@ -22,15 +22,30 @@
   "cran-code-metrics.db" = 5000L, "cran-data-metrics.db" = 3000L,
   "code-manifest.json" = 40L, "data-manifest.json" = 60L)
 
-# A release as the fake keeps it. `assets` is a named integer vector of sizes.
+# A release as the fake keeps it. `assets` is a named integer vector of sizes,
+# and `extra` a list of .pub_asset() entries for the half-uploaded and
+# temporary ones a named vector cannot describe.
+#
+# Every asset carries an id, as an uploaded one does, because a replacement
+# turns on ids: the live asset keeps its id through the rename that moves it
+# out of the way, and the asset that takes its name is a different one.
 .pub_release <- function(id, tag, draft = FALSE, assets = integer(0L),
-                         latest = FALSE, prerelease = FALSE) {
+                         latest = FALSE, prerelease = FALSE,
+                         extra = list()) {
+  numbered <- lapply(seq_along(assets), function(i) {
+    .pub_asset(id * 100L + i, names(assets)[[i]], assets[[i]])
+  })
   list(id = id, tagName = tag, isDraft = draft, isPrerelease = prerelease,
        isLatest = latest,
        hasTag = !draft, name = tag, body = "",
-       assets = unname(lapply(names(assets), function(n) {
-         list(name = n, size = assets[[n]], state = "uploaded")
-       })))
+       assets = unname(c(numbered, extra)))
+}
+
+# One asset. A starter is what an upload that was cut off leaves: the full
+# declared size, no digest, and invisible to every listing but the per-release
+# one.
+.pub_asset <- function(id, name, size, state = "uploaded") {
+  list(id = id, name = name, size = size, state = state)
 }
 
 # The 09-12 release: published, Latest, and complete.
@@ -131,10 +146,29 @@
   sizes[order(names(sizes))]
 }
 
+.pub_asset_ids <- function(release) {
+  ids <- vapply(release$assets, function(a) as.integer(a$id), integer(1L))
+  names(ids) <- vapply(release$assets, function(a) a$name, character(1L))
+  ids[order(names(ids))]
+}
+
+.pub_asset_states <- function(release) {
+  st <- vapply(release$assets, function(a) as.character(a$state), character(1L))
+  names(st) <- vapply(release$assets, function(a) a$name, character(1L))
+  st[order(names(st))]
+}
+
+# The four assets a reader asks for by name, with the .prev a replacement
+# leaves behind and the .next an interrupted one leaves left out.
+.pub_live_sizes <- function(release) {
+  sizes <- .pub_asset_sizes(release)
+  sizes[!grepl("\\.(prev|next)$", names(sizes))]
+}
+
 .pub_expect_whole <- function(world, tag) {
   r <- .pub_only(world, tag)
   expect_false(isTRUE(r$isDraft))
-  expect_equal(.pub_asset_sizes(r), .pub_assets[order(names(.pub_assets))])
+  expect_equal(.pub_live_sizes(r), .pub_assets[order(names(.pub_assets))])
   invisible(r)
 }
 
@@ -497,7 +531,7 @@ test_that("a same-day notes edit that fails once is made again", {
   expect_length(grep("^gh release edit", .pub_log(world)), 2L)
 })
 
-test_that("a failed clobber of today's published release fails the step", {
+test_that("a replacement that never uploads fails the step", {
   # bash ignores `set -e` inside a function called as `f || exit 1`, which is
   # how the shard loop calls publish_metrics. A failed upload followed by a
   # notes edit that worked returned 0, and the run went green with today's
@@ -505,7 +539,7 @@ test_that("a failed clobber of today's published release fails the step", {
   world <- .pub_world(list(
     .pub_0912(),
     .pub_release(2L, "metrics-2026-09-13", assets = .pub_assets - 7L, latest = TRUE)),
-    faults = c("upload-cran-code-metrics.db" = 99L))
+    faults = c("upload-cran-code-metrics.db.next" = 99L))
   res <- .pub_run(world, .pub_today, 'echo "went on past the publish"')
   expect_false(res$status == 0L)
   expect_false("went on past the publish" %in% res$output)
@@ -543,12 +577,14 @@ test_that("the harvest upload goes only into a published release", {
   world <- .pub_world(list(
     .pub_0912(),
     .pub_release(2L, "metrics-2026-09-13", assets = .pub_assets - 7L, latest = TRUE)),
-    faults = c("upload-cran-code-metrics.db" = 1L))
+    faults = c("upload-cran-code-metrics.db.next" = 1L))
   res <- .pub_run(world, harvest)
   expect_equal(res$status, 0L)
   sizes <- .pub_asset_sizes(.pub_only(world, "metrics-2026-09-13"))
   expect_equal(sizes[["cran-code-metrics.db"]], 5000L)
   expect_equal(sizes[["cran-data-metrics.db"]], 2993L)
+  # The copy it replaced is left for a download that is already running.
+  expect_equal(sizes[["cran-code-metrics.db.prev"]], 4993L)
 })
 
 test_that("the harvest names a database missing from out/ before the release is touched", {
@@ -599,6 +635,434 @@ test_that("the harvest refuses two releases under one tag and names them by id",
   expect_true(any(grepl("could not list their ids", res$output, fixed = TRUE)))
   expect_false(any(grepl("^gh release upload", .pub_log(world))))
   expect_length(.pub_state(world), 3L)
+})
+
+# ---------------------------------------------------------------------------
+# Replacing an asset of a release that is already out
+# ---------------------------------------------------------------------------
+# A same-day republish used to upload each file with `gh release upload
+# --clobber`, which deletes the live asset and only then uploads its
+# replacement. When every attempt failed, the published release was left
+# without that asset for good: it is still `latest_tag metrics` tomorrow, so
+# the download step came back with a manifest and no database and preflight
+# refused every run after it.
+#
+# The replacement uploads under a temporary name and swaps the names once the
+# bytes are on the release, so the gap in which a reader finds no asset of that
+# name is one rename wide rather than one upload wide, and the copy it replaces
+# stays under NAME.prev for a download that is already running.
+#
+# The fault names say where a run was interrupted:
+#   upload-NAME.next     the temporary upload never lands
+#   starter-NAME.next    it is cut off part way, leaving a half-uploaded asset
+#   rename-to-NAME.prev  the rename that moves the live asset out of the way
+#   rename-to-NAME       the rename that gives the new bytes the name, and the
+#                        rollback that puts the old asset back
+
+.pub_db <- "cran-code-metrics.db"
+
+.pub_out_today <- function(id = 2L, extra = list()) {
+  .pub_release(id, "metrics-2026-09-13", assets = .pub_assets - 7L,
+               latest = TRUE, extra = extra)
+}
+
+# What a reader that asks for one asset by name gets: its size, or "none".
+.pub_read_by_name <- function(world, tag, name) {
+  res <- .pub_run(world, sprintf(paste0(
+    'rm -rf dl; if gh release download %s -p %s -D dl 2>/dev/null; ',
+    'then echo "bytes=$(wc -c < dl/%s)"; else echo "bytes=none"; fi'),
+    tag, name, name))
+  line <- grep("^bytes=", res$output, value = TRUE)
+  gsub("[^0-9a-z]", "", sub("^bytes=", "", line))
+}
+
+# The asset name each `gh api -X PATCH ... -f name=X` in the log asked for.
+.pub_renames <- function(world) {
+  sub(".*-f name=", "", grep("-X PATCH .*-f name=", .pub_log(world), value = TRUE))
+}
+
+test_that("a republish never takes the live asset away before its replacement is there", {
+  world <- .pub_world(list(.pub_0912(), .pub_out_today()))
+  before <- .pub_asset_ids(.pub_only(world, "metrics-2026-09-13"))
+  expect_equal(.pub_run(world, .pub_today)$status, 0L)
+  r <- .pub_expect_whole(world, "metrics-2026-09-13")
+
+  # Every upload goes under the temporary name.
+  uploads <- grep("^gh release upload", .pub_log(world), value = TRUE)
+  expect_length(uploads, 4L)
+  expect_true(all(grepl("\\.next --clobber$", uploads)))
+
+  # The asset a reader asks for by name is a different asset now, and the one
+  # it replaced kept its id under .prev rather than being deleted.
+  ids <- .pub_asset_ids(r)
+  sizes <- .pub_asset_sizes(r)
+  expect_false(ids[[.pub_db]] %in% before)
+  expect_equal(ids[[paste0(.pub_db, ".prev")]], before[[.pub_db]])
+  expect_equal(sizes[[paste0(.pub_db, ".prev")]], 4993L)
+  expect_equal(.pub_read_by_name(world, "metrics-2026-09-13", .pub_db), "5000")
+  expect_false(any(grepl("-X DELETE", .pub_log(world), fixed = TRUE)))
+})
+
+test_that("a republish gives the databases their names before the manifests", {
+  # A manifest newer than the database beside it is the pair preflight has to
+  # refuse, so the order the renames land in matters as much as the uploads.
+  world <- .pub_world(list(.pub_0912(), .pub_out_today()))
+  expect_equal(.pub_run(world, .pub_today)$status, 0L)
+  named <- .pub_renames(world)
+  expect_equal(named, c(
+    paste0(.pub_db, ".prev"), .pub_db,
+    "cran-data-metrics.db.prev", "cran-data-metrics.db",
+    "code-manifest.json.prev", "code-manifest.json",
+    "data-manifest.json.prev", "data-manifest.json"))
+})
+
+test_that("a replacement stopped after the temporary upload leaves the live asset in place", {
+  for (fault in c("upload-cran-code-metrics.db.next",
+                  "starter-cran-code-metrics.db.next",
+                  "rename-to-cran-code-metrics.db.prev")) {
+    world <- .pub_world(list(.pub_0912(), .pub_out_today()),
+                        faults = stats::setNames(99L, fault))
+    expect_false(.pub_run(world, .pub_today)$status == 0L)
+
+    # The published database is untouched, and still what a reader gets.
+    sizes <- .pub_asset_sizes(.pub_only(world, "metrics-2026-09-13"))
+    expect_equal(sizes[[.pub_db]], 4993L, info = fault)
+    expect_false(paste0(.pub_db, ".prev") %in% names(sizes), info = fault)
+    expect_equal(.pub_read_by_name(world, "metrics-2026-09-13", .pub_db), "4993")
+
+    # The next run clears what it left and publishes the day whole.
+    .pub_set_faults(world, integer(0L))
+    expect_equal(.pub_run(world, .pub_today)$status, 0L)
+    .pub_expect_whole(world, "metrics-2026-09-13")
+  }
+})
+
+test_that("a replacement stopped between the two renames rolls the live asset back", {
+  # The first rename landed, so the name a reader asks for is on the asset the
+  # run was replacing. Nothing else has been swapped, so the day is exactly
+  # where it started: the old database beside the old manifest.
+  world <- .pub_world(list(.pub_0912(), .pub_out_today()),
+                      faults = c("rename-to-cran-code-metrics.db" = 5L))
+  expect_false(.pub_run(world, .pub_today)$status == 0L)
+  sizes <- .pub_asset_sizes(.pub_only(world, "metrics-2026-09-13"))
+  expect_equal(sizes[[.pub_db]], 4993L)
+  expect_equal(.pub_read_by_name(world, "metrics-2026-09-13", .pub_db), "4993")
+
+  .pub_set_faults(world, integer(0L))
+  expect_equal(.pub_run(world, .pub_today)$status, 0L)
+  .pub_expect_whole(world, "metrics-2026-09-13")
+})
+
+test_that("a rollback that also fails leaves the bytes under .prev for the next run", {
+  # This is the one state that hurts: the name is on nothing, so a reader gets
+  # "no assets match the file pattern" and preflight sees the asset as absent.
+  # The bytes are still there, and the next replacement puts the name back on
+  # them before it does anything else.
+  world <- .pub_world(list(.pub_0912(), .pub_out_today()),
+                      faults = c("rename-to-cran-code-metrics.db" = 99L))
+  expect_false(.pub_run(world, .pub_today)$status == 0L)
+  sizes <- .pub_asset_sizes(.pub_only(world, "metrics-2026-09-13"))
+  expect_false(.pub_db %in% names(sizes))
+  expect_equal(sizes[[paste0(.pub_db, ".prev")]], 4993L)
+  expect_equal(sizes[[paste0(.pub_db, ".next")]], 5000L)
+  expect_equal(.pub_read_by_name(world, "metrics-2026-09-13", .pub_db), "none")
+
+  .pub_set_faults(world, integer(0L))
+  res <- .pub_run(world, .pub_today)
+  expect_equal(res$status, 0L)
+  .pub_expect_whole(world, "metrics-2026-09-13")
+  # It put the name back on the published bytes rather than taking the .next
+  # it found: the manifests were not swapped, so the database that .next holds
+  # is not the one they describe.
+  expect_true(any(grepl(
+    sprintf("putting the name back on %s.prev", .pub_db), res$output, fixed = TRUE)))
+})
+
+test_that("every leftover an interrupted replacement can leave is put right by the next one", {
+  # Each of these was built on a real release, read the way the merger reads
+  # it, and repaired. The repair runs before the replacement touches anything.
+  old <- .pub_assets[[.pub_db]] - 7L
+  new <- .pub_assets[[.pub_db]]
+  live <- .pub_asset(250L, .pub_db, old)
+  prev <- .pub_asset(251L, paste0(.pub_db, ".prev"), old)
+  half <- .pub_asset(252L, paste0(.pub_db, ".next"), new, state = "starter")
+  whole <- .pub_asset(253L, paste0(.pub_db, ".next"), new)
+  half_live <- .pub_asset(254L, .pub_db, new, state = "starter")
+
+  leftovers <- list(
+    # Stopped during the temporary upload: the live asset is correct, and a
+    # half-uploaded asset is left that gh itself cannot see.
+    "cut-off upload"   = list(extra = list(half), read = old),
+    # Stopped after it: a complete .next, which would refuse the next upload.
+    "complete .next"   = list(extra = list(whole), read = old),
+    # Stopped after the swap: the old copy is still there under .prev.
+    "swapped already"  = list(extra = list(prev), read = old),
+    # Stopped between the renames: the name is on nothing.
+    "between renames"  = list(extra = list(prev, whole), read = NA,
+                              drop_live = TRUE),
+    # The name is on nothing and only the new bytes are left.
+    "only .next"       = list(extra = list(whole), read = NA, drop_live = TRUE),
+    # The live name itself holds an upload that was cut off. Its bytes are not
+    # servable, so it is not the copy a reader is on and must not be moved
+    # aside as one: with the copy the last replacement left beside it, and
+    # without, which leaves this replacement nothing to move aside at all.
+    "cut-off live"     = list(extra = list(half_live, prev), read = NA,
+                              drop_live = TRUE),
+    "cut-off live only" = list(extra = list(half_live), read = NA,
+                               drop_live = TRUE, prevs = 0L))
+
+  for (nm in names(leftovers)) {
+    case <- leftovers[[nm]]
+    assets <- if (isTRUE(case$drop_live)) .pub_assets[-1L] else .pub_assets
+    world <- .pub_world(list(.pub_0912(), .pub_release(
+      2L, "metrics-2026-09-13", assets = assets - 7L, latest = TRUE,
+      extra = case$extra)))
+    if (isTRUE(case$drop_live)) {
+      expect_equal(.pub_read_by_name(world, "metrics-2026-09-13", .pub_db),
+                   "none", info = nm)
+    }
+    expect_equal(.pub_run(world, .pub_today)$status, 0L, info = nm)
+    r <- .pub_expect_whole(world, "metrics-2026-09-13")
+    # Nothing of the interrupted run is left but the copy this one replaced,
+    # and nothing half written is left under any name: a replacement that
+    # moved one aside would put the rollback on bytes that cannot be served.
+    sizes <- .pub_asset_sizes(r)
+    expect_false(paste0(.pub_db, ".next") %in% names(sizes), info = nm)
+    expect_equal(length(grep(paste0("^", .pub_db, "\\.prev$"), names(sizes))),
+                 case$prevs %||% 1L, info = nm)
+    expect_false("starter" %in% .pub_asset_states(r), info = nm)
+  }
+})
+
+test_that("a leftover with nothing left to serve is named, and the run goes on to upload", {
+  # Only a half-uploaded .next: its bytes are not servable, so there is
+  # nothing to put the name back on. The replacement is about to supply the
+  # asset anyway, so it says so and carries on.
+  world <- .pub_world(list(.pub_0912(), .pub_release(
+    2L, "metrics-2026-09-13", assets = .pub_assets[-1L] - 7L, latest = TRUE,
+    extra = list(.pub_asset(252L, paste0(.pub_db, ".next"), 5000L,
+                            state = "starter")))))
+  res <- .pub_run(world, .pub_today)
+  expect_equal(res$status, 0L)
+  expect_true(any(grepl(sprintf("%s.next was cut off", .pub_db),
+                        res$output, fixed = TRUE)))
+  .pub_expect_whole(world, "metrics-2026-09-13")
+})
+
+test_that("a repair asked for twice does nothing the second time", {
+  world <- .pub_world(list(.pub_0912(), .pub_out_today(extra = list(
+    .pub_asset(251L, paste0(.pub_db, ".prev"), 4993L)))))
+  step <- c('REL=$(release_id metrics-2026-09-13) || exit 1',
+            sprintf('repair_asset metrics-2026-09-13 "$REL" %s || exit 1', .pub_db),
+            'echo "---"',
+            sprintf('repair_asset metrics-2026-09-13 "$REL" %s || exit 1', .pub_db))
+  res <- .pub_run(world, step)
+  expect_equal(res$status, 0L)
+  after <- res$output[seq(which(res$output == "---") + 1L, length(res$output))]
+  expect_false(any(grepl("clearing", after, fixed = TRUE)))
+  expect_equal(names(.pub_asset_sizes(.pub_only(world, "metrics-2026-09-13"))),
+               sort(names(.pub_assets)))
+})
+
+test_that("a temporary name is not what a reader asking for the database gets", {
+  # `gh release download -p NAME` matches the asset name exactly, so the
+  # copies a replacement leaves are invisible to the merger and to the
+  # download step, which both ask for the databases by name.
+  world <- .pub_world(list(.pub_0912(), .pub_out_today()))
+  expect_equal(.pub_run(world, .pub_today)$status, 0L)
+  expect_equal(.pub_read_by_name(world, "metrics-2026-09-13", .pub_db), "5000")
+  res <- .pub_run(world,
+    'gh release download metrics-2026-09-13 -p cran-code-metrics.db -D dl || exit 1',
+    'ls dl')
+  expect_equal(res$status, 0L)
+  expect_equal(grep("cran-code", res$output, value = TRUE), .pub_db)
+})
+
+test_that("a replacement that lands short or with other bytes is refused, and the live asset stays", {
+  for (fault in c("short-cran-code-metrics.db.next",
+                  "digest-cran-code-metrics.db.next")) {
+    world <- .pub_world(list(.pub_0912(), .pub_out_today()),
+                        faults = stats::setNames(99L, fault))
+    res <- .pub_run(world, .pub_today)
+    expect_false(res$status == 0L, info = fault)
+    expect_true(any(grepl(sprintf("%s.next", .pub_db), res$output, fixed = TRUE)),
+                info = fault)
+    sizes <- .pub_asset_sizes(.pub_only(world, "metrics-2026-09-13"))
+    expect_equal(sizes[[.pub_db]], 4993L, info = fault)
+    expect_length(.pub_renames(world), 0L)
+    # The bytes it refused are taken off the release, not left under the
+    # temporary name for a later repair to find.
+    expect_false(paste0(.pub_db, ".next") %in% names(sizes), info = fault)
+  }
+})
+
+test_that("the bytes a replacement refused are never what a later repair gives the name to", {
+  # The check after the upload is the one place that proves an asset wrong,
+  # and the repair gives NAME to a whole NAME.next when the release carries no
+  # NAME. So a .next the check refused must not be there for it to find: this
+  # release lost its database to an upload that was cut off, which the repair
+  # clears, and the replacement that follows lands wrong.
+  for (fault in c("short-cran-code-metrics.db.next",
+                  "digest-cran-code-metrics.db.next")) {
+    world <- .pub_world(list(.pub_0912(), .pub_release(
+      2L, "metrics-2026-09-13", assets = .pub_assets[-1L] - 7L, latest = TRUE,
+      extra = list(.pub_asset(252L, paste0(.pub_db, ".next"), 5000L,
+                              state = "starter")))),
+      faults = stats::setNames(99L, fault))
+    expect_false(.pub_run(world, .pub_today)$status == 0L, info = fault)
+    sizes <- .pub_asset_sizes(.pub_only(world, "metrics-2026-09-13"))
+    expect_false(paste0(.pub_db, ".next") %in% names(sizes), info = fault)
+
+    # The next run reads the release before it builds on it, and finds
+    # nothing to put the name back on rather than the bytes that were refused.
+    .pub_set_faults(world, integer(0L))
+    res <- .pub_run(world, sprintf(
+      "repair_release_assets metrics-2026-09-13 %s || exit 1", .pub_db))
+    expect_equal(res$status, 0L, info = fault)
+    expect_true(any(grepl(
+      sprintf("::warning::metrics-2026-09-13 carries no %s and nothing a replacement left aside",
+              .pub_db), res$output, fixed = TRUE)), info = fault)
+    expect_equal(.pub_read_by_name(world, "metrics-2026-09-13", .pub_db),
+                 "none", info = fault)
+  }
+})
+
+test_that("an upload that exits zero on bytes the release cannot serve is refused", {
+  # gh exiting 0 is not proof the bytes are servable: one 300 MiB upload did
+  # that and a download of the asset still answered BlobNotFound 24.5 s later.
+  # A half-written asset carries the full declared size, so the size alone
+  # cannot tell the two apart; the release has to say the asset is whole.
+  world <- .pub_world(list(.pub_0912(), .pub_out_today()),
+                      faults = c("lied-cran-code-metrics.db.next" = 99L))
+  res <- .pub_run(world, .pub_today)
+  expect_false(res$status == 0L)
+  expect_length(grep("^attempt [1-5]: metrics-2026-09-13 does not list cran-code-metrics.db.next",
+                     res$output), 5L)
+  expect_true(any(grepl(
+    "::error::metrics-2026-09-13 does not carry cran-code-metrics.db.next",
+    res$output, fixed = TRUE)))
+
+  # The published database keeps its name and its bytes, nothing was renamed,
+  # and the asset that was not servable is gone.
+  sizes <- .pub_asset_sizes(.pub_only(world, "metrics-2026-09-13"))
+  expect_equal(sizes[[.pub_db]], 4993L)
+  expect_length(.pub_renames(world), 0L)
+  expect_false(paste0(.pub_db, ".next") %in% names(sizes))
+  expect_equal(.pub_read_by_name(world, "metrics-2026-09-13", .pub_db), "4993")
+})
+
+test_that("a swap the release has not caught up with is read again, and refused if it never shows", {
+  # A listing taken inside 40 ms of a rename that answered 200 has been seen
+  # to still show the state before it, and refusing there would roll back a
+  # swap that worked. Three reads come before the read-back: the repair's, the
+  # check after the upload, and the one that finds the two ids. This release
+  # carries no database, so the reads that hide the name before the swap
+  # change nothing.
+  swap <- c('REL=$(release_id metrics-2026-09-13) || exit 1',
+            sprintf('swap_asset metrics-2026-09-13 "$REL" out/%s || exit 1', .pub_db))
+  missing <- list(.pub_0912(), .pub_release(
+    2L, "metrics-2026-09-13", assets = .pub_assets[-1L] - 7L, latest = TRUE))
+
+  world <- .pub_world(missing, faults = c("stale-cran-code-metrics.db" = 4L))
+  res <- .pub_run(world, swap)
+  expect_equal(res$status, 0L)
+  expect_true(any(grepl(
+    "attempt 1: metrics-2026-09-13 lists cran-code-metrics.db as [nothing]",
+    res$output, fixed = TRUE)))
+  expect_equal(.pub_asset_sizes(.pub_only(world, "metrics-2026-09-13"))[[.pub_db]],
+               5000L)
+  # Nothing was moved aside, so the line that says what happened says so.
+  expect_true(any(grepl("the release carried no cran-code-metrics.db before this run",
+                        res$output, fixed = TRUE)))
+  expect_false(any(grepl(paste0(.pub_db, ".prev"), res$output, fixed = TRUE)))
+
+  world <- .pub_world(missing, faults = c("stale-cran-code-metrics.db" = 99L))
+  res <- .pub_run(world, swap)
+  expect_false(res$status == 0L)
+  expect_true(any(grepl(
+    "::error::metrics-2026-09-13 lists cran-code-metrics.db as [nothing] after the swap",
+    res$output, fixed = TRUE)))
+})
+
+test_that("a live name the release does not list as whole is cleared, whatever state it is in", {
+  # The state of an upload that was cut off measures as "starter", which the
+  # documented states (uploaded, open) do not carry, so the set of them is not
+  # closed. This is the test that decides whether the copy under .prev, the
+  # only other one there is, gets deleted, so only "uploaded" counts as live.
+  for (state in c("starter", "open")) {
+    world <- .pub_world(list(.pub_0912(), .pub_release(
+      2L, "metrics-2026-09-13", assets = .pub_assets[-1L] - 7L, latest = TRUE,
+      extra = list(.pub_asset(254L, .pub_db, 5000L, state = state),
+                   .pub_asset(251L, paste0(.pub_db, ".prev"), 4993L)))))
+    res <- .pub_run(world, c(
+      "REL=$(release_id metrics-2026-09-13) || exit 1",
+      sprintf('repair_asset metrics-2026-09-13 "$REL" %s || exit 1', .pub_db)))
+    expect_equal(res$status, 0L, info = state)
+    r <- .pub_only(world, "metrics-2026-09-13")
+    # The name goes back on the copy a reader can be served, and the asset
+    # that was not whole is gone rather than the copy that was.
+    expect_equal(.pub_asset_ids(r)[[.pub_db]], 251L, info = state)
+    expect_false(254L %in% .pub_asset_ids(r), info = state)
+    expect_equal(.pub_asset_sizes(r)[[.pub_db]], 4993L, info = state)
+  }
+})
+
+test_that("a replacement believes the release rather than the upload's exit status", {
+  # An upload that returns 0 is usually servable in the same instant, but once
+  # it was not, so state, size and digest are read back from the release. A
+  # read that has not caught up with the upload is read again rather than
+  # refused: refusing there fails a replacement whose bytes are all present.
+  # One of the three reads it hides is the repair's, before the upload.
+  world <- .pub_world(list(.pub_0912(), .pub_out_today()),
+                      faults = c("stale-cran-code-metrics.db.next" = 3L))
+  res <- .pub_run(world, .pub_today)
+  expect_equal(res$status, 0L)
+  expect_true(any(grepl("attempt 2: metrics-2026-09-13 does not list cran-code-metrics.db.next",
+                        res$output, fixed = TRUE)))
+  .pub_expect_whole(world, "metrics-2026-09-13")
+})
+
+test_that("the copies a replacement leaves are swept off the releases nothing publishes again", {
+  # Every asset that gets replaced leaves the copy it replaced behind, and the
+  # last replacement of a day is never revisited: without this sweep each kept
+  # release carries a second database for good. Today's is left alone, because
+  # deleting an asset cuts off a download of it that is already running.
+  world <- .pub_world(list(
+    # The legacy split series the prune is told to leave alone. Nothing here
+    # publishes to it again, and what a replacement of its own left is not
+    # this sweep's to put right.
+    .pub_release(10L, "code-2026-07-01", assets = .pub_assets[1L] - 2000L,
+                 extra = list(.pub_asset(170L, paste0(.pub_db, ".prev"), 2500L))),
+    .pub_release(1L, "metrics-2026-09-12", assets = .pub_assets - 1000L,
+                 latest = FALSE, extra = list(
+                   .pub_asset(150L, paste0(.pub_db, ".prev"), 3900L),
+                   .pub_asset(151L, "code-manifest.json.next", 40L))),
+    .pub_release(3L, "metrics-2026-09-11",
+                 assets = .pub_assets[-1L] - 1500L, extra = list(
+                   .pub_asset(160L, paste0(.pub_db, ".prev"), 3400L))),
+    .pub_out_today(extra = list(.pub_asset(250L, paste0(.pub_db, ".prev"), 4993L)))))
+
+  res <- .pub_run(world, "sweep_swap_leftovers metrics metrics-2026-09-13 || exit 1")
+  expect_equal(res$status, 0L)
+
+  # The day before yesterday lost the name a swap never finished giving back;
+  # the sweep puts it on the bytes that are still there.
+  eleven <- .pub_asset_sizes(.pub_only(world, "metrics-2026-09-11"))
+  expect_equal(eleven[[.pub_db]], 3400L)
+  expect_false(any(grepl("\\.(prev|next)$", names(eleven))))
+  twelve <- .pub_asset_sizes(.pub_only(world, "metrics-2026-09-12"))
+  expect_equal(twelve, .pub_assets[order(names(.pub_assets))] - 1000L)
+  # Today keeps its copy: tomorrow's sweep takes it.
+  thirteen <- .pub_asset_sizes(.pub_only(world, "metrics-2026-09-13"))
+  expect_equal(thirteen[[paste0(.pub_db, ".prev")]], 4993L)
+  # The other series comes out as it went in, assets and ids alike.
+  legacy <- .pub_only(world, "code-2026-07-01")
+  expect_equal(.pub_asset_ids(legacy),
+               c("cran-code-metrics.db" = 1001L,
+                 "cran-code-metrics.db.prev" = 170L))
+  expect_equal(.pub_asset_sizes(legacy),
+               c("cran-code-metrics.db" = 3000L,
+                 "cran-code-metrics.db.prev" = 2500L))
 })
 
 # ---------------------------------------------------------------------------

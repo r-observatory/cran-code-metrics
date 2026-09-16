@@ -2,8 +2,10 @@
 # tests/testthat/fixtures/fake-gh.sh: a stand-in for the `gh release` and
 # `gh api` calls scripts/publish.sh makes. test-publish.R copies it onto PATH as `gh`.
 #
-# It models the parts of gh 2.100.0 that decide whether a publish can strand a
-# draft, not the whole CLI:
+# It models the parts of gh 2.100.0 and of the release-assets API that decide
+# whether a publish can strand a draft or leave a published release without one
+# of its assets, not the whole CLI. The asset half was measured against a
+# scratch repository:
 #   - `release list` returns drafts unless told --exclude-drafts, and
 #     pre-releases unless told --exclude-pre-releases.
 #   - `release view/upload/edit/delete TAG` look the tag up as a published
@@ -18,20 +20,49 @@
 #     draft again if an upload fails, and that delete can fail too.
 #   - `upload --clobber` deletes the old copy before uploading the new one, so
 #     a failed upload leaves the release without that asset.
+#   - `upload` names the asset after the basename of the path it is given and
+#     sends the bytes a symlink points at, which is how a file is uploaded
+#     under another name without being copied. Every upload gets a new id.
 #   - `upload` refuses a file that is not there before it looks the release up,
 #     with "no matches found for `FILE`", so every retry of it fails the same.
+#   - an upload that was cut off leaves the asset in state "starter", at the
+#     full declared size and with a null digest. Only
+#     `GET /repos/O/R/releases/{id}/assets` lists it: `release view`, `release
+#     download` and `upload --clobber` cannot see one. It does not reserve its
+#     name either, so the next upload under that name displaces it.
+#   - `release download -p PATTERN` matches the asset NAME with filepath.Match,
+#     exact and case sensitive, so `x.db` matches neither `x.db.prev` nor
+#     `x.db.next`. With nothing matching: "no assets match the file pattern",
+#     exit 1.
+#   - `PATCH /releases/assets/{id}` with a name changes name and nothing else:
+#     the id, size, digest and state stay, and it answers 200. A name another
+#     asset of the same release already holds is 422 already_exists, compared
+#     case-insensitively; renaming an asset to the name it has is a 200 no-op;
+#     an id that is not there is 404. gh prints the error body on stdout, its
+#     "gh: Validation Failed (HTTP 422)" line on stderr, and exits 1.
+#   - `DELETE /releases/assets/{id}` answers 204, and 404 for an id that is gone.
+#   - both asset listings are ordered by the asset's CURRENT name, so a rename
+#     moves the asset in the listing.
 #   - a draft has no git tag, so `delete --cleanup-tag` on one deletes the
 #     release and then exits non-zero.
 #
 # State is $GH_STATE, a JSON array of releases, oldest first:
 #   {id, tagName, isDraft, isPrerelease, isLatest, hasTag, name, body,
-#    assets: [{name, size, state}]}
+#    assets: [{id, name, size, state, digest}]}
 # Every call is appended to $GH_LOG. A fault is a file in $GH_FAULTS holding how
 # many more times it fires:
-#   upload-<asset>  that asset's upload returns HTTP 500
+#   upload-<asset>  that asset's upload returns HTTP 500 and changes nothing
+#   starter-<asset> that asset's upload is cut off: it leaves the asset in
+#                   state "starter" and returns HTTP 500
+#   lied-<asset>    that asset's upload leaves it in state "starter" and
+#                   exits 0, as a 300 MiB upload once did: gh exited 0 and a
+#                   download of the asset answered BlobNotFound 24.5 s later
 #   short-<asset>   that asset's upload succeeds but lands one byte short
-#   stale-<asset>   `release view` leaves that asset out, as a read that has
+#   digest-<asset>  that asset's upload succeeds but lands other bytes
+#   stale-<asset>   an asset listing leaves that asset out, as a read that has
 #                   not caught up with its upload would
+#   rename-to-<name>  a PATCH that would set that name returns HTTP 500
+#   assets          the per-release asset listing returns HTTP 500
 #   create          create returns HTTP 500 and creates nothing
 #   create-after    create makes the release, then returns HTTP 500
 #   cleanup         create's own delete of its draft returns HTTP 500
@@ -45,7 +76,9 @@ echo "gh $*" >> "$GH_LOG"
 
 state() { cat "$GH_STATE"; }
 save() { local t; t=$(mktemp "${GH_STATE}.XXXXXX") && cat > "$t" && mv "$t" "$GH_STATE"; }
-fsize() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1"; }
+# Both follow a symlink, as an upload of one does.
+fsize() { wc -c < "$1" | tr -d ' '; }
+fdigest() { { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1"; } | cut -d' ' -f1; }
 
 fault() {
   local f="$GH_FAULTS/$1" n
@@ -69,56 +102,156 @@ resolve() {
     { echo "release not found" >&2; return 1; }
 }
 
-add_asset() {  # id file
-  local name size
-  name=$(basename "$2")
-  size=$(fsize "$2")
+# Every upload gets an id of its own, and a rename keeps it.
+next_asset_id() { state | jq '([.[].assets[]?.id] | max // 1000) + 1'; }
+
+add_asset() {  # release id, path, optional asset name
+  local rid="$1" path="$2" name size digest aid
+  name="${3:-$(basename "$2")}"
+  size=$(fsize "$path")
+  digest="sha256:$(fdigest "$path")"
   if fault "short-$name"; then size=$((size - 1)); fi
-  state | jq --argjson id "$1" --arg n "$name" --argjson s "$size" '
-    map(if .id == $id
+  if fault "digest-$name"; then
+    digest="sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  fi
+  aid=$(next_asset_id)
+  state | jq --argjson rid "$rid" --argjson aid "$aid" --arg n "$name" \
+             --argjson s "$size" --arg d "$digest" '
+    map(if .id == $rid
         then .assets = ([.assets[] | select(.name != $n)] +
-                        [{name: $n, size: $s, state: "uploaded"}])
+                        [{id: $aid, name: $n, size: $s, state: "uploaded", digest: $d}])
         else . end)' | save
 }
 
-drop_asset() {  # id name
+# What an upload that was cut off leaves: the full declared size, no digest,
+# and invisible to every listing but the per-release one.
+add_starter() {  # release id, path, asset name
+  local rid="$1" size aid
+  size=$(fsize "$2")
+  aid=$(next_asset_id)
+  state | jq --argjson rid "$rid" --argjson aid "$aid" --arg n "$3" --argjson s "$size" '
+    map(if .id == $rid
+        then .assets = ([.assets[] | select(.name != $n)] +
+                        [{id: $aid, name: $n, size: $s, state: "starter", digest: null}])
+        else . end)' | save
+}
+
+drop_asset() {  # release id, name
   state | jq --argjson id "$1" --arg n "$2" '
     map(if .id == $id then .assets |= map(select(.name != $n)) else . end)' | save
 }
 
-has_asset() {  # id name
+# An asset gh can see: `upload --clobber` and `release view` never meet a starter.
+has_uploaded() {  # release id, name
   state | jq -e --argjson id "$1" --arg n "$2" '
-    any(.[] | select(.id == $id) | .assets[]; .name == $n)' >/dev/null
+    any(.[] | select(.id == $id) | .assets[]?; .name == $n and .state != "starter")' >/dev/null
 }
 
 drop_release() { state | jq --argjson id "$1" 'map(select(.id != $id))' | save; }
+
+# A read that has not caught up with an upload: this listing leaves the asset
+# out. Takes a JSON array of assets on stdin and gives one back.
+hide_stale() {
+  local assets f name
+  assets=$(cat)
+  for f in "$GH_FAULTS"/stale-*; do
+    [ -e "$f" ] || continue
+    name="${f##*/stale-}"
+    if fault "stale-$name"; then
+      assets=$(printf '%s\n' "$assets" | jq --arg n "$name" 'map(select(.name != $n))')
+    fi
+  done
+  printf '%s\n' "$assets"
+}
 
 make_latest() {
   state | jq --argjson id "$1" 'map(.isLatest = (.id == $id))' | save
 }
 
-# `gh api` for the two REST calls that address a release by id: list them all,
-# newest first as REST orders them, and delete one. The {owner}/{repo}
-# placeholders stay literal, since there is no repository here to fill them.
+# `gh api` for the REST calls that address a release or an asset by id. The
+# {owner}/{repo} placeholders stay literal, since there is no repository here
+# to fill them.
 if [ "${1:-}" = api ]; then
   shift
-  method=GET; path=""; query=""
+  method=GET; path=""; query=""; field_name=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -X|--method) method="$2"; shift ;;
       -q|--jq) query="$2"; shift ;;
+      -f|--raw-field|-F|--field)
+        case "$2" in name=*) field_name="${2#name=}" ;; esac
+        shift ;;
+      -H|--header) shift ;;
       -*) ;;
       *) path="$1" ;;
     esac
     shift
   done
+  rel_id=$(printf '%s' "$path" | sed -n 's#^repos/{owner}/{repo}/releases/\([0-9][0-9]*\)/assets$#\1#p')
+  asset_id=$(printf '%s' "$path" | sed -n 's#^repos/{owner}/{repo}/releases/assets/\(.*\)$#\1#p')
   case "$method $path" in
     "GET repos/{owner}/{repo}/releases"|"GET repos/{owner}/{repo}/releases?"*)
       if fault api; then http500 "api releases"; fi
+      # The release listing carries each release's assets. Whether it shows a
+      # starter is not known, so the fake leaves them out: nothing may depend
+      # on finding a half-uploaded asset here.
       rest=$(state | jq '[reverse[] | {id, tag_name: .tagName, draft: .isDraft,
                                        prerelease: (.isPrerelease // false),
-                                       name, assets}]')
+                                       name,
+                                       assets: [.assets[]? | select(.state != "starter")]
+                                                | sort_by(.name)}]')
       if [ -n "$query" ]; then printf '%s\n' "$rest" | jq -r "$query"; else printf '%s\n' "$rest"; fi
+      ;;
+    "GET repos/{owner}/{repo}/releases/tags/"*)
+      if fault api; then http500 "api release by tag"; fi
+      tag="${path##*/}"
+      one=$(state | jq --arg t "$tag" '[.[] | select(.tagName == $t and (.isDraft | not))] | .[0]')
+      if [ "$one" = null ]; then
+        echo '{"message":"Not Found","status":"404"}'
+        echo "gh: Not Found (HTTP 404)" >&2
+        exit 1
+      fi
+      if [ -n "$query" ]; then printf '%s\n' "$one" | jq -r "$query"; else printf '%s\n' "$one"; fi
+      ;;
+    "GET repos/{owner}/{repo}/releases/"*"/assets")
+      if fault assets; then http500 "api release assets"; fi
+      if ! state | jq -e --argjson id "$rel_id" 'any(.[]; .id == $id)' >/dev/null; then
+        echo '{"message":"Not Found","status":"404"}'
+        echo "gh: Not Found (HTTP 404)" >&2
+        exit 1
+      fi
+      rest=$(state | jq --argjson id "$rel_id" '
+        [.[] | select(.id == $id) | .assets[]?] | sort_by(.name)' | hide_stale)
+      if [ -n "$query" ]; then printf '%s\n' "$rest" | jq -r "$query"; else printf '%s\n' "$rest"; fi
+      ;;
+    "PATCH repos/{owner}/{repo}/releases/assets/"*)
+      if fault "rename-to-$field_name"; then http500 "api rename asset"; fi
+      if ! state | jq -e --argjson a "$asset_id" 'any(.[].assets[]?; .id == $a)' >/dev/null; then
+        echo '{"message":"Not Found","documentation_url":"https://docs.github.com/rest/releases/assets#update-a-release-asset","status":"404"}'
+        echo "gh: Not Found (HTTP 404)" >&2
+        exit 1
+      fi
+      # Names collide case-insensitively, within the one release.
+      if state | jq -e --argjson a "$asset_id" --arg n "$field_name" '
+           any(.[] | select(any(.assets[]?; .id == $a)) | .assets[]?;
+               .id != $a and (.name | ascii_downcase) == ($n | ascii_downcase))' >/dev/null; then
+        echo '{"message":"Validation Failed","errors":[{"resource":"ReleaseAsset","code":"already_exists","field":"name"}],"documentation_url":"https://docs.github.com/rest/releases/assets#update-a-release-asset","status":"422"}'
+        echo "gh: Validation Failed (HTTP 422)" >&2
+        exit 1
+      fi
+      state | jq --argjson a "$asset_id" --arg n "$field_name" '
+        map(.assets |= map(if .id == $a then .name = $n else . end))' | save
+      one=$(state | jq --argjson a "$asset_id" '[.[].assets[]? | select(.id == $a)] | .[0]')
+      if [ -n "$query" ]; then printf '%s\n' "$one" | jq -r "$query"; else printf '%s\n' "$one"; fi
+      ;;
+    "DELETE repos/{owner}/{repo}/releases/assets/"*)
+      if fault api-delete; then http500 "api delete asset"; fi
+      if ! state | jq -e --argjson a "$asset_id" 'any(.[].assets[]?; .id == $a)' >/dev/null; then
+        echo '{"message":"Not Found","status":"404"}'
+        echo "gh: Not Found (HTTP 404)" >&2
+        exit 1
+      fi
+      state | jq --argjson a "$asset_id" 'map(.assets |= map(select(.id != $a)))' | save
       ;;
     "DELETE repos/{owner}/{repo}/releases/"*)
       id="${path##*/}"
@@ -169,15 +302,43 @@ case "$sub" in
     done
     if fault view; then http500 "view"; fi
     id=$(resolve "$tag") || exit 1
-    one=$(state | jq --argjson id "$id" '.[] | select(.id == $id)')
-    for f in "$GH_FAULTS"/stale-*; do
-      [ -e "$f" ] || continue
-      name="${f##*/stale-}"
-      if fault "stale-$name"; then
-        one=$(printf '%s\n' "$one" | jq --arg n "$name" '.assets |= map(select(.name != $n))')
-      fi
-    done
+    one=$(state | jq --argjson id "$id" '.[] | select(.id == $id)
+            | .assets |= ([.[] | select(.state != "starter")] | sort_by(.name))')
+    assets=$(printf '%s\n' "$one" | jq '.assets' | hide_stale)
+    one=$(printf '%s\n' "$one" | jq --argjson a "$assets" '.assets = $a')
     if [ -n "$query" ]; then printf '%s\n' "$one" | jq -r "$query"; else printf '%s\n' "$one"; fi
+    ;;
+
+  download)
+    tag="$1"; shift; pattern=""; dir="."
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -p|--pattern) pattern="$2"; shift ;;
+        -D|--dir) dir="$2"; shift ;;
+      esac
+      shift
+    done
+    id=$(resolve "$tag") || exit 1
+    names=$(state | jq -r --argjson id "$id" '
+      .[] | select(.id == $id) | .assets[]? | select(.state != "starter") | .name')
+    hit=false
+    for n in $names; do
+      # filepath.Match on the name: exact and case sensitive unless the
+      # pattern says otherwise.
+      # shellcheck disable=SC2254
+      case "$n" in
+        $pattern)
+          size=$(state | jq -r --argjson id "$id" --arg n "$n" '
+            .[] | select(.id == $id) | .assets[] | select(.name == $n) | .size')
+          mkdir -p "$dir"
+          head -c "$size" /dev/zero | tr '\0' '.' > "$dir/$n"
+          hit=true ;;
+      esac
+    done
+    if [ "$hit" = false ]; then
+      echo "no assets match the file pattern" >&2
+      exit 1
+    fi
     ;;
 
   create)
@@ -246,19 +407,32 @@ case "$sub" in
     rc=0
     for f in "${files[@]}"; do
       name=$(basename "$f")
-      if has_asset "$id" "$name"; then
+      # A starter under the same name is invisible here, and does not reserve
+      # the name: the upload goes through and displaces it.
+      if has_uploaded "$id" "$name"; then
         if [ "$clobber" = false ]; then
           echo "asset under the same name already exists: [$name]" >&2
           exit 1
         fi
         drop_asset "$id" "$name"
       fi
+      if fault "starter-$name"; then
+        add_starter "$id" "$f" "$name"
+        echo "HTTP 500: Internal Server Error (assets?name=$name)" >&2
+        rc=1
+        continue
+      fi
+      # An upload that says it worked and left the asset half written.
+      if fault "lied-$name"; then
+        add_starter "$id" "$f" "$name"
+        continue
+      fi
       if fault "upload-$name"; then
         echo "HTTP 500: Internal Server Error (assets?name=$name)" >&2
         rc=1
         continue
       fi
-      add_asset "$id" "$f"
+      add_asset "$id" "$f" "$name"
     done
     exit "$rc"
     ;;

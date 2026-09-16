@@ -127,9 +127,24 @@ release_state() {
 # one of two releases under the same tag: `gh release delete TAG` looks the tag
 # up as a published release and as a draft at the same time and acts on
 # whichever answer comes back first.
+#
+# Read up to five times, as every listing is. Its callers run in the prune
+# step, after the run's own publish has gone through, so one 500 here would
+# fail a run that had already done everything it was asked. The rows are this
+# function's stdout, so the attempt messages go to stderr.
 release_rows() {
-  gh api "repos/{owner}/{repo}/releases?per_page=100" --paginate \
-    -q '.[] | "\(.id) \(.tag_name) \(if .draft then "draft" else "published" end)"'
+  local n rows
+  for n in 1 2 3 4 5; do
+    if rows=$(gh api "repos/{owner}/{repo}/releases?per_page=100" --paginate \
+                -q '.[] | "\(.id) \(.tag_name) \(if .draft then "draft" else "published" end)"'); then
+      printf '%s' "$rows"
+      return 0
+    fi
+    echo "attempt ${n}: could not list the releases" >&2
+    if [ "$n" -lt 5 ]; then publish_backoff "$n" 10; fi
+  done
+  echo "::error::five attempts failed to list the releases." >&2
+  return 1
 }
 
 # "  id <id>: draft|published" for each release under a tag, for the operator.
@@ -715,6 +730,28 @@ delete_stale_drafts() {  # $1=series $2=tag to leave alone
   done <<< "$rows"
 }
 
+# "<release id> <tag> <asset name>" for every asset in the repository whose
+# name ends in one of the temporary names, read up to five times as every
+# listing is. Its rows are this function's stdout, so the attempt messages go
+# to stderr.
+swap_leftover_rows() {
+  local n rows
+  for n in 1 2 3 4 5; do
+    # shellcheck disable=SC2016  # $r is jq's own variable, not the shell's
+    if rows=$(gh api "repos/{owner}/{repo}/releases?per_page=100" --paginate \
+                -q '.[] | . as $r | .assets[]?
+                    | select(.name | endswith(".prev") or endswith(".next"))
+                    | "\($r.id) \($r.tag_name) \(.name)"'); then
+      printf '%s' "$rows"
+      return 0
+    fi
+    echo "attempt ${n}: could not list the releases to find what a replacement left" >&2
+    if [ "$n" -lt 5 ]; then publish_backoff "$n" 10; fi
+  done
+  echo "::error::five attempts failed to list the releases; cannot tell what a replacement left behind." >&2
+  return 1
+}
+
 # Clear the copies a replacement left on the releases of a series that no
 # publish comes back for, and put back any name a swap did not finish giving.
 #
@@ -735,11 +772,7 @@ delete_stale_drafts() {  # $1=series $2=tag to leave alone
 # a later publish.
 sweep_swap_leftovers() {  # $1=series $2=tag to leave alone
   local rows pairs id t base
-  # shellcheck disable=SC2016  # $r is jq's own variable, not the shell's
-  rows=$(gh api "repos/{owner}/{repo}/releases?per_page=100" --paginate \
-           -q '.[] | . as $r | .assets[]?
-               | select(.name | endswith(".prev") or endswith(".next"))
-               | "\($r.id) \($r.tag_name) \(.name)"') || return 1
+  rows=$(swap_leftover_rows) || return 1
   # Both temporary names of one asset are one asset to repair.
   pairs=$(printf '%s\n' "$rows" | sed -e 's/\.prev$//' -e 's/\.next$//' | sort -u)
   while read -r id t base; do

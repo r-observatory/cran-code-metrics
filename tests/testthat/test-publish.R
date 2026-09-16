@@ -454,8 +454,9 @@ test_that("the refusal over two releases under one tag names them by id, not by 
   expect_false(any(grepl("gh release delete", res$output, fixed = TRUE)))
   expect_length(.pub_state(world), 3L)
 
-  # The ids could not be read: still refused, and it says where to find them.
-  world <- .pub_world(twins, faults = c(api = 1L))
+  # The ids could not be read, five times over: still refused, and it says
+  # where to find them.
+  world <- .pub_world(twins, faults = c(api = 5L))
   res <- .pub_run(world, .pub_today)
   expect_false(res$status == 0L)
   expect_true(any(grepl("could not list their ids", res$output, fixed = TRUE)))
@@ -628,8 +629,9 @@ test_that("the harvest refuses two releases under one tag and names them by id",
   expect_false(any(grepl("-X DELETE", .pub_log(world), fixed = TRUE)))
   expect_length(.pub_state(world), 3L)
 
-  # The ids could not be read: still refused, and it says where to find them.
-  world <- .pub_world(twins, faults = c(api = 1L))
+  # The ids could not be read, five times over: still refused, and it says
+  # where to find them.
+  world <- .pub_world(twins, faults = c(api = 5L))
   res <- .pub_run(world, harvest)
   expect_false(res$status == 0L)
   expect_true(any(grepl("could not list their ids", res$output, fixed = TRUE)))
@@ -1131,10 +1133,45 @@ test_that("a draft that will not delete waits for the next run, and a listing th
                         res$output, fixed = TRUE)))
   expect_equal(.pub_tags(world, drafts = TRUE), "metrics-2026-09-14")
 
-  # A listing that cannot be read is not "no drafts".
+  # One 500 on the listing is read again: the run's own publish has already
+  # gone through by the time this runs, so failing the step over a read that
+  # would work on the next attempt turns a clean run red for nothing.
   world <- .pub_world(stale, faults = c(api = 1L))
+  res <- .pub_run(world, step)
+  expect_equal(res$status, 0L)
+  expect_true("went on past the drafts" %in% res$output)
+  expect_length(.pub_tags(world, drafts = TRUE), 0L)
+
+  # A listing that cannot be read at all is not "no drafts".
+  world <- .pub_world(stale, faults = c(api = 5L))
   res <- .pub_run(world, step)
   expect_false(res$status == 0L)
   expect_false("went on past the drafts" %in% res$output)
   expect_length(.pub_tags(world, drafts = TRUE), 2L)
+})
+
+test_that("a listing the sweep could not read once is read again, and one it never reads stops it", {
+  # The prune step runs after the run's own publish, so a 500 here fails a run
+  # that did everything it was asked. Every other listing in the file is read
+  # up to five times; these two were read once.
+  leftovers <- list(
+    .pub_release(1L, "metrics-2026-09-12", assets = .pub_assets - 1000L,
+                 extra = list(.pub_asset(150L, paste0(.pub_db, ".prev"), 3900L))),
+    .pub_out_today())
+  step <- c("sweep_swap_leftovers metrics metrics-2026-09-13 || exit 1",
+            'echo "went on past the leftovers"')
+
+  world <- .pub_world(leftovers, faults = c(api = 1L))
+  res <- .pub_run(world, step)
+  expect_equal(res$status, 0L)
+  expect_true("went on past the leftovers" %in% res$output)
+  expect_equal(.pub_asset_sizes(.pub_only(world, "metrics-2026-09-12")),
+               .pub_assets[order(names(.pub_assets))] - 1000L)
+
+  world <- .pub_world(leftovers, faults = c(api = 5L))
+  res <- .pub_run(world, step)
+  expect_false(res$status == 0L)
+  expect_false("went on past the leftovers" %in% res$output)
+  expect_true(paste0(.pub_db, ".prev") %in%
+                names(.pub_asset_sizes(.pub_only(world, "metrics-2026-09-12"))))
 })

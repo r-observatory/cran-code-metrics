@@ -515,6 +515,23 @@ test_that("a database over the size budget is refused before the release is touc
   expect_length(.pub_log(world), 0L)
 })
 
+test_that("a publish carrying no files at all is refused", {
+  # The read-back has nothing to disagree with when it is given no files, so a
+  # call like this made the draft, found nothing wrong with it and published it
+  # as Latest, and the day's tag then resolved to a release carrying neither
+  # database. Nothing calls it that way today; publish_metrics names its four
+  # files, and this keeps a caller that stops naming them from taking the
+  # series with it.
+  world <- .pub_world(list(.pub_0912()))
+  res <- .pub_run(world,
+    'publish_release metrics-2026-09-13 "CRAN Metrics - 2026-09-13" out/release-notes-code.md || exit 1')
+  expect_false(res$status == 0L)
+  expect_true(any(grepl("::error::no files were named to publish as metrics-2026-09-13",
+                        res$output, fixed = TRUE)))
+  expect_length(.pub_releases_named(world, "metrics-2026-09-13"), 0L)
+  expect_length(.pub_log(world), 0L)
+})
+
 # ---------------------------------------------------------------------------
 # Republishing a release that is already out
 # ---------------------------------------------------------------------------

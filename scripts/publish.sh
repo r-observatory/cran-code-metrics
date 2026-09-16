@@ -678,6 +678,14 @@ edit_release() {  # $1=tag, then the flags
 publish_release() {  # $1=tag $2=title $3=notes file, then the files
   local tag="$1" title="$2" notes="$3" state rel f
   shift 3
+  # A call carrying no files is refused here, because nothing further down
+  # refuses it: the read-back agrees with an empty list on its first read, so
+  # the draft would be created, found whole and published as Latest, and the
+  # day's tag would then resolve to a release carrying neither database.
+  if [ "$#" -eq 0 ]; then
+    echo "::error::no files were named to publish as ${tag}; refusing to make a release with nothing on it."
+    return 1
+  fi
   # Every file is here before the release is touched. publish_metrics measures
   # only the databases, and a missing manifest got as far as an empty draft and
   # five failed uploads before anything said which file it was.

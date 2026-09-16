@@ -554,9 +554,9 @@ test_that("update.yml fails the run when a prior asset does not arrive", {
 # land one after another: a 502, a dropped connection, the 350-minute job
 # timeout or an operator cancel can leave a release carrying shard N's database
 # next to shard N-1's manifest. A run that died between the two renames of one
-# asset leaves that name on nothing, its bytes under NAME.prev, until the next
-# run's repair puts the name back, and until then the release reads as carrying
-# no manifest. Both states are read by every later run, because the same
+# asset leaves that name on nothing, its bytes under swap-prev-NAME, until the
+# next run's repair puts the name back, and until then the release reads as
+# carrying no manifest. Both states are read by every later run, because the same
 # release stays `latest_tag metrics` tomorrow and the day after.
 
 test_that("a database ahead of its manifest proceeds, and one short of it refuses", {
@@ -671,6 +671,19 @@ test_that("the refusal names a repair and does not offer force_full as one", {
   # An operator following the message has to end up somewhere better.
   expect_true(grepl("re-upload", msg, fixed = TRUE))
   expect_true(grepl("delete", msg, fixed = TRUE))
+})
+
+test_that("the repair advice names the temporary names an operator will see", {
+  # An operator reading this is about to look at the release's asset listing,
+  # so the names here have to be the names that listing shows. The temporary
+  # part goes in front of the real name, so that a manifest keeps the .json
+  # extension its content type is declared from, and so that a reader asking
+  # for `<name>*` is not handed the copy a replacement set aside.
+  advice <- retention_repair_advice()
+  expect_true(grepl("`swap-next-<name>`", advice, fixed = TRUE))
+  expect_true(grepl("`swap-prev-<name>`", advice, fixed = TRUE))
+  expect_false(grepl("<name>.next", advice, fixed = TRUE))
+  expect_false(grepl("<name>.prev", advice, fixed = TRUE))
 })
 
 test_that("the repair deletes a draft beside the resolved release by id, never by tag", {

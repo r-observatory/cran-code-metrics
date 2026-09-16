@@ -256,10 +256,10 @@ delete_asset() {  # $1=asset id
 # temporary name, and best effort: the caller is already failing.
 #
 # The bytes of a refused upload cannot be left there. Nothing downloads
-# NAME.next, so keeping it serves no reader, and repair_asset gives that name
-# to a whole NAME.next when the release has lost NAME itself: the one copy this
-# file has measured against the local file and refused would otherwise be the
-# one a later run promotes, without measuring it again.
+# swap-next-NAME, so keeping it serves no reader, and repair_asset gives the
+# name to a whole swap-next-NAME when the release has lost NAME itself: the one
+# copy this file has measured against the local file and refused would
+# otherwise be the one a later run promotes, without measuring it again.
 discard_asset() {  # $1=tag $2=release id $3=asset name
   local rows row id
   if ! rows=$(release_assets "$2"); then
@@ -290,21 +290,21 @@ discard_asset() {  # $1=tag $2=release id $3=asset name
 #                               "starter", which the documented uploaded|open
 #                               does not carry, so the set is not closed, and
 #                               this is the test that decides whether the copy
-#                               under .prev is deleted.
-#   NAME there, .next as well   an upload that was cut off, or one that landed
+#                               set aside is deleted.
+#   NAME there, swap-next- too  an upload that was cut off, or one that landed
 #                               and was never swapped in. The live asset is
 #                               correct; the leftover goes, because a complete
 #                               one would refuse the next upload of that name.
-#   NAME there, .prev as well   the swap finished and the copy it replaced was
+#   NAME there, swap-prev- too  the swap finished and the copy it replaced was
 #                               left for readers. It goes now, a publish later,
 #                               rather than straight after the swap.
-#   NAME gone, .prev there      the run stopped between the two renames. The
+#   NAME gone, swap-prev- there the run stopped between the two renames. The
 #                               name goes back on the published bytes: the
 #                               manifests were not swapped either, so that pair
 #                               is exactly where the day started.
-#   NAME gone, only a whole .next   nothing published is left and the new bytes
+#   NAME gone, whole swap-next- nothing published is left and the new bytes
 #                               are complete, so they take the name.
-#   NAME gone, only a cut-off .next  there is nothing to serve. It is deleted
+#   NAME gone, cut-off swap-next-  there is nothing to serve. It is deleted
 #                               and said out loud; a caller that is about to
 #                               upload the asset carries on.
 #   none of the three there     the release has lost the asset and nothing is
@@ -317,8 +317,8 @@ repair_asset() {  # $1=tag $2=release id $3=asset name
   local tag="$1" rel="$2" name="$3" rows here prev next
   rows=$(release_assets "$rel") || return 1
   here=$(asset_row "$rows" "$name")
-  prev=$(asset_row "$rows" "${name}.prev")
-  next=$(asset_row "$rows" "${name}.next")
+  prev=$(asset_row "$rows" "swap-prev-${name}")
+  next=$(asset_row "$rows" "swap-next-${name}")
 
   if [ -n "$here" ] && [ "$(asset_state "$here")" != uploaded ]; then
     echo "::warning::${name} on ${tag} is an upload that did not finish (state $(asset_state "$here")); clearing it."
@@ -328,18 +328,18 @@ repair_asset() {  # $1=tag $2=release id $3=asset name
 
   if [ -n "$here" ]; then
     if [ -n "$prev" ]; then
-      echo "clearing ${name}.prev on ${tag}, the copy the last replacement moved aside"
+      echo "clearing swap-prev-${name} on ${tag}, the copy the last replacement moved aside"
       delete_asset "$(asset_id "$prev")" || return 1
     fi
     if [ -n "$next" ]; then
-      echo "clearing ${name}.next on ${tag}, left by a replacement that did not finish"
+      echo "clearing swap-next-${name} on ${tag}, left by a replacement that did not finish"
       delete_asset "$(asset_id "$next")" || return 1
     fi
     return 0
   fi
 
   if [ -n "$prev" ]; then
-    echo "::warning::${tag} carries no ${name}; putting the name back on ${name}.prev, which a replacement moved aside and never finished."
+    echo "::warning::${tag} carries no ${name}; putting the name back on swap-prev-${name}, which a replacement moved aside and never finished."
     rename_asset "$(asset_id "$prev")" "$name" || return 1
     if [ -n "$next" ]; then
       delete_asset "$(asset_id "$next")" || return 1
@@ -349,10 +349,10 @@ repair_asset() {  # $1=tag $2=release id $3=asset name
 
   if [ -n "$next" ]; then
     if [ "$(asset_state "$next")" = uploaded ]; then
-      echo "::warning::${tag} carries no ${name}; giving the name to ${name}.next, which uploaded whole."
+      echo "::warning::${tag} carries no ${name}; giving the name to swap-next-${name}, which uploaded whole."
       rename_asset "$(asset_id "$next")" "$name" || return 1
     else
-      echo "::warning::${tag} carries no ${name} and ${name}.next was cut off, so there is nothing to put the name back on; clearing it."
+      echo "::warning::${tag} carries no ${name} and swap-next-${name} was cut off, so there is nothing to put the name back on; clearing it."
       delete_asset "$(asset_id "$next")" || return 1
     fi
   else
@@ -367,8 +367,8 @@ repair_asset() {  # $1=tag $2=release id $3=asset name
 # The download step calls this on the release it is building on, before it
 # reads it. Nothing publishes under an earlier day's tag again, so a run that
 # died between the two renames of its last replacement would otherwise leave
-# that release without the asset for good, with the bytes sitting under .prev
-# and nothing left to put the name back.
+# that release without the asset for good, with the bytes sitting under
+# swap-prev-NAME and nothing left to put the name back.
 repair_release_assets() {  # $1=tag, then the asset names
   local tag="$1" rel n
   shift
@@ -382,20 +382,54 @@ repair_release_assets() {  # $1=tag, then the asset names
 # release ever carrying a half-written one under that name:
 #
 #   0. put right whatever an earlier attempt left,
-#   1. upload the file under NAME.next,
+#   1. upload the file under swap-next-NAME,
 #   2. make the release say that asset is whole,
-#   3. rename NAME to NAME.prev, then NAME.next to NAME,
+#   3. rename NAME to swap-prev-NAME, then swap-next-NAME to NAME,
 #   4. read the release back,
-#   5. leave NAME.prev for the next publish under this tag, or for the sweep.
+#   5. leave swap-prev-NAME for the next publish under this tag, or the sweep.
+#
+# The temporary part of the name goes in front of the real name rather than
+# after it, because the name an asset is uploaded under decides two things
+# that outlive the upload.
+#
+# The first is the content type it is served as. gh reads the extension off
+# the path it is handed, in typeForFilename, which answers from a short table
+# of its own and otherwise from Go's mime.TypeByExtension, and sends the
+# answer as the Content-Type of the upload; GitHub keeps what it was sent and
+# a rename never revisits it. So a manifest staged as code-manifest.json.next
+# is served as application/octet-stream for the life of the release from the
+# first same-day republish, where swap-next-code-manifest.json keeps
+# application/json. .json is in Go's own table, so that much holds wherever
+# the run happens. .db is in no table this laptop has and comes out
+# application/octet-stream, where a machine carrying /etc/mime.types could
+# send something else for it, and a client that is not gh sends whatever type
+# it likes.
+#
+# The second is which patterns a download answers with. A reader asking for
+# code-manifest* is handed the copy a replacement set aside as well as the
+# asset it wanted, where a prefix keeps the leftovers out of that answer. The
+# trade runs the other way for an extension glob, which is what keeping the
+# extension costs: swap-prev-cran-code-metrics.db is inside the answer to
+# *.db and swap-prev-code-manifest.json inside the answer to *.json, where
+# the suffix kept them out. Nothing asks either way today, since the merger
+# and the download step both name the asset in full.
+#
+# Measured against a scratch repository by republishing a manifest through
+# this function: staged in front, the live asset stayed application/json and
+# `gh release download -p 'code-manifest*'` came back with code-manifest.json
+# alone; staged behind, the same republish left the live asset
+# application/octet-stream and that download brought code-manifest.json.prev
+# back with it. On a release carrying an asset and a leftover beside it,
+# `-p '*.json'` came back with both, and `-p '*.db'` the same.
 #
 # Measured against a scratch repository: a by-name download finds no asset for
 # 472 to 1013 ms (median 520) between the two renames, against the length of
 # the whole upload with --clobber, and what a reader meets in that gap is "no
 # assets match the file pattern" from a listing taken inside it, never a 404 on
 # an id that has been deleted, because the old bytes are still there under
-# .prev. Sending both renames down one connection with curl measured 235 to
-# 355 ms, which buys a quarter of a second for a second HTTP client and a
-# second way of holding the token in the publish path.
+# swap-prev-NAME. Sending both renames down one connection with curl measured
+# 235 to 355 ms, which buys a quarter of a second for a second HTTP client and
+# a second way of holding the token in the publish path.
 swap_asset() {  # $1=tag $2=release id $3=file
   local tag="$1" rel="$2" file="$3"
   local name size sha stage link n rows row old_id new_id got ok
@@ -411,7 +445,7 @@ swap_asset() {  # $1=tag $2=release id $3=file
   #    bytes the link points at.
   stage="$(dirname "$file")/.publish-stage"
   mkdir -p "$stage" || return 1
-  link="${stage}/${name}.next"
+  link="${stage}/swap-next-${name}"
   ln -sfn "$(cd "$(dirname "$file")" && pwd)/${name}" "$link" || return 1
   upload_asset "$tag" "$link" || return 1
 
@@ -422,7 +456,7 @@ swap_asset() {  # $1=tag $2=release id $3=file
   ok=""
   for n in 1 2 3 4 5; do
     rows=$(release_assets "$rel") || return 1
-    row=$(asset_row "$rows" "${name}.next")
+    row=$(asset_row "$rows" "swap-next-${name}")
     if [ -n "$row" ] && [ "$(asset_state "$row")" = uploaded ] &&
        [ "$(asset_size "$row")" = "$size" ]; then
       got=$(asset_digest "$row")
@@ -434,12 +468,12 @@ swap_asset() {  # $1=tag $2=release id $3=file
         break
       fi
     fi
-    echo "attempt ${n}: ${tag} does not list ${name}.next as ${size} bytes of sha256:${sha} yet; it has [${row:-nothing}]"
+    echo "attempt ${n}: ${tag} does not list swap-next-${name} as ${size} bytes of sha256:${sha} yet; it has [${row:-nothing}]"
     if [ "$n" -lt 5 ]; then publish_backoff "$n" 10; fi
   done
   if [ -z "$ok" ]; then
-    echo "::error::${tag} does not carry ${name}.next at ${size} bytes of sha256:${sha} after the upload; it has [${row:-nothing}]. ${name} itself is untouched."
-    discard_asset "$tag" "$rel" "${name}.next"
+    echo "::error::${tag} does not carry swap-next-${name} at ${size} bytes of sha256:${sha} after the upload; it has [${row:-nothing}]. ${name} itself is untouched."
+    discard_asset "$tag" "$rel" "swap-next-${name}"
     return 1
   fi
 
@@ -447,22 +481,22 @@ swap_asset() {  # $1=tag $2=release id $3=file
   #    never on two assets and the bytes behind it are never deleted.
   rows=$(release_assets "$rel") || return 1
   old_id=$(asset_id "$(asset_row "$rows" "$name")")
-  new_id=$(asset_id "$(asset_row "$rows" "${name}.next")")
+  new_id=$(asset_id "$(asset_row "$rows" "swap-next-${name}")")
   if [ -z "$new_id" ]; then
-    echo "::error::${name}.next is gone from ${tag} between the check and the swap."
+    echo "::error::swap-next-${name} is gone from ${tag} between the check and the swap."
     return 1
   fi
-  if [ -n "$old_id" ] && ! rename_asset_retrying "$old_id" "${name}.prev"; then
+  if [ -n "$old_id" ] && ! rename_asset_retrying "$old_id" "swap-prev-${name}"; then
     echo "::error::five attempts failed to move ${name} aside on ${tag}; it is still the published asset and nothing was taken away."
     return 1
   fi
   if ! rename_asset_retrying "$new_id" "$name"; then
-    echo "::error::${name}.next uploaded whole but five attempts failed to give it the name ${name} on ${tag}."
+    echo "::error::swap-next-${name} uploaded whole but five attempts failed to give it the name ${name} on ${tag}."
     if [ -n "$old_id" ]; then
       if rename_asset "$old_id" "$name"; then
         echo "::error::${name} is back on the copy that was published, so ${tag} carries what it did before this run."
       else
-        echo "::error::${tag} now carries no ${name}: its bytes are under ${name}.prev, nothing was deleted, and the next publish or download under this tag puts the name back."
+        echo "::error::${tag} now carries no ${name}: its bytes are under swap-prev-${name}, nothing was deleted, and the next publish or download under this tag puts the name back."
       fi
     fi
     return 1
@@ -487,21 +521,27 @@ swap_asset() {  # $1=tag $2=release id $3=file
     return 1
   fi
 
-  # 5. NAME.prev stays. A delete cuts off a download of that asset already in
-  #    flight, and the merger's is tens of seconds long, so a reader whose
+  # 5. swap-prev-NAME stays. A delete cuts off a download of that asset already
+  #    in flight, and the merger's is tens of seconds long, so a reader whose
   #    listing was taken before the swap finishes on the old bytes instead of
   #    failing and pulling the whole file again.
   #
   #    What the reader makes of a whole file it did not expect is its own
   #    affair, and the merger makes the worst of it: it reads the declared
   #    size of whatever holds the name once its download is done, so a
-  #    download that finished on the copy now under .prev is a size it was not
+  #    download that finished on the copy now set aside is a size it was not
   #    promised, which it calls a torn download and fails the merge over.
   #    That costs one merge run per day it happens on, and the next hourly one
   #    reads the new bytes; the cut-off download it replaces had to be made
   #    again anyway, and could be cut off again.
+  #
+  #    While it is there it is inside the answer to `*.db` and `*.json`, which
+  #    is the other half of what keeping the extension costs, so a reader who
+  #    asks for the day's database that way and starts on the copy can have it
+  #    taken from under the download when the next prune sweeps it. Nothing
+  #    asks that way today.
   if [ -n "$old_id" ]; then
-    echo "${tag}: ${name} is asset ${new_id}, ${size} bytes, sha256:${sha}; the copy it replaced is ${name}.prev"
+    echo "${tag}: ${name} is asset ${new_id}, ${size} bytes, sha256:${sha}; the copy it replaced is swap-prev-${name}"
   else
     echo "${tag}: ${name} is asset ${new_id}, ${size} bytes, sha256:${sha}; the release carried no ${name} before this run, so nothing was moved aside"
   fi
@@ -731,16 +771,16 @@ delete_stale_drafts() {  # $1=series $2=tag to leave alone
 }
 
 # "<release id> <tag> <asset name>" for every asset in the repository whose
-# name ends in one of the temporary names, read up to five times as every
-# listing is. Its rows are this function's stdout, so the attempt messages go
-# to stderr.
+# name starts with one of the temporary prefixes, read up to five times as
+# every listing is. Its rows are this function's stdout, so the attempt
+# messages go to stderr.
 swap_leftover_rows() {
   local n rows
   for n in 1 2 3 4 5; do
     # shellcheck disable=SC2016  # $r is jq's own variable, not the shell's
     if rows=$(gh api "repos/{owner}/{repo}/releases?per_page=100" --paginate \
                 -q '.[] | . as $r | .assets[]?
-                    | select(.name | endswith(".prev") or endswith(".next"))
+                    | select(.name | startswith("swap-prev-") or startswith("swap-next-"))
                     | "\($r.id) \($r.tag_name) \(.name)"'); then
       printf '%s' "$rows"
       return 0
@@ -755,12 +795,12 @@ swap_leftover_rows() {
 # Clear the copies a replacement left on the releases of a series that no
 # publish comes back for, and put back any name a swap did not finish giving.
 #
-# Every replacement leaves the copy it replaced under NAME.prev, and the next
-# publish under the same tag clears it. The last publish of a day is never
+# Every replacement leaves the copy it replaced under swap-prev-NAME, and the
+# next publish under the same tag clears it. The last publish of a day is never
 # revisited, because tomorrow's publish uses tomorrow's tag, so without this
 # every kept release would carry a second copy of both databases for good.
 #
-# Today's tag is left alone for the reason the .prev is left in the first
+# Today's tag is left alone for the reason the copy is left in the first
 # place: a delete cuts off a download of that asset already in flight, and the
 # merger's is tens of seconds long. Tomorrow's sweep takes it. This runs in the
 # prune step, after the run's own publish and under the workflow's concurrency
@@ -773,8 +813,11 @@ swap_leftover_rows() {
 sweep_swap_leftovers() {  # $1=series $2=tag to leave alone
   local rows pairs id t base
   rows=$(swap_leftover_rows) || return 1
-  # Both temporary names of one asset are one asset to repair.
-  pairs=$(printf '%s\n' "$rows" | sed -e 's/\.prev$//' -e 's/\.next$//' | sort -u)
+  # Both temporary names of one asset are one asset to repair. The prefix comes
+  # off the asset name, which is the third field, and not off the rest of the
+  # row.
+  pairs=$(printf '%s\n' "$rows" |
+            awk '{ sub(/^swap-(prev|next)-/, "", $3); print $1, $2, $3 }' | sort -u)
   while read -r id t base; do
     case "$t" in "$1"-*) ;; *) continue ;; esac
     if [ "$t" = "$2" ] || [ -z "$base" ]; then continue; fi

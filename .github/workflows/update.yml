@@ -135,11 +135,11 @@ jobs:
           # An asset of a release that is already out is replaced by uploading
           # under a temporary name and swapping the names, and a run that died
           # between those two renames left the release without that asset, its
-          # bytes sitting under <name>.prev. Nothing publishes under an earlier
-          # day's tag again, so the run that reads the release is the only
-          # thing that comes back for it. This puts the name back before the
-          # run asks what the release carries, and clears the copies the last
-          # replacement left. scripts/publish.sh says what each state is.
+          # bytes sitting under swap-prev-<name>. Nothing publishes under an
+          # earlier day's tag again, so the run that reads the release is the
+          # only thing that comes back for it. This puts the name back before
+          # the run asks what the release carries, and clears the copies the
+          # last replacement left. scripts/publish.sh says what each state is.
           if [ -n "$CODE_SRC" ]; then
             repair_release_assets "$CODE_SRC" cran-code-metrics.db cran-data-metrics.db \
               code-manifest.json data-manifest.json || exit 1
@@ -312,10 +312,11 @@ jobs:
           source scripts/publish.sh
           delete_stale_drafts metrics "$METRICS_TAG" || exit 1
 
-          # Replacing an asset leaves the copy it replaced under <name>.prev
-          # for readers that were already downloading it, and the next publish
-          # under that tag clears it. The last publish of a day is never
-          # revisited, so this clears what those left, and puts back any name a
-          # replacement did not finish giving. Today's release is left alone:
-          # a delete cuts off a download of that asset that is already running.
+          # Replacing an asset leaves the copy it replaced under
+          # swap-prev-<name> for readers that were already downloading it, and
+          # the next publish under that tag clears it. The last publish of a
+          # day is never revisited, so this clears what those left, and puts
+          # back any name a replacement did not finish giving. Today's release
+          # is left alone: a delete cuts off a download of that asset that is
+          # already running.
           sweep_swap_leftovers metrics "$METRICS_TAG" || exit 1

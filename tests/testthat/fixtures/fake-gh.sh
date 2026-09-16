@@ -31,13 +31,19 @@
 #     download` and `upload --clobber` cannot see one. It does not reserve its
 #     name either, so the next upload under that name displaces it.
 #   - `release download -p PATTERN` matches the asset NAME with filepath.Match,
-#     exact and case sensitive, so `x.db` matches neither `x.db.prev` nor
-#     `x.db.next`. With nothing matching: "no assets match the file pattern",
-#     exit 1.
+#     exact and case sensitive, so `x.db` matches neither `swap-prev-x.db` nor
+#     `swap-next-x.db`, and `x.db*` matches none of them either. With nothing
+#     matching: "no assets match the file pattern", exit 1.
+#   - an asset is served as the content type its upload declared, and a
+#     rename never revisits it, so the name an asset is UPLOADED under
+#     decides how it is served for the life of the release. gh declares the
+#     type from the extension of the path it is handed, not from the name the
+#     asset ends up with.
 #   - `PATCH /releases/assets/{id}` with a name changes name and nothing else:
-#     the id, size, digest and state stay, and it answers 200. A name another
-#     asset of the same release already holds is 422 already_exists, compared
-#     case-insensitively; renaming an asset to the name it has is a 200 no-op;
+#     the id, size, digest, content type and state stay, and it answers 200. A
+#     name another asset of the same release already holds is 422
+#     already_exists, compared case-insensitively; renaming an asset to the
+#     name it has is a 200 no-op;
 #     an id that is not there is 404. gh prints the error body on stdout, its
 #     "gh: Validation Failed (HTTP 422)" line on stderr, and exits 1.
 #   - `DELETE /releases/assets/{id}` answers 204, and 404 for an id that is gone.
@@ -105,6 +111,17 @@ resolve() {
 # Every upload gets an id of its own, and a rename keeps it.
 next_asset_id() { state | jq '([.[].assets[]?.id] | max // 1000) + 1'; }
 
+# The content type an asset is served as, declared by the upload and never
+# revisited afterwards. gh reads the extension off the path it uploads, in
+# typeForFilename, which answers from a short table of its own and otherwise
+# from Go's mime.TypeByExtension. .json is in Go's own table, so a name ending
+# .json lands as application/json wherever the run happens, which is what a
+# scratch repository gave. An extension neither table names, .db and
+# code-manifest.json.next among them, falls to application/octet-stream on
+# this laptop, which has no /etc/mime.types; a machine with a fuller mime
+# database could send something else, so the answer below models this one.
+ctype() { case "$1" in *.json) echo application/json ;; *) echo application/octet-stream ;; esac; }
+
 add_asset() {  # release id, path, optional asset name
   local rid="$1" path="$2" name size digest aid
   name="${3:-$(basename "$2")}"
@@ -116,10 +133,11 @@ add_asset() {  # release id, path, optional asset name
   fi
   aid=$(next_asset_id)
   state | jq --argjson rid "$rid" --argjson aid "$aid" --arg n "$name" \
-             --argjson s "$size" --arg d "$digest" '
+             --argjson s "$size" --arg d "$digest" --arg c "$(ctype "$name")" '
     map(if .id == $rid
         then .assets = ([.assets[] | select(.name != $n)] +
-                        [{id: $aid, name: $n, size: $s, state: "uploaded", digest: $d}])
+                        [{id: $aid, name: $n, size: $s, state: "uploaded",
+                          digest: $d, content_type: $c}])
         else . end)' | save
 }
 
@@ -129,10 +147,12 @@ add_starter() {  # release id, path, asset name
   local rid="$1" size aid
   size=$(fsize "$2")
   aid=$(next_asset_id)
-  state | jq --argjson rid "$rid" --argjson aid "$aid" --arg n "$3" --argjson s "$size" '
+  state | jq --argjson rid "$rid" --argjson aid "$aid" --arg n "$3" --argjson s "$size" \
+             --arg c "$(ctype "$3")" '
     map(if .id == $rid
         then .assets = ([.assets[] | select(.name != $n)] +
-                        [{id: $aid, name: $n, size: $s, state: "starter", digest: null}])
+                        [{id: $aid, name: $n, size: $s, state: "starter",
+                          digest: null, content_type: $c}])
         else . end)' | save
 }
 

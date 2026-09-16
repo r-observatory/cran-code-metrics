@@ -128,14 +128,14 @@ test_that("an asset of a release that is already out is replaced by name, never 
   # The copy it replaces is renamed out of the way, never deleted: a delete
   # cuts off a download of that asset that is already running.
   expect_false(any(grepl("delete_asset", swap, fixed = TRUE)))
-  expect_true(any(grepl('rename_asset_retrying "$old_id" "${name}.prev"', swap, fixed = TRUE)))
+  expect_true(any(grepl('rename_asset_retrying "$old_id" "swap-prev-${name}"', swap, fixed = TRUE)))
 })
 
 test_that("the download step puts right what an interrupted replacement left on the release it reads", {
   # Nothing publishes under an earlier day's tag again, so a replacement
   # stopped between its two renames leaves that release without the asset,
-  # with the bytes under NAME.prev and no publish coming back for them. The
-  # run that reads the release is what comes back.
+  # with the bytes under swap-prev-NAME and no publish coming back for them.
+  # The run that reads the release is what comes back.
   yml <- .update_yml()
   start <- grep("- name: Download the latest databases", yml, fixed = TRUE)
   expect_length(start, 1L)

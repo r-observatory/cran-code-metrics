@@ -323,10 +323,10 @@ retention_repair_advice <- function() {
     "\nLook at the PREVIOUS release first. A later shard on the same day ",
     "replaces the four assets one at a time, so an interrupted publish can ",
     "leave one shard's database beside another shard's manifest.\n",
-    "Each asset is replaced by uploading it as `<name>.next` and then moving ",
-    "the name over, so an asset the release seems to have lost is usually ",
-    "still on it: its bytes are under `<name>.prev`, and the run that reads ",
-    "the release puts the name back before it reads it. ",
+    "Each asset is replaced by uploading it as `swap-next-<name>` and then ",
+    "moving the name over, so an asset the release seems to have lost is ",
+    "usually still on it: its bytes are under `swap-prev-<name>`, and the run ",
+    "that reads the release puts the name back before it reads it. ",
     "`gh api repos/{owner}/{repo}/releases/<id>/assets` is the listing that ",
     "shows all of them, an upload that was cut off included; `gh release ",
     "view` and `gh release download` do not.\n",
@@ -558,7 +558,7 @@ prior_db_notes <- function(series, counts, prior) {
 #' that died between two of them can leave a release carrying a database newer
 #' than its manifest, and one that died between the two renames that give an
 #' asset its name can leave the release with no code-manifest.json at all until
-#' something puts the name back on the bytes under code-manifest.json.prev.
+#' something puts the name back on the bytes under swap-prev-code-manifest.json.
 #' Refusing on that was a permanent outage: the same release stays latest, so
 #' every later run refused too, and the only recovery the refusal named was the
 #' wipe.

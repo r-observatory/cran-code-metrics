@@ -694,6 +694,13 @@ test_that("the harvest refuses two releases under one tag and names them by id",
   sub(".*-f name=", "", grep("-X PATCH .*-f name=", .pub_log(world), value = TRUE))
 }
 
+# What out/.publish-stage holds afterwards: the links a replacement uploads
+# through, dangling once out/ is cleared.
+.pub_stage_left <- function(world) {
+  list.files(file.path(world$work, "out", ".publish-stage"),
+             all.files = TRUE, no.. = TRUE)
+}
+
 test_that("a republish never takes the live asset away before its replacement is there", {
   world <- .pub_world(list(.pub_0912(), .pub_out_today()))
   before <- .pub_asset_ids(.pub_only(world, "metrics-2026-09-13"))
@@ -921,6 +928,49 @@ test_that("a reader asking for a name with a trailing wildcard gets only the ass
     'ls dl')
   expect_equal(res$status, 0L)
   expect_equal(grep("code-manifest", res$output, value = TRUE), "code-manifest.json")
+})
+
+test_that("the link a replacement uploads through is taken down again", {
+  # The upload goes through a link that gives the database the temporary name
+  # without copying 1.9 GB of it. Each is named after the asset it stages, so
+  # one left behind survives the run that made it, points at a file the next
+  # run overwrites, and is what a later run's upload of the same name follows.
+  world <- .pub_world(list(.pub_0912(), .pub_out_today()))
+  expect_equal(.pub_run(world, .pub_today)$status, 0L)
+  .pub_expect_whole(world, "metrics-2026-09-13")
+  expect_equal(.pub_stage_left(world), character(0L))
+
+  # And a refusal leaves nothing behind either, wherever it stops: before the
+  # upload lands, after the check reads bytes it refuses, or between the two
+  # renames, with the name on neither asset.
+  for (fault in c("upload-swap-next-cran-code-metrics.db",
+                  "short-swap-next-cran-code-metrics.db",
+                  "rename-to-cran-code-metrics.db")) {
+    world <- .pub_world(list(.pub_0912(), .pub_out_today()),
+                        faults = stats::setNames(99L, fault))
+    expect_false(.pub_run(world, .pub_today)$status == 0L, info = fault)
+    expect_equal(.pub_stage_left(world), character(0L), info = fault)
+  }
+})
+
+test_that("a link that will not come down is named, and answers for nothing else", {
+  # The link is this machine's and the asset is on the release whatever
+  # becomes of it, so a `rm` that fails must not turn a replacement that landed
+  # into a run that failed, which is the day's release thrown away and the
+  # analysis repeated.
+  world <- .pub_world(list(.pub_0912(), .pub_out_today()))
+  writeLines(c("#!/usr/bin/env bash",
+               'case "$*" in',
+               '  *.publish-stage*) echo "rm: read-only file system" >&2; exit 1 ;;',
+               'esac',
+               'exec /bin/rm "$@"'), file.path(world$bin, "rm"))
+  Sys.chmod(file.path(world$bin, "rm"), mode = "0755")
+
+  res <- .pub_run(world, .pub_today)
+  expect_equal(res$status, 0L)
+  .pub_expect_whole(world, "metrics-2026-09-13")
+  expect_length(grep("^::warning::could not remove out/\\.publish-stage/swap-next-",
+                     res$output), 4L)
 })
 
 test_that("a replacement that lands short or with other bytes is refused, and the live asset stays", {

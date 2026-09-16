@@ -382,11 +382,13 @@ repair_release_assets() {  # $1=tag, then the asset names
 # release ever carrying a half-written one under that name:
 #
 #   0. put right whatever an earlier attempt left,
-#   1. upload the file under swap-next-NAME,
+#   1. upload the file under swap-next-NAME, through a link of that name,
 #   2. make the release say that asset is whole,
 #   3. rename NAME to swap-prev-NAME, then swap-next-NAME to NAME,
 #   4. read the release back,
 #   5. leave swap-prev-NAME for the next publish under this tag, or the sweep.
+#
+# swap_asset makes the link this uploads through and takes it down again.
 #
 # The temporary part of the name goes in front of the real name rather than
 # after it, because the name an asset is uploaded under decides two things
@@ -430,9 +432,9 @@ repair_release_assets() {  # $1=tag, then the asset names
 # swap-prev-NAME. Sending both renames down one connection with curl measured
 # 235 to 355 ms, which buys a quarter of a second for a second HTTP client and
 # a second way of holding the token in the publish path.
-swap_asset() {  # $1=tag $2=release id $3=file
-  local tag="$1" rel="$2" file="$3"
-  local name size sha stage link n rows row old_id new_id got ok
+swap_staged_asset() {  # $1=tag $2=release id $3=file $4=link to upload through
+  local tag="$1" rel="$2" file="$3" link="$4"
+  local name size sha n rows row old_id new_id got ok
 
   name=$(basename "$file")
   size=$(file_bytes "$file") || return 1
@@ -443,9 +445,7 @@ swap_asset() {  # $1=tag $2=release id $3=file
   # 1. A symlink gives the file the temporary name without copying 1.9 GB of
   #    it: the upload names the asset after the path it is handed and sends the
   #    bytes the link points at.
-  stage="$(dirname "$file")/.publish-stage"
-  mkdir -p "$stage" || return 1
-  link="${stage}/swap-next-${name}"
+  mkdir -p "$(dirname "$link")" || return 1
   ln -sfn "$(cd "$(dirname "$file")" && pwd)/${name}" "$link" || return 1
   upload_asset "$tag" "$link" || return 1
 
@@ -546,6 +546,29 @@ swap_asset() {  # $1=tag $2=release id $3=file
     echo "${tag}: ${name} is asset ${new_id}, ${size} bytes, sha256:${sha}; the release carried no ${name} before this run, so nothing was moved aside"
   fi
   return 0
+}
+
+# Replace one asset of a published release, and take the link the upload went
+# through down again, however the replacement ended.
+#
+# The link is this machine's, not the release's. It is named after the asset
+# and points at a path out/ holds only while the run that wrote it is going,
+# so one left behind outlives its file, and the next run's upload of that name
+# follows a link this one made rather than one it made itself. Four of them
+# were left on a real run, all of them dangling by the end of it.
+#
+# The name is built here rather than by the replacement, so that what is
+# uploaded and what is taken down cannot come apart. Whether the link comes
+# down says nothing about the asset, which is on the release or not either
+# way, so a delete that fails is said out loud and the replacement's own
+# answer is what the caller gets.
+swap_asset() {  # $1=tag $2=release id $3=file
+  local link rc=0
+  link="$(dirname "$3")/.publish-stage/swap-next-$(basename "$3")"
+  swap_staged_asset "$1" "$2" "$3" "$link" || rc=$?
+  rm -f "$link" ||
+    echo "::warning::could not remove ${link}, the link $(basename "$3") was uploaded through; delete it, because the next replacement of that asset uploads through a link of the same name."
+  return "$rc"
 }
 
 # gh retries an upload 3 times, 200 ms apart, which does not outlast an outage:

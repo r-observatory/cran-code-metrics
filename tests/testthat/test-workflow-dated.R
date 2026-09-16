@@ -122,7 +122,10 @@ test_that("an asset of a release that is already out is replaced by name, never 
   expect_true(any(grepl("swap_asset", publish, fixed = TRUE)))
   expect_true(any(grepl("upload_asset", publish, fixed = TRUE)))
 
-  swap <- code("swap_asset")
+  # swap_asset is the link the upload goes through and its removal afterwards;
+  # swap_staged_asset is the replacement itself. Neither deletes the copy it
+  # replaces, so they are read together.
+  swap <- c(code("swap_asset"), code("swap_staged_asset"))
   expect_true(any(grepl('repair_asset "$tag" "$rel" "$name"', swap, fixed = TRUE)))
   expect_true(any(grepl('upload_asset "$tag" "$link"', swap, fixed = TRUE)))
   # The copy it replaces is renamed out of the way, never deleted: a delete

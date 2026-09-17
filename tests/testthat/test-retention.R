@@ -548,13 +548,16 @@ test_that("update.yml fails the run when a prior asset does not arrive", {
 # ---------------------------------------------------------------------------
 # The publish is not atomic, and the guard must not turn that into an outage
 # ---------------------------------------------------------------------------
-# publish_metrics() uploads four assets in one `gh release upload --clobber`,
-# which deletes each existing asset before uploading its replacement. gh cannot
-# do that atomically, so a 502, a dropped connection, the 350-minute job
+# A same-day publish_metrics() replaces four assets, one at a time. Each one
+# goes up under a temporary name and is given its own by a rename, so no reader
+# meets a half-written asset under the name it asked for, but the four still
+# land one after another: a 502, a dropped connection, the 350-minute job
 # timeout or an operator cancel can leave a release carrying shard N's database
-# next to shard N-1's manifest, or no manifest at all. Both states are read by
-# every later run, because the same release stays `latest_tag metrics`
-# tomorrow and the day after.
+# next to shard N-1's manifest. A run that died between the two renames of one
+# asset leaves that name on nothing, its bytes under swap-prev-NAME, until the
+# next run's repair puts the name back, and until then the release reads as
+# carrying no manifest. Both states are read by every later run, because the same
+# release stays `latest_tag metrics` tomorrow and the day after.
 
 test_that("a database ahead of its manifest proceeds, and one short of it refuses", {
   m <- .code_manifest_0814()
@@ -668,6 +671,79 @@ test_that("the refusal names a repair and does not offer force_full as one", {
   # An operator following the message has to end up somewhere better.
   expect_true(grepl("re-upload", msg, fixed = TRUE))
   expect_true(grepl("delete", msg, fixed = TRUE))
+})
+
+test_that("the repair advice names the temporary names an operator will see", {
+  # An operator reading this is about to look at the release's asset listing,
+  # so the names here have to be the names that listing shows. The temporary
+  # part goes in front of the real name, so that a manifest keeps the .json
+  # extension its content type is declared from, and so that a reader asking
+  # for `<name>*` is not handed the copy a replacement set aside.
+  advice <- retention_repair_advice()
+  expect_true(grepl("`swap-next-<name>`", advice, fixed = TRUE))
+  expect_true(grepl("`swap-prev-<name>`", advice, fixed = TRUE))
+  expect_false(grepl("<name>.next", advice, fixed = TRUE))
+  expect_false(grepl("<name>.prev", advice, fixed = TRUE))
+})
+
+test_that("the repair deletes a draft beside the resolved release by id, never by tag", {
+  # The 09-13 draft that wedged the pipeline carried manifests and no
+  # databases, and it was never published. Resolution now skips drafts, so the
+  # only draft this advice can meet shares its tag with the published release
+  # the download step resolved. `gh release delete TAG` looks the tag up both
+  # ways at once and deletes whichever answer arrives first, so following
+  # advice to run it could take the published release and keep the draft.
+  advice <- retention_repair_advice()
+  expect_true(grepl("Draft", advice, fixed = TRUE))
+  expect_true(grepl("never published", advice, fixed = TRUE))
+  expect_true(grepl(paste0(
+    "gh api 'repos/{owner}/{repo}/releases?per_page=100' --paginate ",
+    "-q '.[] | select(.tag_name == \"<tag>\") | \"\\(.id) draft=\\(.draft)\"'"),
+    advice, fixed = TRUE))
+  expect_true(grepl("gh api -X DELETE repos/{owner}/{repo}/releases/<id>",
+                    advice, fixed = TRUE))
+  expect_false(grepl("gh release delete", advice, fixed = TRUE))
+  expect_true(nchar(retention_refusal(c(floor = "a", ceiling = "b"))) < 8000L)
+})
+
+test_that("preflight names a database that never came back instead of calling it smaller", {
+  # Every refused run after 09-13 said the prior database "holds less" than its
+  # manifest, about a database that was not there at all.
+  absent <- withr::local_tempdir()
+  write_manifest(file.path(absent, "prev-code-manifest.json"), .code_manifest_0814())
+  msg <- preflight_refusal(preflight_prior_dbs(absent)$violations)
+  expect_false(grepl("holds less", msg, fixed = TRUE))
+  expect_true(grepl("without the database", msg, fixed = TRUE))
+  expect_true(grepl("re-upload", msg, fixed = TRUE))
+  expect_true(grepl("Draft", msg, fixed = TRUE))
+
+  # A database that did come back short keeps the headline that describes it.
+  short <- withr::local_tempdir()
+  con <- open_or_init_db(file.path(short, DB_FILENAME))
+  DBI::dbWriteTable(con, "cran_code_summary", data.frame(
+    package = "a", version = "1.0", stringsAsFactors = FALSE), append = TRUE)
+  DBI::dbDisconnect(con)
+  write_manifest(file.path(short, "prev-code-manifest.json"), .code_manifest_0814())
+  msg <- preflight_refusal(preflight_prior_dbs(short)$violations)
+  expect_true(grepl("holds less", msg, fixed = TRUE))
+  expect_false(grepl("without the database", msg, fixed = TRUE))
+
+  # Both at once gets both.
+  both <- preflight_refusal(c(absent = "x", "y"))
+  expect_true(grepl("without the database", both, fixed = TRUE))
+  expect_true(grepl("holds less", both, fixed = TRUE))
+})
+
+test_that("preflight.R stops with the headline for what came back", {
+  skip_if(!nzchar(Sys.which("Rscript")), "Rscript is not on PATH")
+  out <- withr::local_tempdir()
+  write_manifest(file.path(out, "prev-code-manifest.json"), .code_manifest_0814())
+  res <- suppressWarnings(system2(
+    "Rscript", c(normalizePath(file.path("..", "..", "scripts", "preflight.R")), out),
+    stdout = TRUE, stderr = TRUE))
+  expect_false(is.null(attr(res, "status")))
+  expect_true(any(grepl("without the database", res, fixed = TRUE)))
+  expect_false(any(grepl("holds less", res, fixed = TRUE)))
 })
 
 test_that("update.yml does not reach for a manifest preflight cannot read", {

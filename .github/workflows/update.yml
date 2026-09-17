@@ -78,7 +78,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          latest_tag() { gh release list --limit 1000 --json tagName -q '.[].tagName' | { grep "^$1-" || true; } | sort -r | head -1; }
+          # latest_tag: the newest PUBLISHED release in a series. A draft left
+          # by a failed publish is not one, and resolving it wedged every run.
+          # shellcheck source=scripts/publish.sh
+          source scripts/publish.sh
 
           # A single consolidated release per day (metrics-YYYY-MM-DD) carries both
           # the code and data DBs as assets. Fall back to the legacy split code-/data-
@@ -119,7 +122,7 @@ jobs:
             for n in 1 2 3 4 5; do
               rm -f "out/$name"
               if gh release download "$tag" --pattern "$name" --dir out && [ -s "out/$name" ]; then
-                echo "fetched ${name} from ${tag} ($(stat -c%s "out/$name") bytes)"
+                echo "fetched ${name} from ${tag} ($(file_bytes "out/$name") bytes)"
                 return 0
               fi
               echo "attempt ${n}: ${name} did not arrive from ${tag}, or arrived empty"
@@ -128,6 +131,22 @@ jobs:
             echo "::error::${tag} lists ${name} as an asset but five attempts failed to fetch a non-empty copy. Refusing to continue: this run would rebuild from an empty database and publish it as latest."
             exit 1
           }
+
+          # An asset of a release that is already out is replaced by uploading
+          # under a temporary name and swapping the names, and a run that died
+          # between those two renames left the release without that asset, its
+          # bytes sitting under swap-prev-<name>. Nothing publishes under an
+          # earlier day's tag again, so the run that reads the release is the
+          # only thing that comes back for it. This puts the name back before
+          # the run asks what the release carries, and clears the copies the
+          # last replacement left. scripts/publish.sh says what each state is.
+          if [ -n "$CODE_SRC" ]; then
+            repair_release_assets "$CODE_SRC" cran-code-metrics.db cran-data-metrics.db \
+              code-manifest.json data-manifest.json || exit 1
+          fi
+          if [ -n "$DATA_SRC" ] && [ "$DATA_SRC" != "$CODE_SRC" ]; then
+            repair_release_assets "$DATA_SRC" cran-data-metrics.db data-manifest.json || exit 1
+          fi
 
           if [ -n "$CODE_SRC" ]; then
             if ! list_assets "$CODE_SRC" "out/.assets-${CODE_SRC}"; then
@@ -166,11 +185,11 @@ jobs:
           # A download can succeed and still hand back a truncated file, so
           # check each database against the manifest published with it before
           # any shard writes to it. Rows, not bytes: a --harvest-descriptions
-          # run clobbers the database asset and leaves the published manifest
+          # run replaces the database asset and leaves the published manifest
           # stale, which moves the file size but never touches
           # cran_code_summary. This is also where a release that published a
           # database and no manifest gets a baseline measured from that
-          # database, so an interrupted upload costs a warning rather than
+          # database, so an interrupted publish costs a warning rather than
           # every run from here on.
           Rscript scripts/preflight.R out/
 
@@ -196,63 +215,51 @@ jobs:
           FORCE_FULL_REBUILD: ${{ inputs.force_full }}
         run: |
           set -euo pipefail
+          # shellcheck source=scripts/publish.sh
+          source scripts/publish.sh
           TODAY="$(date -u +%Y-%m-%d)"
           METRICS_TAG="metrics-${TODAY}"
+          # The prune step cleans up around this tag, hours later. Working the
+          # date out again there gives a run that crossed midnight tomorrow's
+          # tag, so the cleanup would take the release this step had just
+          # published for one nothing comes back for: it would delete the
+          # copies a replacement left minutes earlier, cutting off the
+          # downloads they exist to carry, and stop sparing a draft under the
+          # tag the run was publishing.
+          echo "METRICS_TAG=${METRICS_TAG}" >> "$GITHUB_ENV"
 
           # Harvest mode: backfill archived title/description from tarball
           # DESCRIPTIONs. It only mutates cran_archived_meta's title/description
-          # (the code metrics + data DB + manifests are untouched), so we clobber
-          # just the code-DB asset in today's release. Idempotent (title-IS-NULL
-          # selection) and resumable, so a re-run continues where it left off.
+          # (the code metrics + data DB + manifests are untouched), so it
+          # replaces just the code-DB asset in today's release. Idempotent
+          # (title-IS-NULL selection) and resumable, so a re-run continues where
+          # it left off. Only into a PUBLISHED release: `gh release view` also
+          # finds a draft, and uploading into one publishes nothing. The
+          # replacement uploads under a temporary name and swaps the names, so
+          # the release is never left without the database.
           if [ "${{ inputs.harvest_descriptions }}" = "true" ]; then
             echo "=== harvest-descriptions (elapsed ${SECONDS}s) ==="
             Rscript scripts/update.R out/ --harvest-descriptions
-            if gh release view "$METRICS_TAG" >/dev/null 2>&1; then
-              gh release upload "$METRICS_TAG" out/cran-code-metrics.db --clobber
-              echo "clobbered cran-code-metrics.db in ${METRICS_TAG}"
-            else
-              echo "::error::no ${METRICS_TAG} release to update; run the normal update first."
-              exit 1
-            fi
+            replace_published_asset "$METRICS_TAG" out/cran-code-metrics.db || exit 1
+            echo "replaced cran-code-metrics.db in ${METRICS_TAG}"
             exit 0
           fi
 
           BUDGET="${{ inputs.time_budget_seconds || '18000' }}"
           FORCE=""; [ "${{ inputs.force_full }}" = "true" ] && FORCE="--bootstrap"
           RECOLLECT=""; [ "${{ inputs.recollect }}" = "true" ] && RECOLLECT="--recollect"
-          TODAY="$(date -u +%Y-%m-%d)"
-          METRICS_TAG="metrics-${TODAY}"
-          MAX_BYTES=2040109465
 
           # Publish ONE dated release carrying both the code and data metrics DBs
           # (plus both manifests) as assets, with a single notes body. render_notes.R
           # writes the same catalog to release-notes-code.md/-data.md, so either is
-          # the combined body; we attach the code one.
+          # the combined body; we attach the code one. publish_metrics lives in
+          # scripts/publish.sh, which says how it avoids leaving a draft behind.
           #
-          # Size is the only refusal made here. The refusal that matters more,
+          # Size is the only refusal made there. The refusal that matters more,
           # a run whose figures fell below what the previous release published,
           # is made in scripts/update.R (see "Retention guard"), which exits
           # non-zero and therefore stops the shard below before it ever reaches
-          # this function.
-          publish_metrics() {
-            local f bytes
-            for f in cran-code-metrics.db cran-data-metrics.db; do
-              bytes=$(stat -c%s "out/$f")
-              if [ "$bytes" -gt "$MAX_BYTES" ]; then
-                echo "::error::out/$f is ${bytes} bytes (> ${MAX_BYTES}); refusing to publish ${METRICS_TAG}."
-                return 1
-              fi
-            done
-            local assets=(out/cran-code-metrics.db out/cran-data-metrics.db out/code-manifest.json out/data-manifest.json)
-            if gh release view "$METRICS_TAG" >/dev/null 2>&1; then
-              # Today's release already exists (an earlier shard this run): clobber ONLY today.
-              gh release upload "$METRICS_TAG" "${assets[@]}" --clobber
-              gh release edit "$METRICS_TAG" --notes-file out/release-notes-code.md
-            else
-              gh release create "$METRICS_TAG" "${assets[@]}" \
-                --title "CRAN Metrics - ${TODAY}" --notes-file out/release-notes-code.md --latest
-            fi
-          }
+          # the publish.
 
           shard=0
           while :; do
@@ -267,7 +274,7 @@ jobs:
 
             if [ "$CHANGED" = "true" ]; then
               Rscript scripts/render_notes.R out/
-              publish_metrics || exit 1
+              publish_metrics "$METRICS_TAG" "CRAN Metrics - ${TODAY}" || exit 1
             fi
 
             if [ "$COMPLETE" = "true" ] || [ "$CHANGED" != "true" ]; then
@@ -286,8 +293,9 @@ jobs:
           set -euo pipefail
           # Prune only the consolidated metrics- series. Legacy code-/data- releases
           # are left untouched here and removed by a one-time cleanup once the new
-          # scheme is confirmed.
-          gh release list --limit 1000 --json tagName -q '.[].tagName' \
+          # scheme is confirmed. Drafts are left out so one cannot take a KEEP
+          # slot from a real release; a draft has no tag for --cleanup-tag either.
+          gh release list --exclude-drafts --limit 1000 --json tagName -q '.[].tagName' \
             | { grep "^metrics-" || true; } \
             | Rscript scripts/prune.R \
             | while read -r tag; do
@@ -295,3 +303,20 @@ jobs:
                 echo "pruning $tag"
                 gh release delete "$tag" --yes --cleanup-tag || true
               done
+
+          # That listing leaves drafts out, and a publish replaces a draft only
+          # under its own day's tag, so the draft of a publish that failed on an
+          # earlier day is deleted here or never. scripts/publish.sh says why
+          # this goes by id.
+          # shellcheck source=scripts/publish.sh
+          source scripts/publish.sh
+          delete_stale_drafts metrics "$METRICS_TAG" || exit 1
+
+          # Replacing an asset leaves the copy it replaced under
+          # swap-prev-<name> for readers that were already downloading it, and
+          # the next publish under that tag clears it. The last publish of a
+          # day is never revisited, so this clears what those left, and puts
+          # back any name a replacement did not finish giving. Today's release
+          # is left alone: a delete cuts off a download of that asset that is
+          # already running.
+          sweep_swap_leftovers metrics "$METRICS_TAG" || exit 1

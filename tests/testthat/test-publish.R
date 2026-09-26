@@ -169,7 +169,7 @@
   ct[order(names(ct))]
 }
 
-# The four assets a reader asks for by name, with the copy a replacement sets
+# The assets a reader asks for by name, with the copy a replacement sets
 # aside and the one an interrupted replacement leaves left out.
 .pub_live_sizes <- function(release) {
   sizes <- .pub_asset_sizes(release)
@@ -519,7 +519,7 @@ test_that("a publish carrying no files at all is refused", {
   # The read-back has nothing to disagree with when it is given no files, so a
   # call like this made the draft, found nothing wrong with it and published it
   # as Latest, and the day's tag then resolved to a release carrying neither
-  # database. Nothing calls it that way today; publish_metrics names its four
+  # database. Nothing calls it that way today; publish_metrics names its
   # files, and this keeps a caller that stops naming them from taking the
   # series with it.
   world <- .pub_world(list(.pub_0912()))

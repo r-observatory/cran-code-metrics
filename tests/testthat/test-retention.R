@@ -548,9 +548,9 @@ test_that("update.yml fails the run when a prior asset does not arrive", {
 # ---------------------------------------------------------------------------
 # The publish is not atomic, and the guard must not turn that into an outage
 # ---------------------------------------------------------------------------
-# A same-day publish_metrics() replaces four assets, one at a time. Each one
+# A same-day publish_metrics() replaces the assets one at a time. Each one
 # goes up under a temporary name and is given its own by a rename, so no reader
-# meets a half-written asset under the name it asked for, but the four still
+# meets a half-written asset under the name it asked for, but the assets still
 # land one after another: a 502, a dropped connection, the 350-minute job
 # timeout or an operator cancel can leave a release carrying shard N's database
 # next to shard N-1's manifest. A run that died between the two renames of one

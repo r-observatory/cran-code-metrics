@@ -8,7 +8,7 @@
 #
 # Two things happen here, in this order. A release that published a database
 # and no manifest gets a baseline measured from that database, because a
-# same-day republish replaces four assets one at a time and can be interrupted
+# same-day republish replaces its assets one at a time and can be interrupted
 # between them; refusing on the resulting pair made a transient upload failure
 # permanent, since the same release stays latest tomorrow. The download step
 # repairs a replacement that was cut off mid-swap before this runs, so what

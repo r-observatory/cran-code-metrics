@@ -127,7 +127,8 @@
     list(path = "tables.cran_dataset_contents",   min_ratio = 0.98, max_loss = 0),
     list(path = "db_bytes",                       min_ratio = 0.90, max_loss = 0)
   ),
-  # The text history never deletes a version, so it may only grow.
+  # A package never leaves the text history, but a re-read replaces a version's
+  # rows and may keep fewer fields or notes.
   text = list(
     list(path = "n_packages",                          min_ratio = 1,     max_loss = 0),
     list(path = "n_versions",                          min_ratio = 0.999, max_loss = 0),
@@ -330,7 +331,7 @@ retention_warnings <- function(series, current) {
 retention_repair_advice <- function() {
   paste0(
     "\nLook at the PREVIOUS release first. A later shard on the same day ",
-    "replaces the four assets one at a time, so an interrupted publish can ",
+    "replaces the release's assets one at a time, so an interrupted publish can ",
     "leave one shard's database beside another shard's manifest.\n",
     "Each asset is replaced by uploading it as `swap-next-<name>` and then ",
     "moving the name over, so an asset the release seems to have lost is ",
@@ -431,7 +432,7 @@ retention_refusal <- function(violations) {
 #' One-sided on purpose. Only `now < was` is the signature this guard is for: a
 #' truncated file, or a database from before the rows the manifest counted. The
 #' other direction, a database with MORE rows than its manifest, is what a
-#' publish interrupted between two of its four assets leaves when shard N's
+#' publish interrupted between two of its assets leaves when shard N's
 #' database lands and shard N-1's manifest is still attached, and it costs
 #' nothing: a
 #' smaller baseline only makes the retention floor more permissive, never less.
@@ -475,7 +476,7 @@ prior_db_violations <- function(series, counts, prior) {
 #' A downloaded prior database that is AHEAD of the manifest shipped with it.
 #'
 #' Not a violation, but not nothing either: it says the previous publish was
-#' interrupted partway through its four assets, and the release will keep
+#' interrupted partway through its assets, and the release will keep
 #' handing out a mismatched pair until someone fixes it. Worth an annotation in
 #' the log every run, so it gets noticed before something less benign lands in
 #' the same window.
@@ -493,7 +494,7 @@ prior_db_notes <- function(series, counts, prior) {
     out <- c(out, sprintf(paste0(
       "the downloaded %s database holds %s rows in %s but the manifest ",
       "published with it says %s: the previous publish did not finish ",
-      "uploading its four assets. Building on it anyway (a smaller baseline ",
+      "uploading its assets. Building on it anyway (a smaller baseline ",
       "only loosens the retention floor), but re-upload the manifest that ",
       "belongs with that database."),
       series, .ret_fmt(now_ver), tbls$ver_table, .ret_fmt(was_ver)))
@@ -564,7 +565,7 @@ prior_db_notes <- function(series, counts, prior) {
 #' A baseline measured from a downloaded database, for a release that
 #' published no manifest.
 #'
-#' A same-day republish is not atomic (four assets, one at a time), so a run
+#' A same-day republish is not atomic (one asset at a time), so a run
 #' that died between two of them can leave a release carrying a database newer
 #' than its manifest, and one that died between the two renames that give an
 #' asset its name can leave the release with no code-manifest.json at all until

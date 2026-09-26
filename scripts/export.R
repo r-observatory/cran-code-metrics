@@ -1766,7 +1766,7 @@ upsert_datasets <- function(data_con, datasets_df, pkgs) {
 #' n_universe/n_remaining may be NULL when unmeasurable.
 #'
 #' @param con         Open DBI connection to the pipeline SQLite database.
-#' @param series      "code" or "data".
+#' @param series      "code", "data" or "text".
 #' @param repo        "owner/name" of the publishing repo.
 #' @param db_filename The asset filename this manifest describes.
 #' @param db_bytes    On-disk size of the DB file, in bytes.
@@ -1804,8 +1804,8 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
 
   # Fingerprint over the concatenation of fp_cols keys, ordered by the SQL
   # tuple (not by sorting the already-concatenated strings). Code-series
-  # keys join fields with ":" (matching db_fingerprint()); data-series keys
-  # join fields with "\x1f" per the manifest schema.
+  # keys join fields with ":" (matching db_fingerprint()); data- and
+  # text-series keys join fields with "\x1f" per the manifest schema.
   fp_sep <- if (identical(series, "code")) ":" else "\x1f"
   fingerprint <- {
     if (!fp_table %in% present) {

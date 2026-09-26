@@ -107,3 +107,29 @@ test_that("a run under a 0.5.0 analyzer writes the declared types", {
   on.exit(DBI::dbDisconnect(con), add = TRUE)
   expect_identical(.ss_types(con)[names(.SUMMARY_050_COLS)], .SUMMARY_050_COLS)
 })
+
+# A shard where every package fell back to R carries none of the 0.5.0 keys.
+test_that("a 0.5.0 shard that carries none of the new columns still gets them all", {
+  bare <- function(pkg) data.frame(package = pkg, version = "1.0", loc_r = 10L,
+                                   stringsAsFactors = FALSE)
+
+  created_path <- withr::local_tempfile(fileext = ".db")
+  created <- open_or_init_db(created_path)
+  on.exit(DBI::dbDisconnect(created), add = TRUE)
+  .ss_upsert(created, bare("pkgA"), "0.5.0")
+  expect_identical(.ss_types(created)[names(.SUMMARY_050_COLS)], .SUMMARY_050_COLS)
+
+  altered_path <- withr::local_tempfile(fileext = ".db")
+  altered <- open_or_init_db(altered_path)
+  on.exit(DBI::dbDisconnect(altered), add = TRUE)
+  .ss_upsert(altered, bare("old"), "0.4.0")
+  .ss_upsert(altered, bare("pkgA"), "0.5.0")
+  expect_identical(.ss_types(altered)[names(.SUMMARY_050_COLS)], .SUMMARY_050_COLS)
+
+  exported_path <- withr::local_tempfile(fileext = ".db")
+  export_metrics(exported_path, bare("pkgA"), .empty_churn(), .empty_api(),
+                 analyzer_version = "0.5.0")
+  exported <- DBI::dbConnect(RSQLite::SQLite(), exported_path)
+  on.exit(DBI::dbDisconnect(exported), add = TRUE)
+  expect_identical(.ss_types(exported)[names(.SUMMARY_050_COLS)], .SUMMARY_050_COLS)
+})

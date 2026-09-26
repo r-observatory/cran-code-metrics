@@ -189,3 +189,17 @@ R_SOURCE_RE <- "^R/.*\\.[Rr]$"
 ANALYZER_INPUT_KIND <- "release"
 
 SUMMARY_TABLE <- "cran_code_summary"
+
+# DESCRIPTION and NEWS text for every analysed version, kept in a third database.
+RELEASE_TEXT_DB_FILENAME    <- "cran-release-text.db"
+DESCRIPTION_HISTORY_TABLE   <- "cran_description_history"
+RELEASE_NOTES_HISTORY_TABLE <- "cran_release_notes_history"
+RELEASE_TEXT_VERSIONS_TABLE <- "cran_release_text_versions"
+DESCRIPTION_FIELDS_TABLE    <- "cran_description_fields"
+RELEASE_NOTES_TABLE         <- "cran_release_notes"
+
+# The merged latest-only tables cap each value here, far under MySQL's 32 MiB packet.
+RELEASE_TEXT_FIELD_MAX_BYTES <- 16384L
+
+# More missing history than this means the text database is the wrong copy.
+RELEASE_TEXT_REQUEUE_MAX <- 2000L

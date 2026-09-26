@@ -235,6 +235,15 @@ test_that("the download step repairs and reads the text database, and never star
   expect_length(resolve, 1L)
   # A resolution that failed stops the step rather than reading as no release.
   expect_true(grepl("|| {", lines[resolve], fixed = TRUE))
+  after <- trimws(lines[-seq_len(resolve)])
+  expect_true("exit 1" %in% head(after, match("}", after, nomatch = 0L)))
+  # An older source is listed first, or its text manifest would be skipped unseen.
+  listing <- grep('if ! list_assets "$TEXT_SRC" "out/.assets-${TEXT_SRC}"; then', lines,
+                  fixed = TRUE)
+  expect_length(listing, 1L)
+  expect_identical(trimws(lines[listing + 2L]), "exit 1")
+  expect_true(any(listing < grep('have_asset "$TEXT_SRC" text-manifest.json', lines,
+                                 fixed = TRUE)))
   expect_true(any(grepl('get_asset "$TEXT_SRC" cran-release-text.db', lines, fixed = TRUE)))
   expect_true(any(grepl("mv out/text-manifest.json out/prev-text-manifest.json", lines,
                         fixed = TRUE)))

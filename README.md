@@ -16,7 +16,7 @@ the ordered version series.
 
 ## Output
 
-`cran-code-metrics.db` (published as a dated `code-YYYY-MM-DD` release; a
+`cran-code-metrics.db` (published as a dated `metrics-YYYY-MM-DD` release; a
 release is immutable once a later day's release exists, and old releases are
 pruned on a retention schedule):
 
@@ -30,8 +30,8 @@ pruned on a retention schedule):
 - `cran_release_notes` - the NEWS section for the latest analysed version, when
   the analyzer found one, capped at 16,384 bytes.
 
-`cran-data-metrics.db` is published the same way, as a dated `data-YYYY-MM-DD`
-release, and holds the dataset-focused tables.
+`cran-data-metrics.db` is published in the same release and holds the
+dataset-focused tables.
 
 `cran-release-text.db` is published in the same release and keeps the text
 history: every DESCRIPTION field (`cran_description_history`) and NEWS section

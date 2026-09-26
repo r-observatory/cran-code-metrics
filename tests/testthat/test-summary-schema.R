@@ -133,3 +133,93 @@ test_that("a 0.5.0 shard that carries none of the new columns still gets them al
   on.exit(DBI::dbDisconnect(exported), add = TRUE)
   expect_identical(.ss_types(exported)[names(.SUMMARY_050_COLS)], .SUMMARY_050_COLS)
 })
+
+.ss_retired_shard <- function(with_retired, pkg = "prova") {
+  df <- data.frame(package = pkg, version = "2.3.0",
+                   url = "https://example.org/prova", stringsAsFactors = FALSE)
+  if (with_retired) {
+    df$has_website <- 1L
+    df$copyright_holder_declared <- 1L
+  }
+  df
+}
+
+.ss_cols <- function(con) DBI::dbListFields(con, SUMMARY_TABLE)
+
+test_that("a retired column stays under an older analyzer", {
+  path <- withr::local_tempfile(fileext = ".db")
+  con <- open_or_init_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  .ss_upsert(con, .ss_retired_shard(TRUE), "0.4.0")
+  .ss_upsert(con, .ss_retired_shard(TRUE), "0.4.0")
+  expect_true(all(c("has_website", "copyright_holder_declared") %in% .ss_cols(con)))
+  expect_equal(DBI::dbGetQuery(con, sprintf(
+    'SELECT has_website FROM "%s"', SUMMARY_TABLE))$has_website, 1L)
+})
+
+test_that("a shard with no analyzer at all never drops a filled column", {
+  path <- withr::local_tempfile(fileext = ".db")
+  con <- open_or_init_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  .ss_upsert(con, .ss_retired_shard(TRUE), "0.4.0")
+  # The R fallback's frame lacks the column; the run could not name a build.
+  .ss_upsert(con, .ss_retired_shard(FALSE, pkg = "other"), NA_character_)
+  expect_true("has_website" %in% .ss_cols(con))
+  vals <- DBI::dbGetQuery(con, sprintf(
+    'SELECT package, has_website FROM "%s" ORDER BY package', SUMMARY_TABLE))
+  expect_equal(vals$has_website, c(NA, 1L))
+})
+
+test_that("the first 0.5.0 shard drops both retired columns and keeps the rows", {
+  path <- withr::local_tempfile(fileext = ".db")
+  con <- open_or_init_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  .ss_upsert(con, .ss_retired_shard(TRUE, pkg = "kept"), "0.4.0")
+  .ss_upsert(con, .ss_retired_shard(FALSE), "0.5.0")
+  cols <- .ss_cols(con)
+  expect_false(any(c("has_website", "copyright_holder_declared") %in% cols))
+  rows <- DBI::dbGetQuery(con, sprintf(
+    'SELECT package, url FROM "%s" ORDER BY package', SUMMARY_TABLE))
+  expect_equal(rows$package, c("kept", "prova"))
+  expect_equal(rows$url, rep("https://example.org/prova", 2L))
+})
+
+test_that("a later row carrying a retired column does not add it back", {
+  path <- withr::local_tempfile(fileext = ".db")
+  con <- open_or_init_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  .ss_upsert(con, .ss_retired_shard(TRUE), "0.4.0")
+  .ss_upsert(con, .ss_retired_shard(FALSE), "0.5.0")
+  .ss_upsert(con, .ss_retired_shard(TRUE, pkg = "late"), "0.5.0")
+  expect_false(any(c("has_website", "copyright_holder_declared") %in% .ss_cols(con)))
+  expect_no_error(.ss_upsert(con, .ss_retired_shard(TRUE, pkg = "later"), "0.5.0"))
+})
+
+test_that("columns mapped to 0.5.0 later are stripped and dropped the same way", {
+  retired <- c(.RETIRED_SUMMARY_COLS, dontrun_example_ratio = "0.5.0",
+               examples_coverage = "0.5.0", testing_frameworks = "0.5.0",
+               n_test_cases = "0.5.0")
+  df <- data.frame(package = "p", version = "1.0", dontrun_example_ratio = 0.5,
+                   examples_coverage = 1, testing_frameworks = "[]",
+                   n_test_cases = 3L, stringsAsFactors = FALSE)
+  expect_identical(names(.strip_retired_columns(df, "0.4.0", retired)), names(df))
+  expect_identical(names(.strip_retired_columns(df, "0.5.0", retired)), c("package", "version"))
+
+  path <- withr::local_tempfile(fileext = ".db")
+  con <- open_or_init_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  .ss_upsert(con, df, "0.4.0")
+  expect_identical(.drop_retired_columns(con, "0.4.0", retired), character(0L))
+  expect_setequal(.drop_retired_columns(con, "0.5.0", retired),
+                  c("dontrun_example_ratio", "examples_coverage",
+                    "testing_frameworks", "n_test_cases"))
+  expect_setequal(.ss_cols(con), c("package", "version"))
+})
+
+test_that("a database with no summary table yet is left alone", {
+  path <- withr::local_tempfile(fileext = ".db")
+  con <- open_or_init_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(.drop_retired_columns(con, "0.5.0"), character(0L))
+  expect_identical(.ensure_summary_columns(con, "0.5.0"), character(0L))
+})

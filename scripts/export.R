@@ -51,6 +51,7 @@ export_metrics <- function(path, summary_df, churn_df, api_df, vignettes_df = NU
   # ---- cran_code_summary -----------------------------------------------------
   write_summary <- .coerce_logicals(summary_df)
   write_summary <- .apply_declared_types(write_summary, analyzer_version)
+  write_summary <- .strip_retired_columns(write_summary, analyzer_version)
   # Guarantee at least package and version columns for schema stability.
   if (!"package" %in% names(write_summary)) {
     write_summary[["package"]] <- rep(NA_character_, nrow(write_summary))
@@ -1565,6 +1566,35 @@ db_analyzed_state <- function(con) {
   invisible(add)
 }
 
+# Each retired column and the analyzer version that stopped emitting it.
+.RETIRED_SUMMARY_COLS <- c(has_website = "0.5.0", copyright_holder_declared = "0.5.0")
+
+# The retired names whose analyzer version the running build has reached.
+.retired_now <- function(analyzer_version, retired = .RETIRED_SUMMARY_COLS) {
+  keep <- vapply(unname(retired), function(v) analyzer_at_least(analyzer_version, v),
+                 logical(1L))
+  names(retired)[keep]
+}
+
+#' Remove retired columns from a shard frame, so no row can add one back.
+.strip_retired_columns <- function(df, analyzer_version, retired = .RETIRED_SUMMARY_COLS) {
+  gone <- intersect(.retired_now(analyzer_version, retired), names(df))
+  if (length(gone)) df <- df[, setdiff(names(df), gone), drop = FALSE]
+  df
+}
+
+#' Drop retired columns once the running analyzer is past them. Gated on the build,
+#' not the frame: an R-fallback shard under an old pin must not drop a filled column.
+.drop_retired_columns <- function(con, analyzer_version, retired = .RETIRED_SUMMARY_COLS) {
+  if (!SUMMARY_TABLE %in% DBI::dbListTables(con)) return(invisible(character(0L)))
+  gone <- intersect(.retired_now(analyzer_version, retired),
+                    DBI::dbListFields(con, SUMMARY_TABLE))
+  for (col in gone) {
+    DBI::dbExecute(con, sprintf('ALTER TABLE "%s" DROP COLUMN "%s"', SUMMARY_TABLE, col))
+  }
+  invisible(gone)
+}
+
 #' Upsert one shard's rows into the pipeline database in-place.
 #'
 #' For each package present in summary_df, deletes all prior rows from the
@@ -1627,6 +1657,8 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     # -- Insert fresh summary rows (with schema-growth handling) -------------
     summary_write <- .coerce_logicals(summary_df)
     summary_write <- .apply_declared_types(summary_write, analyzer_version)
+    summary_write <- .strip_retired_columns(summary_write, analyzer_version)
+    .drop_retired_columns(con, analyzer_version)
     tables        <- DBI::dbListTables(con)
 
     if (!"cran_code_summary" %in% tables) {

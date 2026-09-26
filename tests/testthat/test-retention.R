@@ -1180,3 +1180,42 @@ test_that("a text database whose manifest never landed is measured, not refused"
   expect_true(length(retention_violations(
     "text", .text_manifest(n_packages = 0L, n_versions = 0L, history = 0L), derived)) > 0L)
 })
+
+test_that("a text and code pair from different runs is named, not refused", {
+  out <- withr::local_tempdir()
+  write_manifest(file.path(out, "prev-code-manifest.json"), .code_manifest_0814())
+  write_manifest(file.path(out, "prev-text-manifest.json"),
+                 .text_manifest(code_fingerprint = strrep("e", 64L)))
+  got <- text_code_pairing(out, "metrics-2026-08-14", "metrics-2026-08-10")
+  expect_true(got$text_code_mismatch)
+  expect_true(grepl(strrep("e", 64L), got$notes, fixed = TRUE))
+  expect_true(grepl(strrep("b", 64L), got$notes, fixed = TRUE))
+  expect_true(grepl("metrics-2026-08-10", got$notes, fixed = TRUE))
+
+  write_manifest(file.path(out, "prev-text-manifest.json"),
+                 .text_manifest(code_fingerprint = strrep("b", 64L)))
+  expect_false(text_code_pairing(out)$text_code_mismatch)
+  unlink(file.path(out, "prev-text-manifest.json"))
+  expect_false(text_code_pairing(out)$text_code_mismatch)
+})
+
+test_that("preflight.R logs a mixed pair, records it, and lets the run go on", {
+  skip_if(!nzchar(Sys.which("Rscript")), "Rscript is not on PATH")
+  out <- withr::local_tempdir()
+  con <- open_or_init_db(file.path(out, DB_FILENAME)); DBI::dbDisconnect(con)
+  text_con <- open_or_init_release_text_db(file.path(out, RELEASE_TEXT_DB_FILENAME))
+  DBI::dbDisconnect(text_con)
+  empty <- function(m) { m$n_packages <- 0L; m$n_versions <- 0L; m }
+  write_manifest(file.path(out, "prev-code-manifest.json"), empty(.code_manifest_0814()))
+  write_manifest(file.path(out, "prev-text-manifest.json"),
+                 empty(.text_manifest(code_fingerprint = strrep("e", 64L))))
+  res <- suppressWarnings(system2(
+    "Rscript", c(normalizePath(file.path("..", "..", "scripts", "preflight.R")), out,
+                 "--code-src=metrics-2026-08-14", "--text-src=metrics-2026-08-10"),
+    stdout = TRUE, stderr = TRUE))
+  expect_null(attr(res, "status"))
+  expect_true(any(grepl("::warning::the text database from metrics-2026-08-10", res, fixed = TRUE)))
+  check <- jsonlite::fromJSON(file.path(out, "text-code-check.json"))
+  expect_true(check$text_code_mismatch)
+  expect_identical(check$code_tag, "metrics-2026-08-14")
+})

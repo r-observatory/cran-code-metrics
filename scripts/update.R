@@ -1080,6 +1080,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     bootstrap = bootstrap)
   # Names the code database it was published beside, so the next run can tell a mixed pair.
   text_manifest$code_fingerprint <- code_manifest$fingerprint
+  text_check <- read_manifest_file(file.path(out_dir, "text-code-check.json"))
 
   write_manifest(file.path(out_dir, "code-manifest.json"), code_manifest)
   write_manifest(file.path(out_dir, "data-manifest.json"), data_manifest)
@@ -1090,7 +1091,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       n_remaining = length(remaining_after), n_fresh = length(fresh_pkgs),
                       n_shard = length(shard_pkgs),
                       n_versions = nrow(fresh_summary),
-                      shard_failures = length(shard_failures)))
+                      shard_failures = length(shard_failures),
+                      text_code_mismatch = isTRUE(text_check$text_code_mismatch)))
 
   # ---- 8e. Retention guard --------------------------------------------------
   # The published database is the pipeline's accumulated state, so publishing a

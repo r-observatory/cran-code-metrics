@@ -165,3 +165,16 @@ test_that("a run that would publish a smaller text history is refused", {
     tables = list(cran_description_history = 900L, cran_release_notes_history = 40L)))
   expect_error(run_update(.rtr_io(), out, shard_size = 10L), "text n_packages")
 })
+
+test_that("preflight's finding about a mixed pair reaches every shard's run status", {
+  .rtr_stub_bin()
+  .rtr_stub_analyze()
+  out <- withr::local_tempdir()
+  run_update(.rtr_io(), out, shard_size = 10L)
+  expect_false(jsonlite::fromJSON(file.path(out, "run-status.json"))$text_code_mismatch)
+
+  jsonlite::write_json(list(text_code_mismatch = TRUE), file.path(out, "text-code-check.json"),
+                       auto_unbox = TRUE)
+  run_update(.rtr_io(), out, shard_size = 10L)
+  expect_true(jsonlite::fromJSON(file.path(out, "run-status.json"))$text_code_mismatch)
+})

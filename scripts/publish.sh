@@ -102,6 +102,41 @@ latest_tag() {
   return 1
 }
 
+# Newest PUBLISHED tag in a series whose assets name $2, or nothing when no
+# release has carried it. A listing it cannot read fails rather than reads as none.
+newest_tag_with_asset() {  # $1=series $2=asset name
+  local tags tag names n
+  for n in 1 2 3 4 5; do
+    if tags=$(gh release list --exclude-drafts --limit 1000 --json tagName -q '.[].tagName'); then
+      break
+    fi
+    echo "attempt ${n}: could not list the releases to find the newest $1 release carrying $2" >&2
+    if [ "$n" -eq 5 ]; then
+      echo "::error::five attempts failed to list the releases; cannot tell which one carries $2." >&2
+      return 1
+    fi
+    publish_backoff "$n" 10
+  done
+  for tag in $(printf '%s\n' "$tags" | { grep "^$1-" || true; } | sort -r); do
+    for n in 1 2 3 4 5; do
+      if names=$(gh release view "$tag" --json assets -q '.assets[].name'); then
+        break
+      fi
+      echo "attempt ${n}: could not list the assets of ${tag}" >&2
+      if [ "$n" -eq 5 ]; then
+        echo "::error::five attempts failed to list the assets of ${tag}; cannot tell whether it carries $2." >&2
+        return 1
+      fi
+      publish_backoff "$n" 10
+    done
+    if printf '%s\n' "$names" | grep -qxF "$2"; then
+      printf '%s\n' "$tag"
+      return 0
+    fi
+  done
+  return 0
+}
+
 # What exists under a tag: nothing (empty), "published", "draft", or one line
 # per release when more than one carries it. Drafts have to be seen here. A
 # listing rather than `gh release view TAG`: view fails the same way whether the
@@ -726,14 +761,17 @@ publish_release() {  # $1=tag $2=title $3=notes file, then the files
   fi
 }
 
-# The day's metrics release: both databases, then both manifests, from out/.
+# The day's metrics release: the three databases, then the three manifests, from out/.
 #
 # Databases first, because a manifest that landed without its database is the
 # pair preflight has to refuse, and a database ahead of its manifest is the one
 # it can build on.
+#
+# The text database before the code one: a code database ahead of it is a gap of
+# every version the shard read, more than a run re-reads during a rescan.
 publish_metrics() {  # $1=tag $2=title
   local tag="$1" title="$2" f bytes
-  for f in cran-code-metrics.db cran-data-metrics.db; do
+  for f in cran-code-metrics.db cran-data-metrics.db cran-release-text.db; do
     bytes=$(file_bytes "out/$f") || return 1
     if [ "$bytes" -gt "$PUBLISH_MAX_BYTES" ]; then
       echo "::error::out/$f is ${bytes} bytes (> ${PUBLISH_MAX_BYTES}); refusing to publish ${tag}."
@@ -741,8 +779,8 @@ publish_metrics() {  # $1=tag $2=title
     fi
   done
   publish_release "$tag" "$title" out/release-notes-code.md \
-    out/cran-code-metrics.db out/cran-data-metrics.db \
-    out/code-manifest.json out/data-manifest.json || return 1
+    out/cran-release-text.db out/cran-code-metrics.db out/cran-data-metrics.db \
+    out/code-manifest.json out/data-manifest.json out/text-manifest.json || return 1
 }
 
 # Replace one asset of a release that is already out, for the harvest run.

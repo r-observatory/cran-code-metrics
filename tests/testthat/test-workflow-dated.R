@@ -212,3 +212,58 @@ test_that("the prune clears the drafts a failed publish left on an earlier day",
   expect_true(any(grepl("gh api -X DELETE", body, fixed = TRUE)))
   expect_false(any(grepl("gh release delete", body[!grepl("^\\s*#", body)], fixed = TRUE)))
 })
+
+# The download step as one string, continuation lines joined.
+.download_step <- function() {
+  yml <- .update_yml()
+  start <- grep("- name: Download the latest databases", yml, fixed = TRUE)
+  end <- start - 1L +
+    grep("- name: Analyze shards", yml[start:length(yml)], fixed = TRUE)[1L]
+  gsub("\\\\\n\\s*", " ", paste(yml[start:end], collapse = "\n"))
+}
+
+test_that("the download step repairs and reads the text database, and never starts it empty by accident", {
+  step <- .download_step()
+  lines <- strsplit(step, "\n")[[1L]]
+  code_repair <- grep('repair_release_assets "$CODE_SRC"', lines, fixed = TRUE, value = TRUE)
+  expect_length(code_repair, 1L)
+  expect_true(grepl("cran-release-text.db", code_repair, fixed = TRUE))
+  expect_true(grepl("text-manifest.json", code_repair, fixed = TRUE))
+
+  resolve <- grep("newest_tag_with_asset metrics cran-release-text.db", lines,
+                  fixed = TRUE)
+  expect_length(resolve, 1L)
+  # A resolution that failed stops the step rather than reading as no release.
+  expect_true(grepl("|| {", lines[resolve], fixed = TRUE))
+  after <- trimws(lines[-seq_len(resolve)])
+  expect_true("exit 1" %in% head(after, match("}", after, nomatch = 0L)))
+  # An older source is listed first, or its text manifest would be skipped unseen.
+  listing <- grep('if ! list_assets "$TEXT_SRC" "out/.assets-${TEXT_SRC}"; then', lines,
+                  fixed = TRUE)
+  expect_length(listing, 1L)
+  expect_identical(trimws(lines[listing + 2L]), "exit 1")
+  expect_true(any(listing < grep('have_asset "$TEXT_SRC" text-manifest.json', lines,
+                                 fixed = TRUE)))
+  expect_true(any(grepl('get_asset "$TEXT_SRC" cran-release-text.db', lines, fixed = TRUE)))
+  expect_true(any(grepl("mv out/text-manifest.json out/prev-text-manifest.json", lines,
+                        fixed = TRUE)))
+  # The repair comes before the resolution reads what the release carries.
+  expect_lt(grep('repair_release_assets "$CODE_SRC"', lines, fixed = TRUE), resolve)
+  expect_true(any(grepl('preflight.R out/ --code-src="$CODE_SRC" --text-src="$TEXT_SRC"',
+                        lines, fixed = TRUE)))
+  expect_true(any(grepl('PREV_TEXT_TAG=${TEXT_SRC}', lines, fixed = TRUE)))
+})
+
+test_that("the day's release carries the text database and its manifest, databases first", {
+  body <- .sh_function(.publish_sh(), "publish_metrics")
+  joined <- gsub("\\\\\n\\s*", " ", paste(body, collapse = "\n"))
+  expect_true(grepl("cran-code-metrics.db cran-data-metrics.db cran-release-text.db; do",
+                    joined, fixed = TRUE))
+  call <- grep("publish_release", strsplit(joined, "\n")[[1L]], value = TRUE)
+  expect_length(call, 1L)
+  files <- regmatches(call, gregexpr("out/[a-z.-]+", call))[[1L]]
+  expect_identical(files, c("out/release-notes-code.md", "out/cran-release-text.db",
+                            "out/cran-code-metrics.db", "out/cran-data-metrics.db",
+                            "out/code-manifest.json", "out/data-manifest.json",
+                            "out/text-manifest.json"))
+})

@@ -1855,3 +1855,30 @@ test_that("a package the installed analyzer cannot read names no build either", 
   expect_true(all(is.na(
     DBI::dbGetQuery(con, "SELECT datasets_scanned FROM cran_code_summary")[[1L]])))
 })
+
+test_that("how a help page documents a dataset lands on its identity row", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  row <- .mk_wide_row()
+  row$dataset_doc_source <- "Collected by the authors in 2020."
+  row$dataset_doc_format <- 1L
+  expect_identical(intersect(c("dataset_doc_source", "dataset_doc_format"),
+                             .dataset_fields_dropped(row)), character(0L))
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, row, "p"))
+
+  got <- DBI::dbGetQuery(con, "SELECT dataset_doc_source, dataset_doc_format FROM cran_datasets")
+  expect_identical(got$dataset_doc_source, "Collected by the authors in 2020.")
+  expect_identical(got$dataset_doc_format, 1L)
+  expect_false(any(c("dataset_doc_source", "dataset_doc_format") %in%
+                     DBI::dbListFields(con, "cran_dataset_contents")))
+})
+
+test_that("a catalog written before the documentation columns gains them empty", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_wide_row(), "p"))
+  info <- DBI::dbGetQuery(con, "PRAGMA table_info(cran_datasets)")
+  expect_identical(info$type[match(c("dataset_doc_source", "dataset_doc_format"), info$name)],
+                   c("TEXT", "INTEGER"))
+  expect_true(is.na(DBI::dbGetQuery(con, "SELECT dataset_doc_format FROM cran_datasets")[[1L]]))
+})

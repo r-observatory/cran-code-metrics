@@ -548,9 +548,9 @@ test_that("update.yml fails the run when a prior asset does not arrive", {
 # ---------------------------------------------------------------------------
 # The publish is not atomic, and the guard must not turn that into an outage
 # ---------------------------------------------------------------------------
-# A same-day publish_metrics() replaces four assets, one at a time. Each one
+# A same-day publish_metrics() replaces the assets one at a time. Each one
 # goes up under a temporary name and is given its own by a rename, so no reader
-# meets a half-written asset under the name it asked for, but the four still
+# meets a half-written asset under the name it asked for, but the assets still
 # land one after another: a 502, a dropped connection, the 350-minute job
 # timeout or an operator cancel can leave a release carrying shard N's database
 # next to shard N-1's manifest. A run that died between the two renames of one
@@ -744,6 +744,10 @@ test_that("preflight.R stops with the headline for what came back", {
   expect_false(is.null(attr(res, "status")))
   expect_true(any(grepl("without the database", res, fixed = TRUE)))
   expect_false(any(grepl("holds less", res, fixed = TRUE)))
+  # The pairing is recorded before the refusal, and no tag flags leave both tags empty.
+  check <- jsonlite::fromJSON(file.path(out, "text-code-check.json"))
+  expect_identical(check$code_tag, "")
+  expect_identical(check$text_tag, "")
 })
 
 test_that("update.yml does not reach for a manifest preflight cannot read", {
@@ -1116,4 +1120,110 @@ test_that("a baseline carrying no failures count is not given one mid-run", {
   cold <- file.path(out, "prev-data-manifest.json")
   expect_false(advance_ceiling_baseline(cold, "data", .data_manifest_0814()))
   expect_false(file.exists(cold))
+})
+
+# ---------------------------------------------------------------------------
+# The text history: a third database with its own manifest
+# ---------------------------------------------------------------------------
+
+.text_manifest <- function(n_packages = 2L, n_versions = 3L, history = 60L,
+                           notes = 2L, code_fingerprint = strrep("a", 64L)) list(
+  schema_version = 1L, series = "text", db_filename = "cran-release-text.db",
+  n_packages = n_packages, n_versions = n_versions,
+  tables = list(cran_description_history = history,
+                cran_release_notes_history = notes,
+                cran_release_text_versions = n_versions),
+  code_fingerprint = code_fingerprint)
+
+test_that("the text history may grow and may not shrink", {
+  expect_identical(retention_violations("text", .text_manifest(), .text_manifest()),
+                   character(0L))
+  expect_identical(retention_violations("text", .text_manifest(n_versions = 4L, history = 80L),
+                                        .text_manifest()), character(0L))
+  v <- retention_violations("text", .text_manifest(n_packages = 1L), .text_manifest())
+  expect_true(any(grepl("text n_packages", v, fixed = TRUE)))
+  v <- retention_violations("text", .text_manifest(history = 50L), .text_manifest())
+  expect_true(any(grepl("cran_description_history", v, fixed = TRUE)))
+  v <- retention_violations("text", .text_manifest(), NULL, prior_tag = "metrics-2026-09-20")
+  expect_true(any(grepl("no text baseline", v, fixed = TRUE)))
+})
+
+test_that("preflight reads the downloaded text database against its manifest", {
+  out <- withr::local_tempdir()
+  text_con <- open_or_init_release_text_db(file.path(out, RELEASE_TEXT_DB_FILENAME))
+  DBI::dbDisconnect(text_con)
+  write_manifest(file.path(out, "prev-text-manifest.json"), .text_manifest())
+  v <- preflight_prior_dbs(out)$violations
+  expect_true(any(grepl("cran_release_text_versions", v, fixed = TRUE)))
+})
+
+test_that("a text manifest with no text database is the lost-download state", {
+  out <- withr::local_tempdir()
+  write_manifest(file.path(out, "prev-text-manifest.json"), .text_manifest())
+  v <- preflight_prior_dbs(out)$violations
+  expect_true(any(grepl(RELEASE_TEXT_DB_FILENAME, v, fixed = TRUE)))
+})
+
+test_that("a text database whose manifest never landed is measured, not refused", {
+  # A publish cut off between the databases and the manifests leaves this pair.
+  out <- withr::local_tempdir()
+  text_con <- open_or_init_release_text_db(file.path(out, RELEASE_TEXT_DB_FILENAME))
+  text <- .release_text_collect(list(.release_text_rows(
+    "pkgA", "1.0", c(Package = "pkgA", Version = "1.0"), NULL, "0.5.0")), "1.0")
+  upsert_release_text(text_con, text$description, text$release_notes, text$versions)
+  DBI::dbDisconnect(text_con)
+
+  notes <- ensure_prior_baseline(out)
+  expect_true(any(grepl(RELEASE_TEXT_DB_FILENAME, notes, fixed = TRUE)))
+  derived <- read_manifest_file(file.path(out, "prev-text-manifest.json"))
+  expect_identical(as.character(derived$series), "text")
+  expect_equal(as.numeric(derived$n_versions), 1)
+  expect_equal(as.numeric(derived$tables$cran_description_history), 2)
+  expect_identical(preflight_prior_dbs(out)$violations, character(0L))
+  # It is a floor the run is then held to.
+  expect_true(length(retention_violations(
+    "text", .text_manifest(n_packages = 0L, n_versions = 0L, history = 0L), derived)) > 0L)
+})
+
+test_that("a text and code pair from different runs is named, not refused", {
+  out <- withr::local_tempdir()
+  write_manifest(file.path(out, "prev-code-manifest.json"), .code_manifest_0814())
+  write_manifest(file.path(out, "prev-text-manifest.json"),
+                 .text_manifest(code_fingerprint = strrep("e", 64L)))
+  got <- text_code_pairing(out, "metrics-2026-08-14", "metrics-2026-08-10")
+  expect_true(got$text_code_mismatch)
+  expect_true(grepl(strrep("e", 64L), got$notes, fixed = TRUE))
+  expect_true(grepl(strrep("b", 64L), got$notes, fixed = TRUE))
+  expect_true(grepl("metrics-2026-08-10", got$notes, fixed = TRUE))
+
+  write_manifest(file.path(out, "prev-text-manifest.json"),
+                 .text_manifest(code_fingerprint = strrep("b", 64L)))
+  expect_false(text_code_pairing(out)$text_code_mismatch)
+  # A code baseline measured from the database has no fingerprint to compare.
+  code <- .code_manifest_0814(); code$fingerprint <- NULL
+  write_manifest(file.path(out, "prev-code-manifest.json"), code)
+  expect_false(text_code_pairing(out)$text_code_mismatch)
+  unlink(file.path(out, "prev-text-manifest.json"))
+  expect_false(text_code_pairing(out)$text_code_mismatch)
+})
+
+test_that("preflight.R logs a mixed pair, records it, and lets the run go on", {
+  skip_if(!nzchar(Sys.which("Rscript")), "Rscript is not on PATH")
+  out <- withr::local_tempdir()
+  con <- open_or_init_db(file.path(out, DB_FILENAME)); DBI::dbDisconnect(con)
+  text_con <- open_or_init_release_text_db(file.path(out, RELEASE_TEXT_DB_FILENAME))
+  DBI::dbDisconnect(text_con)
+  empty <- function(m) { m$n_packages <- 0L; m$n_versions <- 0L; m }
+  write_manifest(file.path(out, "prev-code-manifest.json"), empty(.code_manifest_0814()))
+  write_manifest(file.path(out, "prev-text-manifest.json"),
+                 empty(.text_manifest(code_fingerprint = strrep("e", 64L))))
+  res <- suppressWarnings(system2(
+    "Rscript", c(normalizePath(file.path("..", "..", "scripts", "preflight.R")), out,
+                 "--code-src=metrics-2026-08-14", "--text-src=metrics-2026-08-10"),
+    stdout = TRUE, stderr = TRUE))
+  expect_null(attr(res, "status"))
+  expect_true(any(grepl("::warning::the text database from metrics-2026-08-10", res, fixed = TRUE)))
+  check <- jsonlite::fromJSON(file.path(out, "text-code-check.json"))
+  expect_true(check$text_code_mismatch)
+  expect_identical(check$code_tag, "metrics-2026-08-14")
 })

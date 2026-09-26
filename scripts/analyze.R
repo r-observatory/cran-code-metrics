@@ -46,6 +46,19 @@ METRIC_GROUPS <- list(
   meta        = metrics_meta
 )
 
+#' The release-input reading of the repository-only metrics on one R-fallback row.
+.null_repository_only_metrics <- function(metrics) {
+  for (col in intersect(REPOSITORY_ONLY_PRESENCE_COLS, names(metrics))) {
+    if (!isTRUE(as.logical(metrics[[col]]))) metrics[[col]] <- NA
+  }
+  if (!isTRUE(as.logical(metrics[["ci_present"]]))) {
+    for (col in intersect(REPOSITORY_ONLY_CI_DETAIL_COLS, names(metrics))) {
+      metrics[[col]] <- NA
+    }
+  }
+  metrics
+}
+
 #' Compute all registered metrics for one package version.
 #'
 #' Iterates over METRIC_GROUPS.  A group that throws an error:
@@ -692,8 +705,9 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series,
 #' @param repo_dir  Path to the cloned git repository.
 #' @param package   Package name string.
 #' @return Named list: $summary, $churn, $api, $functions, $edges, $datasets,
-#'   $vignettes, and $binary_versions: the versions whose metrics the analyzer
-#'   binary produced, as opposed to the pure-R fallback.
+#'   $vignettes, $text (DESCRIPTION and release-notes rows from
+#'   .release_text_collect()), and $binary_versions: the versions whose metrics
+#'   the analyzer binary produced, as opposed to the pure-R fallback.
 analyze_package <- function(repo_dir, package) {
   versions_df <- list_versions(repo_dir)
   churn_all   <- package_churn(repo_dir)
@@ -704,6 +718,7 @@ analyze_package <- function(repo_dir, package) {
   edges_rows         <- vector("list", nrow(versions_df))
   datasets_rows      <- vector("list", nrow(versions_df))
   vignettes_rows     <- vector("list", nrow(versions_df))
+  text_rows          <- vector("list", nrow(versions_df))
   # Whether the dataset reader ran on each version, which a zero-row dataset
   # frame cannot tell you: a package that ships no data and a package nothing
   # looked at both produce none.
@@ -791,7 +806,7 @@ analyze_package <- function(repo_dir, package) {
       metrics <- analyze_with_binary(tmp)
       binary_ran <- !is.null(metrics)
       if (is.null(metrics)) {
-        metrics <- analyze_version(ctx)
+        metrics <- .null_repository_only_metrics(analyze_version(ctx))
       } else if (is.null(metrics[["analyzer_version"]])) {
         # Which build produced this row is what lets a later run tell data it
         # already holds from data a newer build would describe differently.
@@ -812,6 +827,11 @@ analyze_package <- function(repo_dir, package) {
       detail_fns <- attr(metrics, "functions")
       detail_eg  <- attr(metrics, "edges")
       detail_ds  <- attr(metrics, "datasets")
+      text_row   <- if (binary_ran) {
+        .release_text_rows(package, v, attr(metrics, "dcf"),
+                           attr(metrics, "release_notes"),
+                           metrics[["analyzer_version"]])
+      }
 
       dep_sig <- tryCatch(
         deprecation_signals(ctx),
@@ -916,6 +936,7 @@ analyze_package <- function(repo_dir, package) {
       list(safe_metrics = safe_metrics, api_row = api_row, prev_exports = curr_exports,
            dep_sig = dep_sig, functions_row = functions_row, edges_row = edges_row,
            datasets_row = datasets_row, vignettes_row = vignettes_row,
+           text_row = text_row,
            datasets_read = !is.null(detail_ds), from_binary = binary_ran)
     })
 
@@ -925,6 +946,7 @@ analyze_package <- function(repo_dir, package) {
     edges_rows[[i]]         <- iter$edges_row
     datasets_rows[[i]]      <- iter$datasets_row
     vignettes_rows[[i]]     <- iter$vignettes_row
+    text_rows[i]            <- list(iter$text_row)
     datasets_read[[i]]      <- isTRUE(iter$datasets_read)
     from_binary[[i]]        <- isTRUE(iter$from_binary)
     prev_exports            <- iter$prev_exports
@@ -1014,6 +1036,9 @@ analyze_package <- function(repo_dir, package) {
     edges     = edges_df,
     datasets  = datasets_df,
     vignettes = vignettes_df,
+    # DESCRIPTION and release-notes text from the versions the analyzer read.
+    text      = .release_text_collect(
+      text_rows, if (nrow(versions_df)) versions_df$version[nrow(versions_df)] else NA_character_),
     # The versions the analyzer binary produced, which is the only thing that
     # tells those summary rows from the ones the pure-R fallback wrote once
     # they are in the same frame. The caller stamps the running build on these

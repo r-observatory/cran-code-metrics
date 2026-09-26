@@ -16,7 +16,7 @@ the ordered version series.
 
 ## Output
 
-`cran-code-metrics.db` (published as a dated `code-YYYY-MM-DD` release; a
+`cran-code-metrics.db` (published as a dated `metrics-YYYY-MM-DD` release; a
 release is immutable once a later day's release exists, and old releases are
 pruned on a retention schedule):
 
@@ -24,14 +24,33 @@ pruned on a retention schedule):
   a per-version release date.
 - `cran_code_churn` - added and deleted lines per file per version.
 - `cran_api_history` - exported-symbol additions and removals per version.
+- `cran_description_fields` - the latest analysed version's RdMacros,
+  RoxygenNote, SystemRequirements, Language, LazyData, Date and `Config/*`
+  DESCRIPTION fields, each value capped at 16,384 bytes.
+- `cran_release_notes` - the NEWS section for the latest analysed version, when
+  the analyzer found one, capped at 16,384 bytes.
 
-`cran-data-metrics.db` is published the same way, as a dated `data-YYYY-MM-DD`
-release, and holds the dataset-focused tables.
+`cran-data-metrics.db` is published in the same release and holds the
+dataset-focused tables.
 
-Each dated release carries its own `manifest.json` asset (copied from
-`code-manifest.json` or `data-manifest.json`). A separate `run-status.json`,
-written alongside but not published, carries the `changed` and
-`bootstrap_complete` flags that drive the shard loop.
+`cran-release-text.db` is published in the same release and keeps the text
+history: every DESCRIPTION field (`cran_description_history`) and NEWS section
+(`cran_release_notes_history`) of every analysed version, with
+`cran_release_text_versions` recording which versions were read. A run takes it
+from the newest release that carries it and starts it empty only when no
+release ever has.
+
+Each dated release carries `code-manifest.json`, `data-manifest.json` and
+`text-manifest.json`. A separate `run-status.json`, written alongside but not
+published, carries the `changed` and `bootstrap_complete` flags that drive the
+shard loop.
+
+## Retired columns
+
+These columns are no longer published in `cran_code_summary`. Each leaves the
+database on the first shard written by the analyzer version named.
+
+- `has_website`, `copyright_holder_declared` (analyzer 0.5.0)
 
 ## Running
 

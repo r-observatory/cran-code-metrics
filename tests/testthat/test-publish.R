@@ -20,7 +20,9 @@
 
 .pub_assets <- c(
   "cran-code-metrics.db" = 5000L, "cran-data-metrics.db" = 3000L,
-  "code-manifest.json" = 40L, "data-manifest.json" = 60L)
+  "cran-release-text.db" = 2000L,
+  "code-manifest.json" = 40L, "data-manifest.json" = 60L,
+  "text-manifest.json" = 50L)
 
 # A release as the fake keeps it. `assets` is a named integer vector of sizes,
 # and `extra` a list of .pub_asset() entries for the half-uploaded and
@@ -169,7 +171,7 @@
   ct[order(names(ct))]
 }
 
-# The four assets a reader asks for by name, with the copy a replacement sets
+# The assets a reader asks for by name, with the copy a replacement sets
 # aside and the one an interrupted replacement leaves left out.
 .pub_live_sizes <- function(release) {
   sizes <- .pub_asset_sizes(release)
@@ -256,6 +258,58 @@ test_that("a listing latest_tag could not read once is read again", {
   expect_equal(readLines(slept), c("10", "20"))
 })
 
+test_that("the text database is read from the newest release that carries it", {
+  without <- .pub_assets[setdiff(names(.pub_assets), c("cran-release-text.db", "text-manifest.json"))]
+  step <- c('TEXT_SRC=$(newest_tag_with_asset metrics cran-release-text.db) || exit 1',
+            'echo "text=<${TEXT_SRC}>"')
+
+  # The newest release carries it.
+  world <- .pub_world(list(.pub_0912(),
+                           .pub_release(2L, "metrics-2026-09-13", assets = .pub_assets)))
+  res <- .pub_run(world, step)
+  expect_equal(res$status, 0L)
+  expect_true("text=<metrics-2026-09-13>" %in% res$output)
+
+  # The newest lacks it, so the one before it is the source, not an empty start.
+  world <- .pub_world(list(.pub_0912(),
+                           .pub_release(2L, "metrics-2026-09-13", assets = without)))
+  res <- .pub_run(world, step)
+  expect_true("text=<metrics-2026-09-12>" %in% res$output)
+
+  # A draft that carries it is not a release.
+  world <- .pub_world(list(
+    .pub_release(1L, "metrics-2026-09-12", assets = without),
+    .pub_release(2L, "metrics-2026-09-13", draft = TRUE, assets = .pub_assets)))
+  res <- .pub_run(world, step)
+  expect_true("text=<>" %in% res$output)
+
+  # No release ever carried it: an empty answer, which is the one cold start.
+  world <- .pub_world(list(.pub_release(1L, "metrics-2026-09-12", assets = without)))
+  res <- .pub_run(world, step)
+  expect_equal(res$status, 0L)
+  expect_true("text=<>" %in% res$output)
+})
+
+test_that("a release list or asset list that cannot be read never reads as no text database", {
+  step <- c('TEXT_SRC=$(newest_tag_with_asset metrics cran-release-text.db) || exit 1',
+            'echo "resolved:<${TEXT_SRC}>"')
+  world <- .pub_world(list(.pub_0912()), faults = c(list = 99L))
+  res <- .pub_run(world, step)
+  expect_false(res$status == 0L)
+  expect_false(any(grepl("^resolved:", res$output)))
+
+  world <- .pub_world(list(.pub_0912()), faults = c(view = 99L))
+  res <- .pub_run(world, step)
+  expect_false(res$status == 0L)
+  expect_length(grep("^gh release view", .pub_log(world)), 5L)
+
+  # One failed read of each is read again.
+  world <- .pub_world(list(.pub_0912()), faults = c(list = 1L, view = 1L))
+  res <- .pub_run(world, step)
+  expect_equal(res$status, 0L)
+  expect_true("resolved:<metrics-2026-09-12>" %in% res$output)
+})
+
 # ---------------------------------------------------------------------------
 # Publishing a new day's release
 # ---------------------------------------------------------------------------
@@ -300,11 +354,11 @@ test_that("databases upload before manifests", {
   world <- .pub_world(list(.pub_0912()))
   expect_equal(.pub_run(world, .pub_today)$status, 0L)
   uploads <- grep("^gh release upload", .pub_log(world), value = TRUE)
-  expect_length(uploads, 4L)
+  expect_length(uploads, 6L)
   db <- grep("\\.db ", uploads)
   manifest <- grep("manifest\\.json ", uploads)
-  expect_length(db, 2L)
-  expect_length(manifest, 2L)
+  expect_length(db, 3L)
+  expect_length(manifest, 3L)
   expect_lt(max(db), min(manifest))
 })
 
@@ -494,7 +548,8 @@ test_that("a file missing from out/ is named before the release is touched", {
   # is a usage error, so a missing database failed the step with nothing but
   # "stat: invalid option -- '%'". A missing manifest is not measured for the
   # size budget at all: it got as far as an empty draft and five uploads.
-  for (missing in c("cran-data-metrics.db", "data-manifest.json")) {
+  for (missing in c("cran-data-metrics.db", "data-manifest.json",
+                    "cran-release-text.db", "text-manifest.json")) {
     world <- .pub_world(list(.pub_0912()))
     .pub_gnu_stat(world)
     unlink(file.path(world$work, "out", missing))
@@ -515,11 +570,20 @@ test_that("a database over the size budget is refused before the release is touc
   expect_length(.pub_log(world), 0L)
 })
 
+test_that("a text database over the size budget is refused before the release is touched", {
+  world <- .pub_world(list(.pub_0912()))
+  writeBin(as.raw(rep(0x2e, 7000L)), file.path(world$work, "out", "cran-release-text.db"))
+  res <- .pub_run(world, .pub_today, env = c(PUBLISH_MAX_BYTES = "6000"))
+  expect_false(res$status == 0L)
+  expect_true(any(grepl("cran-release-text.db is 7000 bytes", res$output, fixed = TRUE)))
+  expect_length(.pub_log(world), 0L)
+})
+
 test_that("a publish carrying no files at all is refused", {
   # The read-back has nothing to disagree with when it is given no files, so a
   # call like this made the draft, found nothing wrong with it and published it
   # as Latest, and the day's tag then resolved to a release carrying neither
-  # database. Nothing calls it that way today; publish_metrics names its four
+  # database. Nothing calls it that way today; publish_metrics names its
   # files, and this keeps a caller that stops naming them from taking the
   # series with it.
   world <- .pub_world(list(.pub_0912()))
@@ -726,7 +790,7 @@ test_that("a republish never takes the live asset away before its replacement is
 
   # Every upload goes under the temporary name.
   uploads <- grep("^gh release upload", .pub_log(world), value = TRUE)
-  expect_length(uploads, 4L)
+  expect_length(uploads, 6L)
   expect_true(all(grepl("/swap-next-[^/]+ --clobber$", uploads)))
 
   # The asset a reader asks for by name is a different asset now, and the one
@@ -747,10 +811,24 @@ test_that("a republish gives the databases their names before the manifests", {
   expect_equal(.pub_run(world, .pub_today)$status, 0L)
   named <- .pub_renames(world)
   expect_equal(named, c(
+    "swap-prev-cran-release-text.db", "cran-release-text.db",
     paste0("swap-prev-", .pub_db), .pub_db,
     "swap-prev-cran-data-metrics.db", "cran-data-metrics.db",
     "swap-prev-code-manifest.json", "code-manifest.json",
-    "swap-prev-data-manifest.json", "data-manifest.json"))
+    "swap-prev-data-manifest.json", "data-manifest.json",
+    "swap-prev-text-manifest.json", "text-manifest.json"))
+})
+
+test_that("a republish that cannot replace the text database leaves the code database as it was", {
+  # A code database ahead of the text one is a gap of every version the shard
+  # read, which can be more than a run re-reads; the text database ahead is not.
+  world <- .pub_world(list(.pub_0912(), .pub_out_today()),
+                      faults = c("upload-swap-next-cran-release-text.db" = 99L))
+  expect_false(.pub_run(world, .pub_today)$status == 0L)
+  sizes <- .pub_asset_sizes(.pub_only(world, "metrics-2026-09-13"))
+  expect_equal(sizes[["cran-release-text.db"]], 1993L)
+  expect_equal(sizes[[.pub_db]], 4993L)
+  expect_false(paste0("swap-prev-", .pub_db) %in% names(sizes))
 })
 
 test_that("a replacement stopped after the temporary upload leaves the live asset in place", {
@@ -987,7 +1065,7 @@ test_that("a link that will not come down is named, and answers for nothing else
   expect_equal(res$status, 0L)
   .pub_expect_whole(world, "metrics-2026-09-13")
   expect_length(grep("^::warning::could not remove out/\\.publish-stage/swap-next-",
-                     res$output), 4L)
+                     res$output), 6L)
 })
 
 test_that("a replacement that lands short or with other bytes is refused, and the live asset stays", {
@@ -1001,7 +1079,7 @@ test_that("a replacement that lands short or with other bytes is refused, and th
                 info = fault)
     sizes <- .pub_asset_sizes(.pub_only(world, "metrics-2026-09-13"))
     expect_equal(sizes[[.pub_db]], 4993L, info = fault)
-    expect_length(.pub_renames(world), 0L)
+    expect_false(any(grepl(.pub_db, .pub_renames(world), fixed = TRUE)), info = fault)
     # The bytes it refused are taken off the release, not left under the
     # temporary name for a later repair to find.
     expect_false(paste0("swap-next-", .pub_db) %in% names(sizes), info = fault)
@@ -1059,7 +1137,7 @@ test_that("an upload that exits zero on bytes the release cannot serve is refuse
   # and the asset that was not servable is gone.
   sizes <- .pub_asset_sizes(.pub_only(world, "metrics-2026-09-13"))
   expect_equal(sizes[[.pub_db]], 4993L)
-  expect_length(.pub_renames(world), 0L)
+  expect_false(any(grepl(.pub_db, .pub_renames(world), fixed = TRUE)))
   expect_false(paste0("swap-next-", .pub_db) %in% names(sizes))
   expect_equal(.pub_read_by_name(world, "metrics-2026-09-13", .pub_db), "4993")
 })
@@ -1127,10 +1205,10 @@ test_that("a replacement believes the release rather than the upload's exit stat
   # refused: refusing there fails a replacement whose bytes are all present.
   # One of the three reads it hides is the repair's, before the upload.
   world <- .pub_world(list(.pub_0912(), .pub_out_today()),
-                      faults = c("stale-swap-next-cran-code-metrics.db" = 3L))
+                      faults = c("stale-swap-next-cran-release-text.db" = 3L))
   res <- .pub_run(world, .pub_today)
   expect_equal(res$status, 0L)
-  expect_true(any(grepl("attempt 2: metrics-2026-09-13 does not list swap-next-cran-code-metrics.db",
+  expect_true(any(grepl("attempt 2: metrics-2026-09-13 does not list swap-next-cran-release-text.db",
                         res$output, fixed = TRUE)))
   .pub_expect_whole(world, "metrics-2026-09-13")
 })

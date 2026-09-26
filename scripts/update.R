@@ -595,6 +595,15 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # the rows this shard writes. Asking twice would let a binary swapped
   # mid-run clear markers it then never restores.
   analyzer_version <- rpkg_analyzer_version()
+  # A build that rejected the flag would exit 2 on every package and leave every
+  # row to the R fallback, so a 0.5.0 build proves it reads the flag first.
+  if (analyzer_at_least(analyzer_version, "0.5.0") &&
+      !rpkg_analyzer_selfcheck(ANALYZER_INPUT_KIND)) {
+    stop(sprintf(paste0(
+      "rpkg-analyzer %s did not answer --input-kind %s with a summary naming it; ",
+      "stopping before any shard"), analyzer_version, ANALYZER_INPUT_KIND),
+      call. = FALSE)
+  }
 
   if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
@@ -606,6 +615,11 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   on.exit(DBI::dbDisconnect(con), add = TRUE)
   data_con <- open_or_init_data_db(data_db_path)
   on.exit(DBI::dbDisconnect(data_con), add = TRUE)
+  text_db_path <- file.path(out_dir, RELEASE_TEXT_DB_FILENAME)
+  shared_text  <- identical(RELEASE_TEXT_DB_FILENAME, DB_FILENAME)
+  text_con <- open_or_init_release_text_db(text_db_path,
+                                           con = if (shared_text) con else NULL)
+  if (!shared_text) on.exit(DBI::dbDisconnect(text_con), add = TRUE)
 
   # ---- 2. Analyzed state (O(n_packages) query, not full table read) ---------
   if (isTRUE(force_full)) {
@@ -616,6 +630,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     }
     analyzed <- character(0L)
   } else {
+    # Before the queues are read, so a gap in the text history is re-read now.
+    .reconcile_release_text(con, text_con)
     analyzed_df <- db_analyzed_state(con)
     analyzed <- if (nrow(analyzed_df) > 0L) {
       setNames(as.character(analyzed_df$version),
@@ -738,6 +754,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   shard_edges_list     <- list()
   shard_datasets_list  <- list()
   shard_vignettes_list <- list()
+  shard_text_list      <- list()
   shard_failures       <- character(0L)
   # Which of the rows about to be written the analyzer binary produced, keyed
   # by package and version. Only those get the running build stamped on them.
@@ -801,7 +818,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     list(package = pkg, ok = TRUE,
          summary = res$summary, churn = res$churn, api = res$api,
          functions = res$functions, edges = res$edges, datasets = res$datasets,
-         vignettes = res$vignettes, binary_versions = res$binary_versions)
+         vignettes = res$vignettes, text = res$text,
+         binary_versions = res$binary_versions)
   }
 
   results <- parallel::mclapply(shard_pkgs, .pkg_worker,
@@ -825,6 +843,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       shard_edges_list[[pkg]]     <- r$edges
       shard_datasets_list[[pkg]]  <- r$datasets
       shard_vignettes_list[[pkg]] <- r$vignettes
+      shard_text_list[[pkg]]      <- r$text
       shard_binary_keys <- c(shard_binary_keys,
                              .analyzer_row_keys(pkg, r$binary_versions))
       .reset_failure(con, pkg)
@@ -850,6 +869,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   fresh_edges     <- .rbind_union_all(shard_edges_list)     %||% .empty_edges_df()
   fresh_datasets  <- .rbind_union_all(shard_datasets_list)  %||% .empty_datasets_df()
   fresh_vignettes <- .rbind_union_all(shard_vignettes_list) %||% .empty_vignettes_rows()
+  fresh_text      <- .bind_release_text(shard_text_list)
 
   if (length(fresh_pkgs) > 0L) {
     # Write dataset rows before the code summary stamps datasets_scanned = TRUE,
@@ -858,8 +878,14 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # fails afterwards the package stays on the to-do list and the next run
     # redoes both cleanly, rather than being marked done with datasets missing.
     upsert_datasets(data_con, fresh_datasets, fresh_pkgs)
+    # Before the code rows, so a failed text write leaves these packages unmarked.
+    upsert_release_text(text_con, fresh_text$description,
+                        fresh_text$release_notes, fresh_text$versions)
     upsert_shard(con, fresh_summary, fresh_churn, fresh_api,
-                 fresh_functions, fresh_edges, fresh_vignettes)
+                 fresh_functions, fresh_edges, fresh_vignettes,
+                 description_df = fresh_text$description_latest,
+                 release_notes_df = fresh_text$release_notes_latest,
+                 analyzer_version = analyzer_version)
   }
 
   # ---- 7b. Project archived-package metadata into the narrow lookup table ----
@@ -964,7 +990,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       list(con = con,      path = db_path,
            baseline = file.path(out_dir, "prev-code-manifest.json")),
       list(con = data_con, path = data_db_path,
-           baseline = file.path(out_dir, "prev-data-manifest.json")))) {
+           baseline = file.path(out_dir, "prev-data-manifest.json")),
+      list(con = text_con, path = text_db_path,
+           baseline = file.path(out_dir, "prev-text-manifest.json")))) {
       vac <- vacuum_db(spec$con, spec$path)
       if (isTRUE(vac$ran)) {
         # The retention guard reads a smaller file as history that went
@@ -994,6 +1022,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                     n_datasets_unmeasured = .n_datasets_unmeasured(data_con))
   code_db_bytes <- as.numeric(file.info(db_path)$size %||% 0)
   data_db_bytes <- as.numeric(file.info(data_db_path)$size %||% 0)
+  text_db_bytes <- as.numeric(file.info(text_db_path)$size %||% 0)
 
   # ---- 8d. What the dataset columns actually hold ---------------------------
   # A declared column that is NULL for every row in the corpus is not an honest
@@ -1040,15 +1069,30 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     stat_table = "cran_dataset_contents", stat_cols = c("nrow", "ncol"),
     bootstrap = bootstrap, coverage = dataset_coverage)
 
+  text_manifest <- build_manifest(
+    text_con, series = "text", repo = PUBLISH_REPO,
+    db_filename = RELEASE_TEXT_DB_FILENAME, db_bytes = text_db_bytes,
+    tables = c(DESCRIPTION_HISTORY_TABLE, RELEASE_NOTES_HISTORY_TABLE,
+               RELEASE_TEXT_VERSIONS_TABLE),
+    fp_table = RELEASE_TEXT_VERSIONS_TABLE, fp_cols = c("package", "version"),
+    pkg_table = RELEASE_TEXT_VERSIONS_TABLE, ver_table = RELEASE_TEXT_VERSIONS_TABLE,
+    stat_table = RELEASE_TEXT_VERSIONS_TABLE, stat_cols = "n_fields",
+    bootstrap = bootstrap)
+  # Names the code database it was published beside, so the next run can tell a mixed pair.
+  text_manifest$code_fingerprint <- code_manifest$fingerprint
+  text_check <- read_manifest_file(file.path(out_dir, "text-code-check.json"))
+
   write_manifest(file.path(out_dir, "code-manifest.json"), code_manifest)
   write_manifest(file.path(out_dir, "data-manifest.json"), data_manifest)
+  write_manifest(file.path(out_dir, "text-manifest.json"), text_manifest)
   write_manifest(file.path(out_dir, "run-status.json"),
                  list(changed = changed, bootstrap_complete = bootstrap_complete,
                       n_analyzed = n_analyzed_pkgs, n_universe = n_universe,
                       n_remaining = length(remaining_after), n_fresh = length(fresh_pkgs),
                       n_shard = length(shard_pkgs),
                       n_versions = nrow(fresh_summary),
-                      shard_failures = length(shard_failures)))
+                      shard_failures = length(shard_failures),
+                      text_code_mismatch = isTRUE(text_check$text_code_mismatch)))
 
   # ---- 8e. Retention guard --------------------------------------------------
   # The published database is the pipeline's accumulated state, so publishing a
@@ -1074,7 +1118,11 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     retention_violations(
       "data", data_manifest,
       read_manifest_file(file.path(out_dir, "prev-data-manifest.json")),
-      prior_tag = Sys.getenv("PREV_DATA_TAG", ""), force_full = rebuilding))
+      prior_tag = Sys.getenv("PREV_DATA_TAG", ""), force_full = rebuilding),
+    retention_violations(
+      "text", text_manifest,
+      read_manifest_file(file.path(out_dir, "prev-text-manifest.json")),
+      prior_tag = Sys.getenv("PREV_TEXT_TAG", ""), force_full = rebuilding))
   if (length(violations) > 0L) {
     stop(retention_refusal(violations), call. = FALSE)
   }
@@ -1402,6 +1450,7 @@ if (identical(sys.nframe(), 0L)) {
                              pattern = "[.]R$", full.names = TRUE))) source(.f)
   source(file.path(.script_dir, "analyze.R"))
   source(file.path(.script_dir, "export.R"))
+  source(file.path(.script_dir, "release_text.R"))
   source(file.path(.script_dir, "retention.R"))
 
   args <- commandArgs(trailingOnly = TRUE)

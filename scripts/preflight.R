@@ -8,7 +8,7 @@
 #
 # Two things happen here, in this order. A release that published a database
 # and no manifest gets a baseline measured from that database, because a
-# same-day republish replaces four assets one at a time and can be interrupted
+# same-day republish replaces its assets one at a time and can be interrupted
 # between them; refusing on the resulting pair made a transient upload failure
 # permanent, since the same release stays latest tomorrow. The download step
 # repairs a replacement that was cut off mid-swap before this runs, so what
@@ -30,13 +30,23 @@ if (identical(sys.nframe(), 0L)) {
   source(file.path(.script_dir, "retention.R"))
 
   args    <- commandArgs(trailingOnly = TRUE)
-  out_dir <- if (length(args) >= 1L) args[1L] else "out"
+  flag    <- function(name) sub(sprintf("^--%s=", name), "",
+                                grep(sprintf("^--%s=", name), args, value = TRUE)[1L])
+  positional <- args[!startsWith(args, "--")]
+  out_dir <- if (length(positional) >= 1L) positional[1L] else "out"
+  code_tag <- flag("code-src") %||% ""
+  text_tag <- flag("text-src") %||% ""
 
   derived <- ensure_prior_baseline(out_dir)
   checked <- preflight_prior_dbs(out_dir)
-  for (n in c(derived, checked$notes)) {
+  pairing <- text_code_pairing(out_dir, code_tag, text_tag)
+  for (n in c(derived, checked$notes, pairing$notes)) {
     cat(sprintf("::warning::%s\n", n), file = stderr())
   }
+  # Each shard's run-status.json repeats this, so a mismatch outlives this step.
+  jsonlite::write_json(list(text_code_mismatch = pairing$text_code_mismatch,
+                            code_tag = code_tag, text_tag = text_tag),
+                       file.path(out_dir, "text-code-check.json"), auto_unbox = TRUE)
   if (length(checked$violations) > 0L) {
     for (p in checked$violations) cat(sprintf("::error::%s\n", p), file = stderr())
     stop(preflight_refusal(checked$violations), call. = FALSE)

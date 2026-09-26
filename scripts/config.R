@@ -184,3 +184,28 @@ README_SOURCES <- c("README.md", "README.Rmd", "README.qmd", "README.markdown")
 # has always accepted had its functions counted and was then skipped by every
 # security and health metric, silently, with the row still looking populated.
 R_SOURCE_RE <- "^R/.*\\.[Rr]$"
+
+# CRAN rows describe the release tarball, so the analyzer reads it as a release.
+ANALYZER_INPUT_KIND <- "release"
+
+SUMMARY_TABLE <- "cran_code_summary"
+
+# DESCRIPTION and NEWS text for every analysed version, kept in a third database.
+RELEASE_TEXT_DB_FILENAME    <- "cran-release-text.db"
+DESCRIPTION_HISTORY_TABLE   <- "cran_description_history"
+RELEASE_NOTES_HISTORY_TABLE <- "cran_release_notes_history"
+RELEASE_TEXT_VERSIONS_TABLE <- "cran_release_text_versions"
+DESCRIPTION_FIELDS_TABLE    <- "cran_description_fields"
+RELEASE_NOTES_TABLE         <- "cran_release_notes"
+
+# The merged latest-only tables cap each value here, far under MySQL's 32 MiB packet.
+RELEASE_TEXT_FIELD_MAX_BYTES <- 16384L
+
+# More missing history than this means the text database is the wrong copy.
+RELEASE_TEXT_REQUEUE_MAX <- 2000L
+
+# Repository files a CRAN tarball almost never carries: a release without one says
+# nothing about the repository, so these store NULL, never 0.
+REPOSITORY_ONLY_PRESENCE_COLS <- c("ci_present", "has_pkgdown",
+                                   "has_code_of_conduct", "has_contributing_guide")
+REPOSITORY_ONLY_CI_DETAIL_COLS <- c("ci_type", "ci_matrix_breadth", "ci_pr_gated")

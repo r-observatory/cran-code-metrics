@@ -179,7 +179,7 @@ jobs:
           # last replacement left. scripts/publish.sh says what each state is.
           if [ -n "$CODE_SRC" ]; then
             repair_release_assets "$CODE_SRC" cran-code-metrics.db cran-data-metrics.db \
-              code-manifest.json data-manifest.json || exit 1
+              cran-release-text.db code-manifest.json data-manifest.json text-manifest.json || exit 1
           fi
           if [ -n "$DATA_SRC" ] && [ "$DATA_SRC" != "$CODE_SRC" ]; then
             repair_release_assets "$DATA_SRC" cran-data-metrics.db data-manifest.json || exit 1
@@ -219,6 +219,29 @@ jobs:
             fi
           fi
 
+          # The text history rides its own asset: take the newest release that carries
+          # it, and start empty only when no release ever has.
+          TEXT_SRC=$(newest_tag_with_asset metrics cran-release-text.db) || {
+            echo "::error::could not tell which release carries cran-release-text.db; refusing to start the text history from empty."
+            exit 1
+          }
+          if [ -n "$TEXT_SRC" ]; then
+            if [ "$TEXT_SRC" != "$CODE_SRC" ]; then
+              echo "::warning::cran-release-text.db comes from ${TEXT_SRC}; ${CODE_SRC:-the newest release} does not carry it."
+              if ! list_assets "$TEXT_SRC" "out/.assets-${TEXT_SRC}"; then
+                echo "::error::could not read the asset list of ${TEXT_SRC}; refusing to guess whether it carries a text manifest."
+                exit 1
+              fi
+            fi
+            get_asset "$TEXT_SRC" cran-release-text.db
+            if have_asset "$TEXT_SRC" text-manifest.json; then
+              get_asset "$TEXT_SRC" text-manifest.json
+              mv out/text-manifest.json out/prev-text-manifest.json
+            fi
+          else
+            echo "no release has carried cran-release-text.db yet; the text history starts empty"
+          fi
+
           # A download can succeed and still hand back a truncated file, so
           # check each database against the manifest published with it before
           # any shard writes to it. Rows, not bytes: a --harvest-descriptions
@@ -228,7 +251,7 @@ jobs:
           # database and no manifest gets a baseline measured from that
           # database, so an interrupted publish costs a warning rather than
           # every run from here on.
-          Rscript scripts/preflight.R out/
+          Rscript scripts/preflight.R out/ --code-src="$CODE_SRC" --text-src="$TEXT_SRC"
 
           # Snapshot the pre-run package set so the release notes can tag
           # each changed package as new-to-the-catalog vs updated. Always
@@ -238,6 +261,7 @@ jobs:
 
           echo "PREV_CODE_TAG=${CODE_SRC}" >> "$GITHUB_ENV"
           echo "PREV_DATA_TAG=${DATA_SRC}" >> "$GITHUB_ENV"
+          echo "PREV_TEXT_TAG=${TEXT_SRC}" >> "$GITHUB_ENV"
           ls -la out || true
 
       - name: Analyze shards and publish after each

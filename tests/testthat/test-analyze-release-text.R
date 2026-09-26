@@ -48,8 +48,11 @@ test_that("each version keeps its own DESCRIPTION and NEWS, and the latest is ma
 
 test_that("versions the R fallback wrote contribute no text and no repository zeros", {
   skip_on_os("windows")
-  withr::local_envvar(RPKG_ANALYZER_BIN = "/nonexistent/rpkg-analyzer")
-  skip_if(nzchar(unname(Sys.which("rpkg-analyzer"))), "a real rpkg-analyzer is on PATH")
+  # CI puts rpkg-analyzer on PATH, so hide the binary rather than skip there.
+  env <- environment(analyze_with_binary)
+  old <- get("rpkg_analyzer_bin", envir = env)
+  withr::defer(assign("rpkg_analyzer_bin", old, envir = env))
+  assign("rpkg_analyzer_bin", function() "", envir = env)
   repo <- file.path(withr::local_tempdir(), "pkgA")
   .art_repo(repo)
   res <- analyze_package(repo, "pkgA")

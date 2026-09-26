@@ -31,6 +31,7 @@ test_that("a zero becomes NULL, a one stays, and running it again changes nothin
   expect_identical(ci$has_pkgdown, 1L)
   expect_identical(ci$ci_type, '["github-actions"]')
   expect_identical(ci$ci_matrix_breadth, 4L)
+  expect_true(is.na(ci$has_code_of_conduct))
   expect_true(all(is.na(unlist(none[c("ci_present", "has_pkgdown", "has_code_of_conduct",
                                       "ci_type", "ci_matrix_breadth", "ci_pr_gated")]))))
   expect_identical(none$has_contributing_guide, 1L)

@@ -91,8 +91,6 @@ export_metrics <- function(path, summary_df, churn_df, api_df, vignettes_df = NU
   DBI::dbWriteTable(con, "cran_code_churn", .coerce_logicals(churn_df), row.names = FALSE)
   DBI::dbExecute(con,
     "CREATE INDEX idx_churn_pkg_ver ON cran_code_churn(package, version)")
-  DBI::dbExecute(con,
-    "CREATE INDEX idx_churn_pkg ON cran_code_churn(package)")
 
   # ---- cran_api_history ------------------------------------------------------
   DBI::dbWriteTable(con, "cran_api_history", .coerce_logicals(api_df), row.names = FALSE)
@@ -179,9 +177,18 @@ metrics_fingerprint <- function(summary_df) {
   DBI::dbExecute(con, sprintf(
     "CREATE INDEX IF NOT EXISTS idx_%s_pkg_ver ON %s(package, version)",
     table, table))
-  DBI::dbExecute(con, sprintf(
-    "CREATE INDEX IF NOT EXISTS idx_%s_pkg ON %s(package)",
-    table, table))
+  invisible(NULL)
+}
+
+# Single-column (package) indexes that the (package, version) index already
+# serves; each is a second copy of the table's package column on disk.
+.REDUNDANT_INDEXES <- c("idx_churn_pkg", "idx_cran_functions_pkg",
+                        "idx_cran_call_edges_pkg", "idx_cran_vignettes_pkg")
+
+.drop_redundant_indexes <- function(con) {
+  for (idx in .REDUNDANT_INDEXES) {
+    DBI::dbExecute(con, sprintf('DROP INDEX IF EXISTS "%s"', idx))
+  }
   invisible(NULL)
 }
 
@@ -1445,9 +1452,8 @@ open_or_init_db <- function(path) {
   DBI::dbExecute(con,
     "CREATE INDEX IF NOT EXISTS idx_churn_pkg_ver ON cran_code_churn(package, version)")
   DBI::dbExecute(con,
-    "CREATE INDEX IF NOT EXISTS idx_churn_pkg ON cran_code_churn(package)")
-  DBI::dbExecute(con,
     "CREATE INDEX IF NOT EXISTS idx_api_pkg_ver ON cran_api_history(package, version)")
+  .drop_redundant_indexes(con)
 
   con
 }

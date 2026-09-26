@@ -184,3 +184,6 @@ README_SOURCES <- c("README.md", "README.Rmd", "README.qmd", "README.markdown")
 # has always accepted had its functions counted and was then skipped by every
 # security and health metric, silently, with the row still looking populated.
 R_SOURCE_RE <- "^R/.*\\.[Rr]$"
+
+# CRAN rows describe the release tarball, so the analyzer reads it as a release.
+ANALYZER_INPUT_KIND <- "release"

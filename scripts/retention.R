@@ -126,6 +126,13 @@
     list(path = "tables.cran_datasets",           min_ratio = 0.99, max_loss = 0),
     list(path = "tables.cran_dataset_contents",   min_ratio = 0.98, max_loss = 0),
     list(path = "db_bytes",                       min_ratio = 0.90, max_loss = 0)
+  ),
+  # The text history never deletes a version, so it may only grow.
+  text = list(
+    list(path = "n_packages",                          min_ratio = 1,     max_loss = 0),
+    list(path = "n_versions",                          min_ratio = 0.999, max_loss = 0),
+    list(path = "tables.cran_description_history",     min_ratio = 0.999, max_loss = 0),
+    list(path = "tables.cran_release_notes_history",   min_ratio = 0.999, max_loss = 0)
   )
 )
 
@@ -133,7 +140,9 @@
 # messages cannot drift apart.
 .RETENTION_KEY_TABLES <- list(
   code = list(ver_table = "cran_code_summary",     pkg_table = "cran_code_summary"),
-  data = list(ver_table = "cran_dataset_versions", pkg_table = "cran_datasets")
+  data = list(ver_table = "cran_dataset_versions", pkg_table = "cran_datasets"),
+  text = list(ver_table = "cran_release_text_versions",
+              pkg_table = "cran_release_text_versions")
 )
 
 # Read one dotted path ("tables.cran_functions") out of a parsed manifest.
@@ -178,7 +187,7 @@ read_manifest_file <- function(path) {
 
 #' Figures this run must not publish, given the previous release's figures.
 #'
-#' @param series     "code" or "data".
+#' @param series     "code", "data" or "text".
 #' @param current    Manifest list this run is about to publish.
 #' @param prior      Manifest list the previous release published, or NULL.
 #' @param prior_tag  Tag of the previous release, "" when none exists. A
@@ -436,7 +445,7 @@ retention_refusal <- function(violations) {
 #' can legitimately differ from db_bytes, but harvest only ever writes
 #' cran_archived_meta and can never move these two counts.
 #'
-#' @param series "code" or "data".
+#' @param series "code", "data" or "text".
 #' @param counts list(n_packages, n_versions) measured from the downloaded DB.
 #' @param prior  Manifest published alongside that DB, or NULL (nothing to check).
 #' @return Character vector of violations, possibly empty.
@@ -536,10 +545,11 @@ prior_db_notes <- function(series, counts, prior) {
   list(n_versions = n_ver, n_packages = n_pkg)
 }
 
-# The two series the download step brings back, named once.
+# The series the download step brings back, named once.
 .ret_prior_specs <- function() list(
   list(series = "code", manifest = "prev-code-manifest.json", db = DB_FILENAME),
-  list(series = "data", manifest = "prev-data-manifest.json", db = DATA_DB_FILENAME)
+  list(series = "data", manifest = "prev-data-manifest.json", db = DATA_DB_FILENAME),
+  list(series = "text", manifest = "prev-text-manifest.json", db = RELEASE_TEXT_DB_FILENAME)
 )
 
 # The row counts a series' checks actually read, so a baseline measured from a
@@ -573,7 +583,7 @@ prior_db_notes <- function(series, counts, prior) {
 #' is exactly what a lost download leaves, and must stay indistinguishable from
 #' it, so it yields no baseline and retention_violations() refuses on the tag.
 #'
-#' @param series  "code" or "data".
+#' @param series  "code", "data" or "text".
 #' @param db_path Path to the downloaded database.
 #' @return A manifest-shaped list, or NULL.
 derive_baseline_manifest <- function(series, db_path) {
@@ -744,7 +754,7 @@ advance_ceiling_baseline <- function(path, series, current) {
   invisible(TRUE)
 }
 
-#' Check both downloaded prior databases against their manifests.
+#' Check each downloaded prior database against its manifest.
 #'
 #' Called once per run, from the download step, before any shard writes: the
 #' comparison only holds on the first shard, because every later shard has
@@ -752,7 +762,7 @@ advance_ceiling_baseline <- function(path, series, current) {
 #' describes yesterday's release.
 #'
 #' @param out_dir Directory holding the downloaded prev-*-manifest.json files
-#'   and the two databases.
+#'   and the databases.
 #' @return list(violations, notes). violations is empty when the run may build
 #'   on what came back; notes carries the recoverable mismatches, which are
 #'   worth saying out loud and are not worth stopping a daily pipeline for.

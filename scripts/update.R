@@ -990,7 +990,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       list(con = con,      path = db_path,
            baseline = file.path(out_dir, "prev-code-manifest.json")),
       list(con = data_con, path = data_db_path,
-           baseline = file.path(out_dir, "prev-data-manifest.json")))) {
+           baseline = file.path(out_dir, "prev-data-manifest.json")),
+      list(con = text_con, path = text_db_path,
+           baseline = file.path(out_dir, "prev-text-manifest.json")))) {
       vac <- vacuum_db(spec$con, spec$path)
       if (isTRUE(vac$ran)) {
         # The retention guard reads a smaller file as history that went
@@ -1020,6 +1022,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                     n_datasets_unmeasured = .n_datasets_unmeasured(data_con))
   code_db_bytes <- as.numeric(file.info(db_path)$size %||% 0)
   data_db_bytes <- as.numeric(file.info(data_db_path)$size %||% 0)
+  text_db_bytes <- as.numeric(file.info(text_db_path)$size %||% 0)
 
   # ---- 8d. What the dataset columns actually hold ---------------------------
   # A declared column that is NULL for every row in the corpus is not an honest
@@ -1066,8 +1069,21 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     stat_table = "cran_dataset_contents", stat_cols = c("nrow", "ncol"),
     bootstrap = bootstrap, coverage = dataset_coverage)
 
+  text_manifest <- build_manifest(
+    text_con, series = "text", repo = PUBLISH_REPO,
+    db_filename = RELEASE_TEXT_DB_FILENAME, db_bytes = text_db_bytes,
+    tables = c(DESCRIPTION_HISTORY_TABLE, RELEASE_NOTES_HISTORY_TABLE,
+               RELEASE_TEXT_VERSIONS_TABLE),
+    fp_table = RELEASE_TEXT_VERSIONS_TABLE, fp_cols = c("package", "version"),
+    pkg_table = RELEASE_TEXT_VERSIONS_TABLE, ver_table = RELEASE_TEXT_VERSIONS_TABLE,
+    stat_table = RELEASE_TEXT_VERSIONS_TABLE, stat_cols = "n_fields",
+    bootstrap = bootstrap)
+  # Names the code database it was published beside, so the next run can tell a mixed pair.
+  text_manifest$code_fingerprint <- code_manifest$fingerprint
+
   write_manifest(file.path(out_dir, "code-manifest.json"), code_manifest)
   write_manifest(file.path(out_dir, "data-manifest.json"), data_manifest)
+  write_manifest(file.path(out_dir, "text-manifest.json"), text_manifest)
   write_manifest(file.path(out_dir, "run-status.json"),
                  list(changed = changed, bootstrap_complete = bootstrap_complete,
                       n_analyzed = n_analyzed_pkgs, n_universe = n_universe,
@@ -1100,7 +1116,11 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     retention_violations(
       "data", data_manifest,
       read_manifest_file(file.path(out_dir, "prev-data-manifest.json")),
-      prior_tag = Sys.getenv("PREV_DATA_TAG", ""), force_full = rebuilding))
+      prior_tag = Sys.getenv("PREV_DATA_TAG", ""), force_full = rebuilding),
+    retention_violations(
+      "text", text_manifest,
+      read_manifest_file(file.path(out_dir, "prev-text-manifest.json")),
+      prior_tag = Sys.getenv("PREV_TEXT_TAG", ""), force_full = rebuilding))
   if (length(violations) > 0L) {
     stop(retention_refusal(violations), call. = FALSE)
   }

@@ -134,3 +134,34 @@ test_that("a gap under the running 0.5.0 build is re-read once and then stays cl
                     message = "release text history lacks")
   expect_identical(second$n_fresh, 0L)
 })
+
+test_that("the text manifest names the code database it was published beside", {
+  .rtr_stub_bin()
+  .rtr_stub_analyze()
+  out <- withr::local_tempdir()
+  run_update(.rtr_io(), out, shard_size = 10L)
+  tm <- jsonlite::fromJSON(file.path(out, "text-manifest.json"))
+  cm <- jsonlite::fromJSON(file.path(out, "code-manifest.json"))
+  expect_identical(tm$series, "text")
+  expect_identical(tm$db_filename, RELEASE_TEXT_DB_FILENAME)
+  expect_identical(tm$n_versions, 1L)
+  expect_identical(tm$code_fingerprint, cm$fingerprint)
+})
+
+test_that("a shard with no text still publishes an empty text manifest", {
+  .rtr_stub_bin()
+  .rtr_stub_analyze(with_text = FALSE)
+  out <- withr::local_tempdir()
+  run_update(.rtr_io(), out, shard_size = 10L)
+  expect_identical(jsonlite::fromJSON(file.path(out, "text-manifest.json"))$n_versions, 0L)
+})
+
+test_that("a run that would publish a smaller text history is refused", {
+  .rtr_stub_bin()
+  .rtr_stub_analyze()
+  out <- withr::local_tempdir()
+  write_manifest(file.path(out, "prev-text-manifest.json"), list(
+    schema_version = 1L, series = "text", n_packages = 5L, n_versions = 50L,
+    tables = list(cran_description_history = 900L, cran_release_notes_history = 40L)))
+  expect_error(run_update(.rtr_io(), out, shard_size = 10L), "text n_packages")
+})

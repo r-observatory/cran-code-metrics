@@ -1117,3 +1117,66 @@ test_that("a baseline carrying no failures count is not given one mid-run", {
   expect_false(advance_ceiling_baseline(cold, "data", .data_manifest_0814()))
   expect_false(file.exists(cold))
 })
+
+# ---------------------------------------------------------------------------
+# The text history: a third database with its own manifest
+# ---------------------------------------------------------------------------
+
+.text_manifest <- function(n_packages = 2L, n_versions = 3L, history = 60L,
+                           notes = 2L, code_fingerprint = strrep("a", 64L)) list(
+  schema_version = 1L, series = "text", db_filename = "cran-release-text.db",
+  n_packages = n_packages, n_versions = n_versions,
+  tables = list(cran_description_history = history,
+                cran_release_notes_history = notes,
+                cran_release_text_versions = n_versions),
+  code_fingerprint = code_fingerprint)
+
+test_that("the text history may grow and may not shrink", {
+  expect_identical(retention_violations("text", .text_manifest(), .text_manifest()),
+                   character(0L))
+  expect_identical(retention_violations("text", .text_manifest(n_versions = 4L, history = 80L),
+                                        .text_manifest()), character(0L))
+  v <- retention_violations("text", .text_manifest(n_packages = 1L), .text_manifest())
+  expect_true(any(grepl("text n_packages", v, fixed = TRUE)))
+  v <- retention_violations("text", .text_manifest(history = 50L), .text_manifest())
+  expect_true(any(grepl("cran_description_history", v, fixed = TRUE)))
+  v <- retention_violations("text", .text_manifest(), NULL, prior_tag = "metrics-2026-09-20")
+  expect_true(any(grepl("no text baseline", v, fixed = TRUE)))
+})
+
+test_that("preflight reads the downloaded text database against its manifest", {
+  out <- withr::local_tempdir()
+  text_con <- open_or_init_release_text_db(file.path(out, RELEASE_TEXT_DB_FILENAME))
+  DBI::dbDisconnect(text_con)
+  write_manifest(file.path(out, "prev-text-manifest.json"), .text_manifest())
+  v <- preflight_prior_dbs(out)$violations
+  expect_true(any(grepl("cran_release_text_versions", v, fixed = TRUE)))
+})
+
+test_that("a text manifest with no text database is the lost-download state", {
+  out <- withr::local_tempdir()
+  write_manifest(file.path(out, "prev-text-manifest.json"), .text_manifest())
+  v <- preflight_prior_dbs(out)$violations
+  expect_true(any(grepl(RELEASE_TEXT_DB_FILENAME, v, fixed = TRUE)))
+})
+
+test_that("a text database whose manifest never landed is measured, not refused", {
+  # A publish cut off between the databases and the manifests leaves this pair.
+  out <- withr::local_tempdir()
+  text_con <- open_or_init_release_text_db(file.path(out, RELEASE_TEXT_DB_FILENAME))
+  text <- .release_text_collect(list(.release_text_rows(
+    "pkgA", "1.0", c(Package = "pkgA", Version = "1.0"), NULL, "0.5.0")), "1.0")
+  upsert_release_text(text_con, text$description, text$release_notes, text$versions)
+  DBI::dbDisconnect(text_con)
+
+  notes <- ensure_prior_baseline(out)
+  expect_true(any(grepl(RELEASE_TEXT_DB_FILENAME, notes, fixed = TRUE)))
+  derived <- read_manifest_file(file.path(out, "prev-text-manifest.json"))
+  expect_identical(as.character(derived$series), "text")
+  expect_equal(as.numeric(derived$n_versions), 1)
+  expect_equal(as.numeric(derived$tables$cran_description_history), 2)
+  expect_identical(preflight_prior_dbs(out)$violations, character(0L))
+  # It is a floor the run is then held to.
+  expect_true(length(retention_violations(
+    "text", .text_manifest(n_packages = 0L, n_versions = 0L, history = 0L), derived)) > 0L)
+})

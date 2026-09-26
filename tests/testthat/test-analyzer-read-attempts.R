@@ -340,7 +340,8 @@ test_that("a package given up on is asked again by the next analyzer build", {
 
   # A new build arrives. Same package, same failure, but nothing here has been
   # asked of this reader yet.
-  .stub_analyzer_bin(stub_dir, "0.5.0-test")
+  # It reads only the self-check package, which a 0.5.0 build is asked first.
+  .stub_analyzer_bin(stub_dir, "0.5.0-test", reads = "0.0.1", input_kind = "release")
   retried <- suppressWarnings(run_update(io, out, shard_size = 10L))
   expect_equal(retried$n_fresh, 1L)
   expect_true(retried$changed)

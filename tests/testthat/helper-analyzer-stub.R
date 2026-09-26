@@ -22,14 +22,18 @@
 #' @param version The build the stub answers `--version` with.
 #' @param reads   Package versions the stub will read, matched against the
 #'   Version field of the DESCRIPTION in the directory it is pointed at.
-.stub_analyzer_bin <- function(dir, version, reads = character(0L)) {
+#' @param input_kind When set, each summary names it, as a 0.5.0 build does.
+.stub_analyzer_bin <- function(dir, version, reads = character(0L),
+                              input_kind = NULL) {
   stub <- file.path(dir, "stub-analyzer.sh")
+  kind <- if (is.null(input_kind)) "" else
+    sprintf(',\\"input_kind\\":\\"%s\\"', input_kind)
   read_branch <- if (length(reads) > 0L) {
     c(
       'dir=$(echo "$1" | tr -d "\'")',
       'v=$(sed -n "s/^Version: *//p" "$dir/DESCRIPTION" | head -1)',
       sprintf('case "$v" in %s)', paste(reads, collapse = "|")),
-      '  echo "{\\"rec\\":\\"summary\\",\\"loc_r\\":1,\\"n_fns_r\\":1}"',
+      sprintf('  echo "{\\"rec\\":\\"summary\\",\\"loc_r\\":1,\\"n_fns_r\\":1%s}"', kind),
       paste0('  echo "{\\"rec\\":\\"dataset\\",\\"name\\":\\"d\\",',
              '\\"file\\":\\"data/d.rda\\",\\"class\\":\\"data.frame\\",',
              '\\"kind\\":\\"table\\",\\"confidence\\":\\"exact\\",',

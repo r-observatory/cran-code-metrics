@@ -88,3 +88,49 @@ test_that("a failed text write fails the shard before the code rows are written"
   tables <- .rtr_query(file.path(out, DB_FILENAME), "SELECT name FROM sqlite_master")$name
   expect_false("cran_code_summary" %in% tables)
 })
+
+test_that("a run re-reads the package whose 0.5.0 rows the history lacks", {
+  .rtr_stub_bin()
+  .rtr_stub_analyze()
+  out <- withr::local_tempdir()
+  con <- open_or_init_db(file.path(out, DB_FILENAME))
+  upsert_shard(con, data.frame(package = "pkgA", version = "1.0", loc_r = 1L,
+                               n_fns_r = 1L, analyzer_version = "0.5.0",
+                               latest_release_date = "2026-01-01",
+                               datasets_scanned = 1L, detail_scanned = 1L,
+                               stringsAsFactors = FALSE),
+               churn_df = .empty_churn(), api_df = .empty_api())
+  DBI::dbDisconnect(con)
+
+  expect_message(m <- run_update(.rtr_io(), out, shard_size = 10L),
+                 "release text history lacks 1 analysed version")
+  expect_identical(m$n_fresh, 1L)
+  expect_equal(.rtr_query(file.path(out, RELEASE_TEXT_DB_FILENAME), sprintf(
+    'SELECT COUNT(*) n FROM "%s"', RELEASE_TEXT_VERSIONS_TABLE))$n, 1L)
+})
+
+test_that("a gap under the running 0.5.0 build is re-read once and then stays closed", {
+  # The stored row names the running build, so only the reconciliation can put
+  # it back in the queue; a build change would re-read it anyway.
+  withr::local_envvar(
+    RPKG_ANALYZER_BIN = .stub_analyzer_bin(withr::local_tempdir(), "0.5.0-test",
+                                           reads = "0.0.1", input_kind = ANALYZER_INPUT_KIND),
+    PREV_CODE_TAG = "", PREV_DATA_TAG = "", PREV_TEXT_TAG = "")
+  .rtr_stub_analyze()
+  out <- withr::local_tempdir()
+  con <- open_or_init_db(file.path(out, DB_FILENAME))
+  upsert_shard(con, data.frame(package = "pkgA", version = "1.0", loc_r = 1L,
+                               n_fns_r = 1L, analyzer_version = "0.5.0-test",
+                               latest_release_date = "2026-01-01",
+                               datasets_scanned = 1L, detail_scanned = 1L,
+                               stringsAsFactors = FALSE),
+               churn_df = .empty_churn(), api_df = .empty_api())
+  DBI::dbDisconnect(con)
+
+  expect_message(first <- suppressWarnings(run_update(.rtr_io(), out, shard_size = 10L)),
+                 "release text history lacks 1 analysed version")
+  expect_identical(first$n_fresh, 1L)
+  expect_no_message(second <- suppressWarnings(run_update(.rtr_io(), out, shard_size = 10L)),
+                    message = "release text history lacks")
+  expect_identical(second$n_fresh, 0L)
+})

@@ -215,3 +215,63 @@ upsert_release_text <- function(text_con, description_df, notes_df, versions_df)
   }
   invisible(NULL)
 }
+
+#' Re-queue every package whose 0.5.0 rows the text history lacks or holds only from an
+#' older build. Past `max_missing` the text database is the wrong copy, and the run stops.
+.reconcile_release_text <- function(con, text_con, max_missing = RELEASE_TEXT_REQUEUE_MAX) {
+  if (!SUMMARY_TABLE %in% DBI::dbListTables(con)) return(invisible(0L))
+  fields <- DBI::dbListFields(con, SUMMARY_TABLE)
+  if (!"analyzer_version" %in% fields) return(invisible(0L))
+  builds <- DBI::dbGetQuery(con, sprintf(
+    'SELECT DISTINCT analyzer_version FROM "%s" WHERE analyzer_version IS NOT NULL',
+    SUMMARY_TABLE))$analyzer_version
+  checked <- builds[vapply(builds, analyzer_at_least, logical(1L), min = "0.5.0")]
+  if (!length(checked)) return(invisible(0L))
+  rows <- DBI::dbGetQuery(con, sprintf(
+    'SELECT package, version FROM "%s" WHERE analyzer_version IN (%s)',
+    SUMMARY_TABLE, paste(rep("?", length(checked)), collapse = ", ")),
+    params = as.list(checked))
+  # A row an older build wrote carries no release notes, so only a reading by a
+  # 0.5.0 build closes the gap; an older text copy can hold one from before the pin.
+  read_by <- DBI::dbGetQuery(text_con, sprintf(
+    'SELECT DISTINCT analyzer_version FROM "%s" WHERE analyzer_version IS NOT NULL',
+    RELEASE_TEXT_VERSIONS_TABLE))$analyzer_version
+  current <- read_by[vapply(read_by, analyzer_at_least, logical(1L), min = "0.5.0")]
+  have <- if (length(current)) {
+    DBI::dbGetQuery(text_con, sprintf(
+      'SELECT package, version FROM "%s" WHERE analyzer_version IN (%s)',
+      RELEASE_TEXT_VERSIONS_TABLE, paste(rep("?", length(current)), collapse = ", ")),
+      params = as.list(current))
+  } else {
+    data.frame(package = character(0L), version = character(0L))
+  }
+  missing <- rows[!paste(rows$package, rows$version, sep = "\r") %in%
+                    paste(have$package, have$version, sep = "\r"), , drop = FALSE]
+  n <- nrow(missing)
+  if (n == 0L) return(invisible(0L))
+  if (n > max_missing) {
+    stop(sprintf(paste0(
+      "%d analysed versions have no 0.5.0 reading in %s, more than the %d a run re-reads: ",
+      "%s is not the copy that belongs with this code database. Restore it from ",
+      "the release that published it and re-run."),
+      n, RELEASE_TEXT_VERSIONS_TABLE, max_missing, RELEASE_TEXT_DB_FILENAME),
+      call. = FALSE)
+  }
+  pkgs <- unique(missing$package)
+  if (all(c("datasets_scanned", "latest_release_date") %in% fields)) {
+    for (i in seq(1L, length(pkgs), by = 900L)) {
+      chunk <- pkgs[i:min(i + 899L, length(pkgs))]
+      DBI::dbExecute(con, sprintf(
+        'UPDATE "%s" SET datasets_scanned = NULL
+          WHERE latest_release_date IS NOT NULL AND package IN (%s)',
+        SUMMARY_TABLE, paste(rep("?", length(chunk)), collapse = ", ")),
+        params = as.list(chunk))
+    }
+  }
+  shown <- head(paste(missing$package, missing$version), 10L)
+  message(sprintf("release text history lacks %d analysed version%s; re-reading %d package%s: %s%s",
+                  n, if (n == 1L) "" else "s", length(pkgs),
+                  if (length(pkgs) == 1L) "" else "s",
+                  paste(shown, collapse = ", "), if (n > 10L) ", ..." else ""))
+  invisible(n)
+}

@@ -216,3 +216,79 @@ test_that("the command line sources every script the tests source", {
   expect_identical(setdiff(tested, c(loaded, runner_only)), character(0L))
   expect_true("release_text.R" %in% loaded)
 })
+
+.rt_summary <- function(con, pkg, versions, analyzer_version) {
+  df <- data.frame(package = pkg, version = versions, analyzer_version = analyzer_version,
+                   latest_release_date = c(rep(NA, length(versions) - 1L), "2026-09-01"),
+                   datasets_scanned = 1L, stringsAsFactors = FALSE)
+  upsert_shard(con, df, churn_df = .empty_churn(), api_df = .empty_api())
+}
+
+.rt_scanned <- function(con, pkg) {
+  DBI::dbGetQuery(con, sprintf(
+    'SELECT datasets_scanned FROM "%s" WHERE package = ? AND latest_release_date IS NOT NULL',
+    SUMMARY_TABLE), params = list(pkg))$datasets_scanned
+}
+
+test_that("a 0.5.0 version the history lacks puts its package back in the queue", {
+  db <- .rt_dbs()
+  .rt_summary(db$con, "gap", c("1.0", "1.1"), "0.5.0")
+  .rt_summary(db$con, "whole", "2.0", "0.5.0")
+  whole <- .rt_package("whole", "2.0")
+  upsert_release_text(db$text_con, whole$description, whole$release_notes, whole$versions)
+
+  expect_message(n <- .reconcile_release_text(db$con, db$text_con), "gap 1.0")
+  expect_identical(n, 2L)
+  expect_true(is.na(.rt_scanned(db$con, "gap")))
+  expect_identical(.rt_scanned(db$con, "whole"), 1L)
+})
+
+test_that("rows below 0.5.0 and rows the R fallback wrote are not checked", {
+  db <- .rt_dbs()
+  .rt_summary(db$con, "old", "1.0", "0.4.0")
+  .rt_summary(db$con, "fallback", "1.0", NA_character_)
+  .rt_summary(db$con, "blank", "1.0", "")
+  expect_identical(.reconcile_release_text(db$con, db$text_con), 0L)
+  expect_identical(.rt_scanned(db$con, "old"), 1L)
+})
+
+test_that("a history missing more than the limit stops the run and clears nothing", {
+  db <- .rt_dbs()
+  .rt_summary(db$con, "big", as.character(seq_len(2001L)), "0.5.0")
+  expect_error(.reconcile_release_text(db$con, db$text_con), "2001")
+  expect_identical(.rt_scanned(db$con, "big"), 1L)
+})
+
+test_that("a history that has every 0.5.0 version changes nothing", {
+  db <- .rt_dbs()
+  .rt_summary(db$con, "pkgA", c("1.0", "1.1"), "0.5.0-test")
+  text <- .rt_package("pkgA", c("1.0", "1.1"))
+  upsert_release_text(db$text_con, text$description, text$release_notes, text$versions)
+  expect_silent(n <- .reconcile_release_text(db$con, db$text_con))
+  expect_identical(n, 0L)
+  expect_identical(.rt_scanned(db$con, "pkgA"), 1L)
+})
+
+test_that("a history row an older build wrote does not stand in for a 0.5.0 reading", {
+  # An older text copy can hold the version as read before the pin moved, without
+  # its release notes, so only the 0.5.0 reading closes the gap.
+  db <- .rt_dbs()
+  .rt_summary(db$con, "stale", "1.0", "0.5.0")
+  old <- .release_text_collect(list(.release_text_rows(
+    "stale", "1.0", .rt_dcf("1.0"), NULL, "0.4.0")), "1.0")
+  upsert_release_text(db$text_con, old$description, old$release_notes, old$versions)
+  expect_message(n <- .reconcile_release_text(db$con, db$text_con), "stale 1.0")
+  expect_identical(n, 1L)
+  expect_true(is.na(.rt_scanned(db$con, "stale")))
+})
+
+test_that("the log names the first ten missing versions and counts the rest", {
+  db <- .rt_dbs()
+  .rt_summary(db$con, "many", sprintf("1.%d", 1:12), "0.5.0")
+  msg <- paste(testthat::capture_messages(
+    n <- .reconcile_release_text(db$con, db$text_con)), collapse = "")
+  expect_identical(n, 12L)
+  expect_true(grepl("lacks 12 analysed versions", msg, fixed = TRUE))
+  expect_identical(lengths(gregexpr("many 1\\.[0-9]+", msg)), 10L)
+  expect_true(grepl(", ...", msg, fixed = TRUE))
+})

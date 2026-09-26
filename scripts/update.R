@@ -630,6 +630,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     }
     analyzed <- character(0L)
   } else {
+    # Before the queues are read, so a gap in the text history is re-read now.
+    .reconcile_release_text(con, text_con)
     analyzed_df <- db_analyzed_state(con)
     analyzed <- if (nrow(analyzed_df) > 0L) {
       setNames(as.character(analyzed_df$version),

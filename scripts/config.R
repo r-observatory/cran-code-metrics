@@ -187,3 +187,5 @@ R_SOURCE_RE <- "^R/.*\\.[Rr]$"
 
 # CRAN rows describe the release tarball, so the analyzer reads it as a release.
 ANALYZER_INPUT_KIND <- "release"
+
+SUMMARY_TABLE <- "cran_code_summary"

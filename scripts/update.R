@@ -868,7 +868,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # redoes both cleanly, rather than being marked done with datasets missing.
     upsert_datasets(data_con, fresh_datasets, fresh_pkgs)
     upsert_shard(con, fresh_summary, fresh_churn, fresh_api,
-                 fresh_functions, fresh_edges, fresh_vignettes)
+                 fresh_functions, fresh_edges, fresh_vignettes,
+                 analyzer_version = analyzer_version)
   }
 
   # ---- 7b. Project archived-package metadata into the narrow lookup table ----

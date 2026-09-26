@@ -42,13 +42,15 @@
 #' @param api_df     data.frame with columns package, version, exports_added,
 #'   exports_removed (JSON array strings), n_exports (integer), and optionally
 #'   cold_removals.
-export_metrics <- function(path, summary_df, churn_df, api_df, vignettes_df = NULL) {
+export_metrics <- function(path, summary_df, churn_df, api_df, vignettes_df = NULL,
+                           analyzer_version = NA_character_) {
   if (file.exists(path)) unlink(path)
   con <- DBI::dbConnect(RSQLite::SQLite(), path)
   on.exit(DBI::dbDisconnect(con), add = TRUE)
 
   # ---- cran_code_summary -----------------------------------------------------
   write_summary <- .coerce_logicals(summary_df)
+  write_summary <- .apply_declared_types(write_summary, analyzer_version)
   # Guarantee at least package and version columns for schema stability.
   if (!"package" %in% names(write_summary)) {
     write_summary[["package"]] <- rep(NA_character_, nrow(write_summary))
@@ -57,6 +59,7 @@ export_metrics <- function(path, summary_df, churn_df, api_df, vignettes_df = NU
     write_summary[["version"]] <- rep(NA_character_, nrow(write_summary))
   }
   DBI::dbWriteTable(con, "cran_code_summary", write_summary, row.names = FALSE)
+  .ensure_summary_columns(con, analyzer_version)
   DBI::dbExecute(con,
     "CREATE UNIQUE INDEX idx_summary_pkg_ver ON cran_code_summary(package, version)")
 
@@ -1514,6 +1517,54 @@ db_analyzed_state <- function(con) {
   rbind(primary, fallback)
 }
 
+# Every summary column rpkg-analyzer 0.5.0 adds, with its SQLite type. A first
+# shard where a text column is all NA would otherwise type it INTEGER for good.
+.SUMMARY_050_COLS <- c(
+  input_kind = "TEXT",
+  has_citation = "INTEGER", citation_read = "TEXT", citation_kind = "TEXT",
+  citation_n_entries = "INTEGER", citation_bibtype = "TEXT",
+  citation_dois = "TEXT", citation_venue = "TEXT",
+  has_rd_bibliography = "INTEGER",
+  n_help_topics = "INTEGER", n_help_topics_internal = "INTEGER",
+  n_help_topics_data = "INTEGER", n_help_topics_package = "INTEGER",
+  examples_coverage_fn = "REAL", examples_coverage_fn_basis = "TEXT",
+  rd_example_pages = "INTEGER", rd_example_pages_run = "INTEGER",
+  rd_example_pages_donttest_only = "INTEGER",
+  rd_example_pages_never_run = "INTEGER", rd_example_pages_empty = "INTEGER",
+  rd_example_pages_conditional = "INTEGER",
+  test_framework_primary = "TEXT", test_frameworks_used = "TEXT",
+  test_frameworks_declared = "TEXT", n_test_units = "INTEGER",
+  test_unit = "TEXT", n_rout_save = "INTEGER", n_test_blocks = "INTEGER",
+  n_test_blocks_cran_skipped = "INTEGER", tests_gated_not_cran = "INTEGER",
+  vignette_eval_gated = "INTEGER",
+  news_file = "TEXT", changelog_file = "TEXT", release_notes_source = "TEXT",
+  build_ignored = "TEXT", build_ignore_bad_lines = "INTEGER"
+)
+
+#' Coerce each declared 0.5.0 column in a shard frame to its declared class.
+.apply_declared_types <- function(df, analyzer_version) {
+  if (!analyzer_at_least(analyzer_version, "0.5.0")) return(df)
+  for (col in intersect(names(.SUMMARY_050_COLS), names(df))) {
+    df[[col]] <- switch(.SUMMARY_050_COLS[[col]],
+                        TEXT    = as.character(df[[col]]),
+                        INTEGER = as.integer(df[[col]]),
+                        REAL    = as.double(df[[col]]))
+  }
+  df
+}
+
+#' Add every declared 0.5.0 column the summary table lacks, with its declared type.
+.ensure_summary_columns <- function(con, analyzer_version) {
+  if (!analyzer_at_least(analyzer_version, "0.5.0")) return(invisible(character(0L)))
+  if (!SUMMARY_TABLE %in% DBI::dbListTables(con)) return(invisible(character(0L)))
+  add <- setdiff(names(.SUMMARY_050_COLS), DBI::dbListFields(con, SUMMARY_TABLE))
+  for (col in add) {
+    DBI::dbExecute(con, sprintf('ALTER TABLE "%s" ADD COLUMN "%s" %s',
+                                SUMMARY_TABLE, col, .SUMMARY_050_COLS[[col]]))
+  }
+  invisible(add)
+}
+
 #' Upsert one shard's rows into the pipeline database in-place.
 #'
 #' For each package present in summary_df, deletes all prior rows from the
@@ -1541,10 +1592,12 @@ db_analyzed_state <- function(con) {
 #'   untouched. Detail is expected to cover each package's latest version only;
 #'   the delete-by-package step still clears any prior-version detail rows so no
 #'   stale rows survive a re-analysis.
+#' @param analyzer_version The running analyzer build; gates the 0.5.0 schema steps.
 #' @return invisible(NULL)
 upsert_shard <- function(con, summary_df, churn_df, api_df,
                          functions_df = NULL, edges_df = NULL,
-                         vignettes_df = NULL) {
+                         vignettes_df = NULL,
+                         analyzer_version = NA_character_) {
   pkgs <- unique(as.character(summary_df$package))
   if (length(pkgs) == 0L) return(invisible(NULL))
 
@@ -1573,13 +1626,16 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
 
     # -- Insert fresh summary rows (with schema-growth handling) -------------
     summary_write <- .coerce_logicals(summary_df)
+    summary_write <- .apply_declared_types(summary_write, analyzer_version)
     tables        <- DBI::dbListTables(con)
 
     if (!"cran_code_summary" %in% tables) {
       # First-ever write: create the table from the data.frame schema.
       DBI::dbWriteTable(con, "cran_code_summary", summary_write,
                         row.names = FALSE, overwrite = FALSE, append = FALSE)
+      .ensure_summary_columns(con, analyzer_version)
     } else {
+      .ensure_summary_columns(con, analyzer_version)
       # Possibly new columns have appeared since the table was first created.
       existing_cols <- DBI::dbListFields(con, "cran_code_summary")
       for (col in setdiff(names(summary_write), existing_cols)) {

@@ -828,7 +828,7 @@ preflight_refusal <- function(violations) {
 }
 
 #' Whether the downloaded text and code databases came from one run. A mismatch is
-#' reported, not refused: the run re-reads what the text history lacks.
+#' reported, not refused: the run requeues the 0.5.0 readings the text history lacks.
 text_code_pairing <- function(out_dir, code_tag = "", text_tag = "") {
   text <- read_manifest_file(file.path(out_dir, "prev-text-manifest.json"))
   code <- read_manifest_file(file.path(out_dir, "prev-code-manifest.json"))
@@ -839,8 +839,8 @@ text_code_pairing <- function(out_dir, code_tag = "", text_tag = "") {
   }
   list(text_code_mismatch = TRUE, notes = sprintf(paste0(
     "the text database from %s was published beside code fingerprint %s, and the ",
-    "code database from %s has fingerprint %s; this run re-reads the versions the ",
-    "text history lacks"),
+    "code database from %s has fingerprint %s; the run requeues the versions a 0.5.0 ",
+    "build analysed and the text history lacks"),
     if (nzchar(text_tag)) text_tag else "an unnamed release", paired,
     if (nzchar(code_tag)) code_tag else "an unnamed release", actual))
 }

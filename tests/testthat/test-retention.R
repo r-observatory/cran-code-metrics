@@ -744,6 +744,10 @@ test_that("preflight.R stops with the headline for what came back", {
   expect_false(is.null(attr(res, "status")))
   expect_true(any(grepl("without the database", res, fixed = TRUE)))
   expect_false(any(grepl("holds less", res, fixed = TRUE)))
+  # The pairing is recorded before the refusal, and no tag flags leave both tags empty.
+  check <- jsonlite::fromJSON(file.path(out, "text-code-check.json"))
+  expect_identical(check$code_tag, "")
+  expect_identical(check$text_tag, "")
 })
 
 test_that("update.yml does not reach for a manifest preflight cannot read", {
@@ -1194,6 +1198,10 @@ test_that("a text and code pair from different runs is named, not refused", {
 
   write_manifest(file.path(out, "prev-text-manifest.json"),
                  .text_manifest(code_fingerprint = strrep("b", 64L)))
+  expect_false(text_code_pairing(out)$text_code_mismatch)
+  # A code baseline measured from the database has no fingerprint to compare.
+  code <- .code_manifest_0814(); code$fingerprint <- NULL
+  write_manifest(file.path(out, "prev-code-manifest.json"), code)
   expect_false(text_code_pairing(out)$text_code_mismatch)
   unlink(file.path(out, "prev-text-manifest.json"))
   expect_false(text_code_pairing(out)$text_code_mismatch)

@@ -51,6 +51,31 @@ test_that("a value cut to the byte budget stays valid UTF-8 and says it was cut"
   expect_true(validUTF8(latest$value))
 })
 
+test_that("the latest rows are cut to the byte budget and the history keeps the whole text", {
+  long <- paste0("a", strrep("é", 10000L))
+  rows <- list(.release_text_rows("pkgA", "1.0", c(SystemRequirements = long),
+                                  .rt_notes("1.0", long), "0.5.0"))
+  text <- .release_text_collect(rows, "1.0")
+  kept <- RELEASE_TEXT_FIELD_MAX_BYTES - 1L
+  expect_identical(nchar(text$description_latest$value, type = "bytes"), kept)
+  expect_identical(nchar(text$release_notes_latest$release_notes, type = "bytes"), kept)
+  expect_true(validUTF8(text$release_notes_latest$release_notes))
+  expect_identical(text$release_notes_latest$release_notes_truncated, 1L)
+  expect_identical(nchar(text$description$value, type = "bytes"), 20001L)
+  expect_identical(nchar(text$release_notes$release_notes, type = "bytes"), 20001L)
+
+  # A section the analyzer already cut keeps saying so under the budget.
+  own <- .release_text_collect(list(.release_text_rows(
+    "pkgA", "1.1", NULL, .rt_notes("1.1", truncated = TRUE), "0.5.0")), "1.1")
+  expect_identical(own$release_notes_latest$release_notes_truncated, 1L)
+})
+
+test_that("a new code database has both latest-only tables before any shard writes text", {
+  db <- .rt_dbs()
+  expect_true(all(c(DESCRIPTION_FIELDS_TABLE, RELEASE_NOTES_TABLE) %in%
+                    DBI::dbListTables(db$con)))
+})
+
 test_that("an empty DESCRIPTION record and a missing one both leave a versions row", {
   empty <- .release_text_rows("pkgA", "1.0", stats::setNames(character(0L), character(0L)),
                               NULL, "0.5.0")

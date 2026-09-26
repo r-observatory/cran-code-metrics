@@ -46,6 +46,19 @@ METRIC_GROUPS <- list(
   meta        = metrics_meta
 )
 
+#' The release-input reading of the repository-only metrics on one R-fallback row.
+.null_repository_only_metrics <- function(metrics) {
+  for (col in intersect(REPOSITORY_ONLY_PRESENCE_COLS, names(metrics))) {
+    if (!isTRUE(as.logical(metrics[[col]]))) metrics[[col]] <- NA
+  }
+  if (!isTRUE(as.logical(metrics[["ci_present"]]))) {
+    for (col in intersect(REPOSITORY_ONLY_CI_DETAIL_COLS, names(metrics))) {
+      metrics[[col]] <- NA
+    }
+  }
+  metrics
+}
+
 #' Compute all registered metrics for one package version.
 #'
 #' Iterates over METRIC_GROUPS.  A group that throws an error:
@@ -793,7 +806,7 @@ analyze_package <- function(repo_dir, package) {
       metrics <- analyze_with_binary(tmp)
       binary_ran <- !is.null(metrics)
       if (is.null(metrics)) {
-        metrics <- analyze_version(ctx)
+        metrics <- .null_repository_only_metrics(analyze_version(ctx))
       } else if (is.null(metrics[["analyzer_version"]])) {
         # Which build produced this row is what lets a later run tell data it
         # already holds from data a newer build would describe differently.

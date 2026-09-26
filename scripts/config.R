@@ -203,3 +203,9 @@ RELEASE_TEXT_FIELD_MAX_BYTES <- 16384L
 
 # More missing history than this means the text database is the wrong copy.
 RELEASE_TEXT_REQUEUE_MAX <- 2000L
+
+# Repository files a CRAN tarball almost never carries: a release without one says
+# nothing about the repository, so these store NULL, never 0.
+REPOSITORY_ONLY_PRESENCE_COLS <- c("ci_present", "has_pkgdown",
+                                   "has_code_of_conduct", "has_contributing_guide")
+REPOSITORY_ONLY_CI_DETAIL_COLS <- c("ci_type", "ci_matrix_breadth", "ci_pr_gated")

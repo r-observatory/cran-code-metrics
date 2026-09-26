@@ -45,3 +45,15 @@ test_that("each version keeps its own DESCRIPTION and NEWS, and the latest is ma
   expect_identical(unique(text$description_latest$version), "1.1")
   expect_identical(text$description_latest$field, "RoxygenNote")
 })
+
+test_that("versions the R fallback wrote contribute no text and no repository zeros", {
+  skip_on_os("windows")
+  withr::local_envvar(RPKG_ANALYZER_BIN = "/nonexistent/rpkg-analyzer")
+  skip_if(nzchar(unname(Sys.which("rpkg-analyzer"))), "a real rpkg-analyzer is on PATH")
+  repo <- file.path(withr::local_tempdir(), "pkgA")
+  .art_repo(repo)
+  res <- analyze_package(repo, "pkgA")
+  expect_equal(nrow(res$text$versions), 0L)
+  expect_true(all(is.na(res$summary$has_pkgdown)))
+  expect_true(all(is.na(res$summary$ci_type)))
+})

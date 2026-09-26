@@ -1597,6 +1597,28 @@ db_analyzed_state <- function(con) {
   invisible(gone)
 }
 
+#' Turn stored repository-only zeros into NULL on the release input; a 1 stays,
+#' since the release itself carries the file. Idempotent.
+.null_repository_only_columns <- function(con) {
+  if (!SUMMARY_TABLE %in% DBI::dbListTables(con)) return(invisible(0L))
+  fields   <- DBI::dbListFields(con, SUMMARY_TABLE)
+  presence <- intersect(REPOSITORY_ONLY_PRESENCE_COLS, fields)
+  n <- 0L
+  if (length(presence)) {
+    n <- n + DBI::dbExecute(con, sprintf('UPDATE "%s" SET %s WHERE %s', SUMMARY_TABLE,
+      paste(sprintf('"%s" = NULLIF("%s", 0)', presence, presence), collapse = ", "),
+      paste(sprintf('"%s" = 0', presence), collapse = " OR ")))
+  }
+  detail <- intersect(REPOSITORY_ONLY_CI_DETAIL_COLS, fields)
+  if (length(detail) && "ci_present" %in% fields) {
+    n <- n + DBI::dbExecute(con, sprintf(
+      'UPDATE "%s" SET %s WHERE ci_present IS NULL AND (%s)', SUMMARY_TABLE,
+      paste(sprintf('"%s" = NULL', detail), collapse = ", "),
+      paste(sprintf('"%s" IS NOT NULL', detail), collapse = " OR ")))
+  }
+  invisible(n)
+}
+
 #' Upsert one shard's rows into the pipeline database in-place.
 #'
 #' For each package present in summary_df, deletes all prior rows from the
@@ -1687,6 +1709,7 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     DBI::dbExecute(con,
       "CREATE UNIQUE INDEX IF NOT EXISTS idx_summary_pkg_ver
        ON cran_code_summary(package, version)")
+    .null_repository_only_columns(con)
 
     # -- Insert fresh churn rows ---------------------------------------------
     churn_write <- .coerce_logicals(churn_df)

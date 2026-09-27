@@ -1675,14 +1675,28 @@ test_that("a columns profile within the bound is stored untouched", {
 .ds_stub_analyze <- function(version = "0.4.0-test") {
   env <- environment(run_update)
   old <- get("analyze_package", envir = env)
-  assign("analyze_package", function(dest, pkg) list(
-    summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
-      latest_release_date = "2026-01-01", datasets_scanned = TRUE, detail_scanned = TRUE,
-      analyzer_version = version, stringsAsFactors = FALSE),
-    api = data.frame(package = pkg, version = "1.0", exports_added = "[]",
-      exports_removed = "[]", n_exports = 1L, stringsAsFactors = FALSE),
-    churn = NULL, functions = NULL, edges = NULL, datasets = NULL,
-    binary_versions = "1.0"), envir = env)
+  assign("analyze_package", function(dest, pkg) {
+    # With no build named, the run stamps the running one, and the text names it too.
+    build <- if (is.na(version)) rpkg_analyzer_version() else version
+    # The analyzer prints a dcf record, and from 0.5.0 a release_notes record too.
+    notes <- if (analyzer_at_least(build, "0.5.0")) {
+      list(rec = "release_notes", package_version = "1.0", news_file = "NEWS.md",
+           release_notes_source = "news_md", release_notes = "- first release",
+           release_notes_truncated = FALSE)
+    }
+    list(
+      summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
+        latest_release_date = "2026-01-01", datasets_scanned = TRUE, detail_scanned = TRUE,
+        analyzer_version = version, stringsAsFactors = FALSE),
+      api = data.frame(package = pkg, version = "1.0", exports_added = "[]",
+        exports_removed = "[]", n_exports = 1L, stringsAsFactors = FALSE),
+      churn = NULL, functions = NULL, edges = NULL, datasets = NULL,
+      # The text reading analyze_package keeps for each version the binary produced.
+      text = .release_text_collect(list(.release_text_rows(
+        pkg, "1.0", c(Package = pkg, Version = "1.0", Title = "A Package"),
+        notes, build)), "1.0"),
+      binary_versions = "1.0")
+  }, envir = env)
   old
 }
 

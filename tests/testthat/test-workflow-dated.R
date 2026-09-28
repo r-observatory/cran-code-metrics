@@ -230,8 +230,8 @@ test_that("the download step repairs and reads the text database, and never star
   expect_true(grepl("cran-release-text.db", code_repair, fixed = TRUE))
   expect_true(grepl("text-manifest.json", code_repair, fixed = TRUE))
 
-  resolve <- grep("newest_tag_with_asset metrics cran-release-text.db", lines,
-                  fixed = TRUE)
+  resolve <- grep("newest_tag_with_asset metrics cran-release-text.db.zst cran-release-text.db)",
+                  lines, fixed = TRUE)
   expect_length(resolve, 1L)
   # A resolution that failed stops the step rather than reading as no release.
   expect_true(grepl("|| {", lines[resolve], fixed = TRUE))
@@ -244,7 +244,9 @@ test_that("the download step repairs and reads the text database, and never star
   expect_identical(trimws(lines[listing + 2L]), "exit 1")
   expect_true(any(listing < grep('have_asset "$TEXT_SRC" text-manifest.json', lines,
                                  fixed = TRUE)))
-  expect_true(any(grepl('get_asset "$TEXT_SRC" cran-release-text.db', lines, fixed = TRUE)))
+  expect_true(any(grepl('get_db "$TEXT_SRC" cran-release-text.db || exit 1', lines, fixed = TRUE)))
+  expect_true(any(grepl("check_fetched_db out/cran-release-text.db out/prev-text-manifest.json || exit 1",
+                        lines, fixed = TRUE)))
   expect_true(any(grepl("mv out/text-manifest.json out/prev-text-manifest.json", lines,
                         fixed = TRUE)))
   # The repair comes before the resolution reads what the release carries.
@@ -266,4 +268,43 @@ test_that("the day's release carries the text database and its manifest, databas
                             "out/cran-code-metrics.db", "out/cran-data-metrics.db",
                             "out/code-manifest.json", "out/data-manifest.json",
                             "out/text-manifest.json"))
+  # Each database in the form PUBLISH_FORM names, .zst unless told plain.
+  dbs <- regmatches(call, gregexpr('"out/[a-z-]+\\.db\\$\\{ext\\}"', call))[[1L]]
+  expect_length(dbs, 3L)
+})
+
+test_that("the download step reads each database in either form, and never builds on one it could not read", {
+  lines <- strsplit(.download_step(), "\n")[[1L]]
+  code <- trimws(lines[!grepl("^\\s*#", lines)])
+  # zstd is asked for before anything is fetched.
+  zstd <- grep("command -v zstd", code, fixed = TRUE)
+  expect_length(zstd, 1L)
+  expect_lt(zstd, min(grep("get_db ", code, fixed = TRUE)))
+  for (db in c("cran-code-metrics.db", "cran-data-metrics.db")) {
+    src <- if (grepl("code", db)) "CODE_SRC" else "DATA_SRC"
+    expect_true(sprintf('if have_db "$%s" %s; then', src, db) %in% code, info = db)
+    expect_true(sprintf('get_db "$%s" %s || exit 1', src, db) %in% code, info = db)
+  }
+  for (series in c("code", "data", "text")) {
+    db <- c(code = "cran-code-metrics.db", data = "cran-data-metrics.db",
+            text = "cran-release-text.db")[[series]]
+    expect_true(sprintf("check_fetched_db out/%s out/prev-%s-manifest.json || exit 1", db, series)
+                %in% code, info = series)
+  }
+  # A database comes down only through get_db, which reads the .zst first, and
+  # every fetch stops the step when it fails.
+  expect_false(any(grepl('get_asset "\\$[A-Z_]+" [a-z-]+\\.db', code)))
+  expect_false(any(grepl("gh release download", code, fixed = TRUE)))
+  fetches <- grep("^(get_asset|get_db) ", code, value = TRUE)
+  expect_gte(length(fetches), 6L)
+  expect_true(all(endsWith(fetches, "|| exit 1")))
+})
+
+test_that("the databases are compressed at level 3, without --long, and checked before they go out", {
+  body <- .sh_function(.publish_sh(), "compress_db")
+  body <- body[!grepl("^\\s*#", body)]
+  expect_true(any(grepl("zstd -q -f -3 -T0 ", body, fixed = TRUE)))
+  expect_true(any(grepl("zstd -tq ", body, fixed = TRUE)))
+  expect_false(any(grepl("--long", body, fixed = TRUE)))
+  expect_true(any(grepl('^PUBLISH_FORM="\\$\\{PUBLISH_FORM:-zstd\\}"$', .publish_sh())))
 })

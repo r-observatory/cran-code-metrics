@@ -541,17 +541,27 @@ test_that("a shard with nothing to publish does not rewrite the database", {
 test_that("update.yml fails the run when a prior asset does not arrive", {
   workflow_path <- file.path("..", "..", ".github", "workflows", "update.yml")
   yml <- readLines(workflow_path)
-  dl  <- grep("gh release download", yml, value = TRUE, fixed = TRUE)
-  expect_true(length(dl) > 0L)
+  # The download step sources its fetches from scripts/publish.sh.
+  sh <- readLines(file.path("..", "..", "scripts", "publish.sh"))
+  body_of <- function(name) {
+    start <- grep(sprintf("^%s\\(\\) \\{", name), sh)
+    expect_length(start, 1L)
+    sh[start:(start - 1L + grep("^\\}", sh[start:length(sh)])[1L])]
+  }
+  fetches <- c(body_of("get_asset"), body_of("get_db"))
+  dl  <- grep("gh release download", fetches, value = TRUE, fixed = TRUE)
+  expect_length(dl, 2L)
   # Not one of the prior-state fetches may end in `|| true`: that is the line
   # that let cran-queue republish an empty database as latest.
   expect_false(any(grepl("|| true", dl, fixed = TRUE)))
   expect_false(any(grepl("2>/dev/null", dl, fixed = TRUE)))
 
   y <- paste(yml, collapse = "\n")
-  expect_true(grepl("sleep", y, fixed = TRUE))          # retry with backoff
-  expect_true(grepl("preflight.R", y, fixed = TRUE))    # content check
-  expect_true(grepl("-s \"out/$name\"", y, fixed = TRUE))  # zero-length is a failure
+  f <- paste(fetches, collapse = "\n")
+  expect_true(grepl("publish_backoff", f, fixed = TRUE))  # retry with backoff
+  expect_true(grepl("preflight.R", y, fixed = TRUE))      # content check
+  expect_true(grepl("-s \"out/$name\"", f, fixed = TRUE))   # zero-length is a failure
+  expect_true(grepl("-s \"out/$asset\"", f, fixed = TRUE))
   # The shard loop must carry the rebuild exemption for the whole run, not
   # just for the shard that gets --bootstrap.
   expect_true(grepl("FORCE_FULL_REBUILD", y, fixed = TRUE))

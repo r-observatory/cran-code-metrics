@@ -36,10 +36,19 @@
 # no asset of that name is one rename wide instead of one upload wide, and the
 # copy it replaces is kept rather than deleted.
 
-# GitHub refuses a release asset over 2 GiB, so an oversized database is
-# refused before any gh call rather than after a 1.9 GiB upload that cannot
-# land. ~1.9 GiB, for headroom.
+# GitHub refuses a release asset over 2 GiB, so an oversized asset is refused
+# before any gh call rather than after a 1.9 GiB upload that cannot land.
+# ~1.9 GiB, for headroom. It measures the file uploaded, the .zst.
 PUBLISH_MAX_BYTES="${PUBLISH_MAX_BYTES:-2040109465}"
+
+# zstd publishes each database as <name>.zst, about a fifth of its size; plain
+# is the way back, with no revert.
+PUBLISH_FORM="${PUBLISH_FORM:-zstd}"
+
+# The asset cap stops binding once the databases are compressed. The runner's
+# disk, VACUUM and the merged observatory.db meet the uncompressed size first,
+# so a database past 4 GiB is published with a warning.
+PUBLISH_RAW_WARN_BYTES="${PUBLISH_RAW_WARN_BYTES:-4294967296}"
 
 # Size in bytes: GNU stat on the runner, BSD stat where the tests run on macOS.
 # A missing file is named before either is asked. GNU stat reads the BSD form
@@ -102,37 +111,41 @@ latest_tag() {
   return 1
 }
 
-# Newest PUBLISHED tag in a series whose assets name $2, or nothing when no
-# release has carried it. A listing it cannot read fails rather than reads as none.
-newest_tag_with_asset() {  # $1=series $2=asset name
-  local tags tag names n
+# Newest PUBLISHED tag in a series whose assets name any of the names given, or
+# nothing when no release has carried one. A listing it cannot read fails
+# rather than reads as none.
+newest_tag_with_asset() {  # $1=series, then the asset names
+  local series="$1" tags tag names n want
+  shift
   for n in 1 2 3 4 5; do
     if tags=$(gh release list --exclude-drafts --limit 1000 --json tagName -q '.[].tagName'); then
       break
     fi
-    echo "attempt ${n}: could not list the releases to find the newest $1 release carrying $2" >&2
+    echo "attempt ${n}: could not list the releases to find the newest ${series} release carrying $*" >&2
     if [ "$n" -eq 5 ]; then
-      echo "::error::five attempts failed to list the releases; cannot tell which one carries $2." >&2
+      echo "::error::five attempts failed to list the releases; cannot tell which one carries $*." >&2
       return 1
     fi
     publish_backoff "$n" 10
   done
-  for tag in $(printf '%s\n' "$tags" | { grep "^$1-" || true; } | sort -r); do
+  for tag in $(printf '%s\n' "$tags" | { grep "^${series}-" || true; } | sort -r); do
     for n in 1 2 3 4 5; do
       if names=$(gh release view "$tag" --json assets -q '.assets[].name'); then
         break
       fi
       echo "attempt ${n}: could not list the assets of ${tag}" >&2
       if [ "$n" -eq 5 ]; then
-        echo "::error::five attempts failed to list the assets of ${tag}; cannot tell whether it carries $2." >&2
+        echo "::error::five attempts failed to list the assets of ${tag}; cannot tell whether it carries $*." >&2
         return 1
       fi
       publish_backoff "$n" 10
     done
-    if printf '%s\n' "$names" | grep -qxF "$2"; then
-      printf '%s\n' "$tag"
-      return 0
-    fi
+    for want in "$@"; do
+      if printf '%s\n' "$names" | grep -qxF "$want"; then
+        printf '%s\n' "$tag"
+        return 0
+      fi
+    done
   done
   return 0
 }
@@ -347,9 +360,11 @@ discard_asset() {  # $1=tag $2=release id $3=asset name
 #                               out loud for the same reason: the caller may
 #                               be about to supply it, and the run that reads
 #                               the release has its own answer for an asset
-#                               that is not there.
-repair_asset() {  # $1=tag $2=release id $3=asset name
-  local tag="$1" rel="$2" name="$3" rows here prev next
+#                               that is not there. With $4=quiet it is not
+#                               said: a database is carried in one of two
+#                               forms, and the caller says whether either is.
+repair_asset() {  # $1=tag $2=release id $3=asset name [$4=quiet]
+  local tag="$1" rel="$2" name="$3" quiet="${4:-}" rows here prev next
   rows=$(release_assets "$rel") || return 1
   here=$(asset_row "$rows" "$name")
   prev=$(asset_row "$rows" "swap-prev-${name}")
@@ -390,14 +405,14 @@ repair_asset() {  # $1=tag $2=release id $3=asset name
       echo "::warning::${tag} carries no ${name} and swap-next-${name} was cut off, so there is nothing to put the name back on; clearing it."
       delete_asset "$(asset_id "$next")" || return 1
     fi
-  else
+  elif [ "$quiet" != quiet ]; then
     echo "::warning::${tag} carries no ${name} and nothing a replacement left aside, so there is nothing to put the name back on."
   fi
   return 0
 }
 
 # Put right what an interrupted replacement left on a release, for each asset
-# name given.
+# name given. A database name covers both forms, <name>.zst and <name>.
 #
 # The download step calls this on the release it is building on, before it
 # reads it. Nothing publishes under an earlier day's tag again, so a run that
@@ -405,11 +420,28 @@ repair_asset() {  # $1=tag $2=release id $3=asset name
 # that release without the asset for good, with the bytes sitting under
 # swap-prev-NAME and nothing left to put the name back.
 repair_release_assets() {  # $1=tag, then the asset names
-  local tag="$1" rel n
+  local tag="$1" rel n rows f found
   shift
   rel=$(release_id "$tag") || return 1
   for n in "$@"; do
-    repair_asset "$tag" "$rel" "$n" || return 1
+    case "$n" in
+      *.db)
+        rows=$(release_assets "$rel") || return 1
+        found=""
+        for f in "${n}.zst" "$n"; do
+          if [ -n "$(asset_row "$rows" "$f")$(asset_row "$rows" "swap-prev-$f")$(asset_row "$rows" "swap-next-$f")" ]; then
+            found=yes
+          fi
+        done
+        if [ -z "$found" ]; then
+          echo "::warning::${tag} carries neither ${n}.zst nor ${n}, and nothing a replacement left aside, so there is nothing to put either name back on."
+          continue
+        fi
+        repair_asset "$tag" "$rel" "${n}.zst" quiet || return 1
+        repair_asset "$tag" "$rel" "$n" quiet || return 1 ;;
+      *)
+        repair_asset "$tag" "$rel" "$n" || return 1 ;;
+    esac
   done
 }
 
@@ -761,6 +793,80 @@ publish_release() {  # $1=tag $2=title $3=notes file, then the files
   fi
 }
 
+# Compress a database to <file>.zst beside it, and prove the result decodes.
+# Level 3 without --long: 21.5% of the code database, about 3 s on a runner,
+# and a 2 MiB window any zstd decodes under its default memory limit.
+compress_db() {  # $1=database file
+  rm -f "$1.zst"
+  if ! zstd -q -f -3 -T0 "$1" -o "$1.zst"; then
+    rm -f "$1.zst"
+    echo "::error::could not compress $1."
+    return 1
+  fi
+  if ! zstd -tq "$1.zst"; then
+    rm -f "$1.zst"
+    echo "::error::$1.zst does not decompress; refusing to publish it."
+    return 1
+  fi
+}
+
+# Record in a manifest the database it describes and the asset that carries
+# it. db_bytes stays the uncompressed size, which the retention guard compares
+# day to day; the asset fields let the next run tell whether the file it
+# fetched is the one this manifest was published with.
+stamp_manifest() {  # $1=manifest $2=database $3=asset file
+  local bytes sha abytes asha
+  bytes=$(file_bytes "$2") || return 1
+  sha=$(file_sha256 "$2") || return 1
+  abytes=$(file_bytes "$3") || return 1
+  if [ "$3" = "$2" ]; then
+    asha="$sha"
+  else
+    asha=$(file_sha256 "$3") || return 1
+  fi
+  if ! jq --argjson b "$bytes" --arg s "$sha" --arg a "$(basename "$3")" \
+          --argjson ab "$abytes" --arg as "$asha" \
+          '.db_bytes = $b | .db_sha256 = $s | .asset_filename = $a | .asset_bytes = $ab | .asset_sha256 = $as' \
+          "$1" > "$1.tmp"; then
+    rm -f "$1.tmp"
+    echo "::error::could not record $(basename "$2") in $1."
+    return 1
+  fi
+  mv "$1.tmp" "$1"
+}
+
+# Take assets off a published release by id, each with the copies a
+# replacement left under it, retrying until a listing shows none of them.
+#
+# A release carries one form of each database, and a reader takes the .zst
+# whenever one is listed, so the other form has to go: a stale .zst beside a
+# plain republish is what every reader would read. The swap-prev- and
+# swap-next- copies go too, or the next sweep gives one of them the name back.
+drop_assets() {  # $1=tag, then the asset names
+  local tag="$1" rel n rows f name row left
+  shift
+  rel=$(release_id "$tag") || return 1
+  for n in 1 2 3 4 5; do
+    rows=$(release_assets "$rel") || return 1
+    left=""
+    for name in "$@"; do
+      for f in "$name" "swap-prev-${name}" "swap-next-${name}"; do
+        row=$(asset_row "$rows" "$f")
+        if [ -z "$row" ]; then continue; fi
+        echo "clearing ${f} from ${tag}, the form this publish does not carry"
+        delete_asset "$(asset_id "$row")" || left="${left} ${f}"
+      done
+    done
+    if [ -z "$left" ]; then return 0; fi
+    echo "attempt ${n}: could not delete${left} on ${tag}"
+    if [ "$n" -lt 5 ]; then publish_backoff "$n" 10; fi
+  done
+  for f in $left; do
+    echo "::error::could not take ${f} off ${tag}; a reader that finds both forms takes the .zst."
+  done
+  return 1
+}
+
 # The day's metrics release: the three databases, then the three manifests, from out/.
 #
 # Databases first, because a manifest that landed without its database is the
@@ -769,18 +875,58 @@ publish_release() {  # $1=tag $2=title $3=notes file, then the files
 #
 # The text database before the code one: a code database ahead of it is a gap of
 # every version the shard read, more than a run re-reads during a rescan.
+#
+# Each database goes out as <name>.zst unless PUBLISH_FORM=plain, and the other
+# form comes off the release once the new one is verified, which covers the
+# switch day and a rollback.
 publish_metrics() {  # $1=tag $2=title
-  local tag="$1" title="$2" f bytes
+  local tag="$1" title="$2" f bytes ext other rc=0
+  case "$PUBLISH_FORM" in
+    zstd) ext=".zst"; other="" ;;
+    plain) ext=""; other=".zst" ;;
+    *)
+      echo "::error::PUBLISH_FORM is ${PUBLISH_FORM}; it takes zstd or plain. Refusing to publish ${tag}."
+      return 1 ;;
+  esac
   for f in cran-code-metrics.db cran-data-metrics.db cran-release-text.db; do
     bytes=$(file_bytes "out/$f") || return 1
-    if [ "$bytes" -gt "$PUBLISH_MAX_BYTES" ]; then
-      echo "::error::out/$f is ${bytes} bytes (> ${PUBLISH_MAX_BYTES}); refusing to publish ${tag}."
-      return 1
+    if [ "$bytes" -gt "$PUBLISH_RAW_WARN_BYTES" ]; then
+      echo "::warning::out/$f is ${bytes} bytes uncompressed (> ${PUBLISH_RAW_WARN_BYTES}). The runner's disk, VACUUM and the merged observatory.db meet this size before the asset cap does."
     fi
   done
-  publish_release "$tag" "$title" out/release-notes-code.md \
-    out/cran-release-text.db out/cran-code-metrics.db out/cran-data-metrics.db \
-    out/code-manifest.json out/data-manifest.json out/text-manifest.json || return 1
+  for f in code-manifest.json data-manifest.json text-manifest.json; do
+    file_bytes "out/$f" >/dev/null || return 1
+  done
+
+  for f in cran-release-text.db cran-code-metrics.db cran-data-metrics.db; do
+    if [ -n "$ext" ]; then compress_db "out/$f" || rc=1; fi
+    if [ "$rc" -eq 0 ]; then
+      bytes=$(file_bytes "out/${f}${ext}") || rc=1
+    fi
+    if [ "$rc" -eq 0 ] && [ "$bytes" -gt "$PUBLISH_MAX_BYTES" ]; then
+      echo "::error::out/${f}${ext} is ${bytes} bytes (> ${PUBLISH_MAX_BYTES}); refusing to publish ${tag}."
+      rc=1
+    fi
+    if [ "$rc" -ne 0 ]; then break; fi
+  done
+  if [ "$rc" -eq 0 ]; then
+    stamp_manifest out/code-manifest.json out/cran-code-metrics.db "out/cran-code-metrics.db${ext}" &&
+      stamp_manifest out/data-manifest.json out/cran-data-metrics.db "out/cran-data-metrics.db${ext}" &&
+      stamp_manifest out/text-manifest.json out/cran-release-text.db "out/cran-release-text.db${ext}" ||
+      rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    publish_release "$tag" "$title" out/release-notes-code.md \
+      "out/cran-release-text.db${ext}" "out/cran-code-metrics.db${ext}" "out/cran-data-metrics.db${ext}" \
+      out/code-manifest.json out/data-manifest.json out/text-manifest.json || rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    drop_assets "$tag" "cran-release-text.db${other}" "cran-code-metrics.db${other}" \
+      "cran-data-metrics.db${other}" || rc=1
+  fi
+  # The .zst files go either way, so they never take the next shard's disk.
+  rm -f out/cran-release-text.db.zst out/cran-code-metrics.db.zst out/cran-data-metrics.db.zst
+  return "$rc"
 }
 
 # Replace one asset of a release that is already out, for the harvest run.
@@ -791,8 +937,13 @@ publish_metrics() {  # $1=tag $2=title
 # its own. gh refuses a missing file without calling GitHub, so the upload
 # retries could not change the answer: it took five attempts and about 300 s
 # of backoff to fail, and the error named the upload rather than the file.
+#
+# A database is replaced in the form the release carries, the .zst when it
+# lists one or a copy a replacement set aside, and PUBLISH_FORM decides only
+# for a release carrying neither. A release carrying both keeps the .zst, the
+# one a reader takes.
 replace_published_asset() {  # $1=tag $2=file
-  local tag="$1" file="$2" state rel
+  local tag="$1" file="$2" state rel rows name zst upload other="" rc=0
   file_bytes "$file" >/dev/null || return 1
   state=$(release_state "$tag") || return 1
   case "$state" in
@@ -808,8 +959,24 @@ replace_published_asset() {  # $1=tag $2=file
       return 1 ;;
   esac
   rel=$(release_id "$tag") || return 1
-  swap_asset "$tag" "$rel" "$file" || return 1
-  verify_assets "$tag" "$file" || return 1
+  upload="$file"
+  case "$file" in
+    *.db)
+      name=$(basename "$file")
+      rows=$(release_assets "$rel") || return 1
+      zst="$(asset_row "$rows" "${name}.zst")$(asset_row "$rows" "swap-prev-${name}.zst")"
+      if [ -n "$zst" ] ||
+         { [ -z "$(asset_row "$rows" "$name")" ] && [ "$PUBLISH_FORM" = zstd ]; }; then
+        compress_db "$file" || return 1
+        upload="${file}.zst"
+        other="$name"
+      fi ;;
+  esac
+  swap_asset "$tag" "$rel" "$upload" || rc=1
+  if [ "$rc" -eq 0 ]; then verify_assets "$tag" "$upload" || rc=1; fi
+  if [ "$rc" -eq 0 ] && [ -n "$other" ]; then drop_assets "$tag" "$other" || rc=1; fi
+  if [ "$upload" != "$file" ]; then rm -f "$upload"; fi
+  return "$rc"
 }
 
 # Delete the drafts in a series that no publish will come back for.
@@ -895,4 +1062,128 @@ sweep_swap_leftovers() {  # $1=series $2=tag to leave alone
       echo "::warning::could not clear what a replacement left under ${base} on ${t}; the next scheduled run tries again."
     fi
   done <<< "$pairs"
+}
+
+# The download step's reads of the release a run builds on.
+#
+# This pipeline is incremental: the prior release's database IS the
+# accumulated state, and a run that starts without it rebuilds from empty and
+# publishes that as latest, green. cran-queue lost 323,063 snapshots covering
+# four months exactly that way on 2026-07-16, when a single 503 on the asset
+# download was swallowed by `|| true`. So every fetch retries, a zero-length
+# file or a .zst that will not decompress counts as a failed download, and a
+# release that advertises an asset the run cannot get fails the run. "No prior
+# release" stays distinguishable from "the download failed" because it is the
+# resolved tag, not the presence of a file, that says which one a run is in.
+
+# The asset names of a release, one per line, into $2.
+list_assets() {  # $1=tag $2=file to write
+  local n
+  for n in 1 2 3 4 5; do
+    if gh release view "$1" --json assets -q '.assets[].name' > "$2"; then
+      return 0
+    fi
+    echo "attempt ${n}: could not list the assets of $1"
+    if [ "$n" -lt 5 ]; then publish_backoff "$n" 10; fi
+  done
+  return 1
+}
+
+# Whether the listing list_assets took of a release names an asset.
+have_asset() { grep -qxF "$2" "out/.assets-$1"; }
+
+# Whether it lists a database in either form.
+have_db() { have_asset "$1" "$2.zst" || have_asset "$1" "$2"; }
+
+get_asset() {  # $1=tag $2=asset name
+  local tag="$1" name="$2" n
+  for n in 1 2 3 4 5; do
+    rm -f "out/$name"
+    if gh release download "$tag" --pattern "$name" --dir out && [ -s "out/$name" ]; then
+      echo "fetched ${name} from ${tag} ($(file_bytes "out/$name") bytes)"
+      return 0
+    fi
+    echo "attempt ${n}: ${name} did not arrive from ${tag}, or arrived empty"
+    if [ "$n" -lt 5 ]; then publish_backoff "$n" 10; fi
+  done
+  rm -f "out/$name"
+  echo "::error::${tag} lists ${name} as an asset but five attempts failed to fetch a non-empty copy. Refusing to continue: this run would rebuild from an empty database and publish it as latest."
+  return 1
+}
+
+# Fetch a database into out/<name>: the .zst when the release lists one,
+# decompressed, and the plain file otherwise, as a release from before the
+# switch carries it. A .zst cut short fails zstd's frame checksum, which counts
+# as a failed attempt, and the last one leaves nothing in out/ to build on.
+#
+# out/.fetched-<name>.txt records the asset read and its sha256, which is how
+# check_fetched_db tells whether a manifest was published with these bytes.
+get_db() {  # $1=tag $2=database name
+  local tag="$1" name="$2" asset n sha
+  if have_asset "$tag" "${name}.zst"; then
+    asset="${name}.zst"
+  elif have_asset "$tag" "$name"; then
+    get_asset "$tag" "$name" || return 1
+    sha=$(file_sha256 "out/$name") || return 1
+    printf '%s %s\n' "$name" "$sha" > "out/.fetched-${name}.txt"
+    return 0
+  else
+    echo "::error::${tag} lists neither ${name}.zst nor ${name}; there is no database to fetch."
+    return 1
+  fi
+  for n in 1 2 3 4 5; do
+    rm -f "out/$asset" "out/$name"
+    if gh release download "$tag" --pattern "$asset" --dir out && [ -s "out/$asset" ] &&
+       zstd -dq -f "out/$asset" -o "out/$name"; then
+      sha=$(file_sha256 "out/$asset") || return 1
+      printf '%s %s\n' "$asset" "$sha" > "out/.fetched-${name}.txt"
+      echo "fetched ${name} from ${tag} ($(file_bytes "out/$name") bytes, from ${asset} at $(file_bytes "out/$asset") bytes)"
+      rm -f "out/$asset"
+      return 0
+    fi
+    echo "attempt ${n}: ${asset} did not arrive from ${tag}, arrived empty, or would not decompress"
+    if [ "$n" -lt 5 ]; then publish_backoff "$n" 10; fi
+  done
+  rm -f "out/$asset" "out/$name"
+  echo "::error::${tag} lists ${asset} but five attempts failed to fetch a copy that decompresses whole. Refusing to continue: this run would rebuild from an empty database and publish it as latest."
+  return 1
+}
+
+# Hold a fetched database to the manifest published with it, when that
+# manifest names the very asset get_db read: it must then be db_bytes long and
+# hash to db_sha256. A manifest published with other bytes, a database a shard
+# ahead of it or one a harvest replaced, or one from before the checksums were
+# recorded, is left to preflight, which compares rows.
+check_fetched_db() {  # $1=database $2=manifest published with it
+  local db="$1" manifest="$2" name rec fields asset="" asha="" want_asset want_asha want_bytes want_sha bytes sha
+  name=$(basename "$db")
+  if [ ! -f "$db" ]; then return 0; fi
+  if [ ! -f "$manifest" ]; then
+    echo "${name} came without a manifest; preflight measures a baseline from its rows"
+    return 0
+  fi
+  if ! fields=$(jq -r '[.asset_filename, .asset_sha256, .db_bytes, .db_sha256]
+                       | map(if . == null then "" else tostring end) | join("|")' "$manifest"); then
+    echo "::error::${manifest} is not a manifest jq can read; refusing to guess whether ${name} is whole."
+    return 1
+  fi
+  IFS='|' read -r want_asset want_asha want_bytes want_sha <<< "$fields"
+  rec="$(dirname "$db")/.fetched-${name}.txt"
+  if [ -f "$rec" ]; then read -r asset asha < "$rec"; fi
+  if [ -z "$want_asha" ] || [ -z "$want_sha" ] || [ -z "$want_bytes" ] || [ -z "$asset" ] ||
+     [ "$want_asset" != "$asset" ] || [ "$want_asha" != "$asha" ]; then
+    echo "${name}: its manifest was not published with ${asset:-the file fetched}, or predates checksums; preflight checks ${name} by its rows"
+    return 0
+  fi
+  bytes=$(file_bytes "$db") || return 1
+  if [ "$bytes" != "$want_bytes" ]; then
+    echo "::error::${name} is ${bytes} bytes, and the manifest published with ${asset} says ${want_bytes}. Refusing to build on a database that is not the one published."
+    return 1
+  fi
+  sha=$(file_sha256 "$db") || return 1
+  if [ "$sha" != "$want_sha" ]; then
+    echo "::error::${name} hashes to sha256:${sha}, and the manifest published with ${asset} says sha256:${want_sha}. Refusing to build on a database that is not the one published."
+    return 1
+  fi
+  echo "${name} matches the manifest published with it: ${bytes} bytes, sha256:${sha}"
 }

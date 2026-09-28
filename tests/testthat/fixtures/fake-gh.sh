@@ -51,6 +51,9 @@
 #     moves the asset in the listing.
 #   - a draft has no git tag, so `delete --cleanup-tag` on one deletes the
 #     release and then exits non-zero.
+#   - `release download` hands back the bytes that were uploaded, when
+#     $GH_BLOBS keeps them (one file per asset id, so a rename keeps them),
+#     and otherwise the declared size of dots.
 #
 # State is $GH_STATE, a JSON array of releases, oldest first:
 #   {id, tagName, isDraft, isPrerelease, isLatest, hasTag, name, body,
@@ -67,6 +70,8 @@
 #   digest-<asset>  that asset's upload succeeds but lands other bytes
 #   stale-<asset>   an asset listing leaves that asset out, as a read that has
 #                   not caught up with its upload would
+#   cut-<asset>     a download of that asset exits 0 with only the first half
+#                   of its bytes, as a stream cut short can
 #   rename-to-<name>  a PATCH that would set that name returns HTTP 500
 #   assets          the per-release asset listing returns HTTP 500
 #   create          create returns HTTP 500 and creates nothing
@@ -132,6 +137,7 @@ add_asset() {  # release id, path, optional asset name
     digest="sha256:0000000000000000000000000000000000000000000000000000000000000000"
   fi
   aid=$(next_asset_id)
+  if [ -n "${GH_BLOBS:-}" ]; then head -c "$size" "$path" > "$GH_BLOBS/$aid"; fi
   state | jq --argjson rid "$rid" --argjson aid "$aid" --arg n "$name" \
              --argjson s "$size" --arg d "$digest" --arg c "$(ctype "$name")" '
     map(if .id == $rid
@@ -348,10 +354,17 @@ case "$sub" in
       # shellcheck disable=SC2254
       case "$n" in
         $pattern)
-          size=$(state | jq -r --argjson id "$id" --arg n "$n" '
-            .[] | select(.id == $id) | .assets[] | select(.name == $n) | .size')
+          read -r aid size < <(state | jq -r --argjson id "$id" --arg n "$n" '
+            .[] | select(.id == $id) | .assets[] | select(.name == $n) | "\(.id) \(.size)"')
           mkdir -p "$dir"
-          head -c "$size" /dev/zero | tr '\0' '.' > "$dir/$n"
+          if [ -n "${GH_BLOBS:-}" ] && [ -f "$GH_BLOBS/$aid" ]; then
+            cat "$GH_BLOBS/$aid" > "$dir/$n"
+          else
+            head -c "$size" /dev/zero | tr '\0' '.' > "$dir/$n"
+          fi
+          if fault "cut-$n"; then
+            head -c $(( size / 2 )) "$dir/$n" > "$dir/$n.cut" && mv "$dir/$n.cut" "$dir/$n"
+          fi
           hit=true ;;
       esac
     done

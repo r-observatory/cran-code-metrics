@@ -34,4 +34,7 @@ jobs:
           chmod +x "$HOME/.local/bin/rpkg-analyzer"
           echo "RPKG_ANALYZER_BIN=$HOME/.local/bin/rpkg-analyzer" >> "$GITHUB_ENV"
       - name: Run unit tests
-        run: Rscript tests/testthat.R
+        run: |
+          # The .zst tests skip without zstd, so a runner without it fails here.
+          zstd --version
+          Rscript tests/testthat.R

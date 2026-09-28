@@ -45,6 +45,8 @@ Each dated release carries `code-manifest.json`, `data-manifest.json` and
 published, carries the `changed` and `bootstrap_complete` flags that drive the
 shard loop.
 
+The databases are published zstd-compressed, as `cran-code-metrics.db.zst`, `cran-data-metrics.db.zst` and `cran-release-text.db.zst`, and `zstd -d cran-code-metrics.db.zst` gives back the SQLite file. A release carries one form of each database, and releases from before the switch carry the plain `.db` files. A manifest describes the SQLite file (`db_filename`, `db_bytes`, `db_sha256`) and the asset that carries it (`asset_filename`, `asset_bytes`, `asset_sha256`). Setting `PUBLISH_FORM=plain` for the workflow publishes the plain files again.
+
 ## Retired columns
 
 These columns are no longer published in `cran_code_summary`. Each leaves the
@@ -66,6 +68,8 @@ databases plus their manifests. The bootstrap fills the full catalog over
 several runs: each shard is published so progress survives a restart, and the
 workflow keeps starting shards until the catalog is complete or a time budget
 is reached. Set `GITHUB_TOKEN` so git fetches are authenticated.
+
+The tests run from the repository root and need R with RSQLite, DBI, jsonlite, digest, testthat and withr, plus bash, jq, zstd, git and sqlite3 on PATH. The release tests in `test-publish.R` skip without bash or jq, and those that read or write a `.zst` skip without zstd. Point `RPKG_ANALYZER_BIN` at an rpkg-analyzer binary (the workflows pin v0.4.0) to run the tests that need a real analyzer; without one they skip. A few tests skip when `rpkg-analyzer` is on PATH, so name the binary through the variable rather than PATH.
 
 ## Notes
 

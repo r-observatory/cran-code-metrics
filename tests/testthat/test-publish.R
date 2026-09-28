@@ -62,16 +62,30 @@
                assets = .pub_assets[c("code-manifest.json", "data-manifest.json")])
 }
 
+# The database each manifest describes.
+.pub_manifest_db <- c("code-manifest.json" = "cran-code-metrics.db",
+                      "data-manifest.json" = "cran-data-metrics.db",
+                      "text-manifest.json" = "cran-release-text.db")
+
 #' A throwaway world: a fake gh on PATH, its release state, and a working
 #' directory holding the out/ files the workflow would publish.
+#'
+#' The release mechanics further down are written against the plain names,
+#' so a world publishes plain unless told otherwise. PUBLISH_FORM=plain is
+#' also the way back from zstd, so they keep covering it.
 #'
 #' @param releases List of .pub_release() entries, oldest first.
 #' @param faults   Named integer vector: fault name to how many times it fires.
 #' @param frame    Where the temporary directory is cleaned up.
-.pub_world <- function(releases, faults = integer(0L), frame = parent.frame()) {
+#' @param form     PUBLISH_FORM for every step run in it; NA leaves it unset.
+.pub_world <- function(releases, faults = integer(0L), frame = parent.frame(),
+                       form = "plain") {
   skip_on_os("windows")
   skip_if(!nzchar(Sys.which("bash")), "bash is not installed")
   skip_if(!nzchar(Sys.which("jq")), "jq is not installed")
+  if (!identical(form, "plain")) {
+    skip_if(!nzchar(Sys.which("zstd")), "zstd is not installed")
+  }
 
   dir <- withr::local_tempdir(.local_envir = frame)
   bin <- file.path(dir, "bin")
@@ -82,15 +96,26 @@
   work <- file.path(dir, "work")
   dir.create(file.path(work, "out"), recursive = TRUE)
   for (n in names(.pub_assets)) {
-    writeBin(as.raw(rep(0x2e, .pub_assets[[n]])), file.path(work, "out", n))
+    path <- file.path(work, "out", n)
+    if (n %in% names(.pub_manifest_db)) {
+      jsonlite::write_json(list(schema_version = 1L, series = sub("-.*", "", n),
+                                db_filename = .pub_manifest_db[[n]],
+                                db_bytes = .pub_assets[[.pub_manifest_db[[n]]]]),
+                           path, auto_unbox = TRUE, pretty = TRUE)
+    } else {
+      writeBin(as.raw(rep(0x2e, .pub_assets[[n]])), path)
+    }
   }
   writeLines("notes for today", file.path(work, "out", "release-notes-code.md"))
 
   world <- list(dir = dir, bin = bin, work = work,
                 state = file.path(dir, "state.json"),
                 log = file.path(dir, "gh.log"),
-                faults = file.path(dir, "faults"))
+                faults = file.path(dir, "faults"),
+                blobs = file.path(dir, "blobs"),
+                form = form)
   dir.create(world$faults)
+  dir.create(world$blobs)
   file.create(world$log)
   .pub_set_state(world, releases)
   .pub_set_faults(world, faults)
@@ -125,6 +150,7 @@
                ...), script)
   vars <- c(PATH = paste(world$bin, Sys.getenv("PATH"), sep = .Platform$path.sep),
             GH_STATE = world$state, GH_LOG = world$log, GH_FAULTS = world$faults,
+            GH_BLOBS = world$blobs, PUBLISH_FORM = world$form,
             PUBLISH_RETRY_SECONDS = "0", env)
   out <- withr::with_envvar(vars, suppressWarnings(
     system2("bash", shQuote(script), stdout = TRUE, stderr = TRUE)))
@@ -178,10 +204,48 @@
   sizes[!grepl("^swap-(prev|next)-", names(sizes))]
 }
 
+# The file a reader asking for `name` on `tag` is handed, fetched into a
+# directory of its own.
+.pub_fetch <- function(world, tag, name) {
+  dl <- tempfile("dl", tmpdir = world$dir)
+  res <- .pub_run(world, sprintf("gh release download %s -p %s -D %s || exit 1",
+                                 tag, name, shQuote(dl)))
+  expect_equal(res$status, 0L, info = name)
+  file.path(dl, name)
+}
+
+# The bytes a .zst holds once decompressed.
+.pub_unzst <- function(path) {
+  out <- tempfile(fileext = ".db")
+  expect_equal(system2("zstd", c("-dq", "-f", shQuote(path), "-o", shQuote(out))), 0L)
+  out
+}
+
+.pub_same_bytes <- function(a, b) {
+  identical(readBin(a, "raw", file.size(a)), readBin(b, "raw", file.size(b)))
+}
+
+# Published whole: every asset the form names is on the published release and
+# holds what out/ holds. A plain asset is measured, as the release measures
+# it, and a .zst is fetched and decompressed, since its size depends on zstd.
 .pub_expect_whole <- function(world, tag) {
   r <- .pub_only(world, tag)
   expect_false(isTRUE(r$isDraft))
-  expect_equal(.pub_live_sizes(r), .pub_assets[order(names(.pub_assets))])
+  live <- .pub_live_sizes(r)
+  dbs <- setdiff(names(.pub_assets), names(.pub_manifest_db))
+  zst <- identical(world$form, "zstd") || is.na(world$form)
+  want <- sort(c(if (zst) paste0(dbs, ".zst") else dbs, names(.pub_manifest_db)))
+  expect_equal(names(live), want)
+  for (n in intersect(names(live), want)) {
+    if (endsWith(n, ".zst")) {
+      db <- sub("\\.zst$", "", n)
+      expect_true(.pub_same_bytes(.pub_unzst(.pub_fetch(world, tag, n)),
+                                  file.path(world$work, "out", db)), info = n)
+    } else {
+      expect_equal(live[[n]], as.integer(file.size(file.path(world$work, "out", n))),
+                   info = n)
+    }
+  }
   invisible(r)
 }
 
@@ -1111,8 +1175,8 @@ test_that("the bytes a replacement refused are never what a later repair gives t
       "repair_release_assets metrics-2026-09-13 %s || exit 1", .pub_db))
     expect_equal(res$status, 0L, info = fault)
     expect_true(any(grepl(
-      sprintf("::warning::metrics-2026-09-13 carries no %s and nothing a replacement left aside",
-              .pub_db), res$output, fixed = TRUE)), info = fault)
+      sprintf("::warning::metrics-2026-09-13 carries neither %s.zst nor %s, and nothing a replacement left aside",
+              .pub_db, .pub_db), res$output, fixed = TRUE)), info = fault)
     expect_equal(.pub_read_by_name(world, "metrics-2026-09-13", .pub_db),
                  "none", info = fault)
   }
@@ -1363,4 +1427,469 @@ test_that("a listing the sweep could not read once is read again, and one it nev
   expect_false("went on past the leftovers" %in% res$output)
   expect_true(paste0("swap-prev-", .pub_db) %in%
                 names(.pub_asset_sizes(.pub_only(world, "metrics-2026-09-12"))))
+})
+
+# ---------------------------------------------------------------------------
+# The databases go out zstd-compressed
+# ---------------------------------------------------------------------------
+# cran-code-metrics.db was on course to reach GitHub's 2 GiB asset limit in
+# 2027. Each database is published as <name>.zst at level 3, about a fifth of
+# its size, and the plain file is no longer published. The manifests still
+# describe the SQLite file, so the retention guard and preflight read what
+# they always read, and a reader takes the .zst when a release lists one and
+# the plain file otherwise, so the releases from before stay readable.
+
+.pub_dbs <- c("cran-release-text.db", "cran-code-metrics.db", "cran-data-metrics.db")
+
+# Bytes zstd cannot shrink, so a .zst of them is larger than the file.
+.pub_incompressible <- function(path, n) {
+  writeBin(as.raw(sample.int(256L, n, replace = TRUE) - 1L), path)
+}
+
+.pub_zst <- function(src, dest = paste0(src, ".zst")) {
+  expect_equal(system2("zstd", c("-q", "-f", "-3", shQuote(src), "-o", shQuote(dest))), 0L)
+  dest
+}
+
+.pub_sha <- function(path) digest::digest(file = path, algo = "sha256")
+
+test_that("a new day's release carries each database as .zst and no plain copy", {
+  for (form in c("zstd", NA)) {   # NA: PUBLISH_FORM unset, the default
+    world <- .pub_world(list(.pub_0912()), form = form)
+    .pub_incompressible(file.path(world$work, "out", "cran-code-metrics.db"), 5000L)
+    res <- .pub_run(world, .pub_today)
+    expect_equal(res$status, 0L, info = form)
+    r <- .pub_expect_whole(world, "metrics-2026-09-13")
+    expect_true(isTRUE(r$isLatest))
+    expect_false(any(names(.pub_asset_sizes(r)) %in% .pub_dbs))
+
+    # Text, code and data, then the manifests, as the plain files went.
+    uploads <- grep("^gh release upload", .pub_log(world), value = TRUE)
+    expect_equal(sub(".*out/([^ ]+) --clobber$", "\\1", uploads),
+                 c(paste0(.pub_dbs, ".zst"),
+                   "code-manifest.json", "data-manifest.json", "text-manifest.json"))
+    # The .zst files are not left in out/ to take disk from the next shard.
+    expect_false(any(file.exists(file.path(world$work, "out", paste0(.pub_dbs, ".zst")))))
+  }
+})
+
+test_that("each manifest describes the SQLite file and records the asset that carries it", {
+  world <- .pub_world(list(.pub_0912()), form = "zstd")
+  .pub_incompressible(file.path(world$work, "out", "cran-code-metrics.db"), 5000L)
+  expect_equal(.pub_run(world, .pub_today)$status, 0L)
+  r <- .pub_only(world, "metrics-2026-09-13")
+  sizes <- .pub_asset_sizes(r)
+  digests <- vapply(r$assets, function(a) as.character(a$digest %||% NA), character(1L))
+  names(digests) <- vapply(r$assets, function(a) a$name, character(1L))
+
+  for (m in names(.pub_manifest_db)) {
+    db <- .pub_manifest_db[[m]]
+    got <- jsonlite::read_json(.pub_fetch(world, "metrics-2026-09-13", m))
+    expect_identical(got$db_filename, db)
+    # The uncompressed size, which the retention guard compares day to day.
+    expect_equal(got$db_bytes, .pub_assets[[db]], info = m)
+    expect_identical(got$db_sha256, .pub_sha(file.path(world$work, "out", db)), info = m)
+    expect_identical(got$asset_filename, paste0(db, ".zst"), info = m)
+    expect_equal(got$asset_bytes, sizes[[paste0(db, ".zst")]], info = m)
+    expect_identical(paste0("sha256:", got$asset_sha256), digests[[paste0(db, ".zst")]],
+                     info = m)
+  }
+  # What was there before is kept.
+  code <- jsonlite::read_json(file.path(world$work, "out", "code-manifest.json"))
+  expect_identical(code$series, "code")
+  expect_lt(sizes[["cran-release-text.db.zst"]], .pub_assets[["cran-release-text.db"]])
+})
+
+test_that("the size budget applies to the .zst, and a large database is published with a warning", {
+  # 5000 bytes of dots compress to a few dozen, so a database the plain budget
+  # refused goes out.
+  world <- .pub_world(list(.pub_0912()), form = "zstd")
+  res <- .pub_run(world, .pub_today,
+                  env = c(PUBLISH_MAX_BYTES = "4000", PUBLISH_RAW_WARN_BYTES = "4500"))
+  expect_equal(res$status, 0L)
+  .pub_expect_whole(world, "metrics-2026-09-13")
+  expect_true(any(grepl("::warning::out/cran-code-metrics.db is 5000 bytes uncompressed",
+                        res$output, fixed = TRUE)))
+  expect_false(any(grepl("::warning::out/cran-data-metrics.db", res$output, fixed = TRUE)))
+
+  # A .zst over the budget is refused before the release is touched.
+  world <- .pub_world(list(.pub_0912()), form = "zstd")
+  .pub_incompressible(file.path(world$work, "out", "cran-code-metrics.db"), 5000L)
+  res <- .pub_run(world, .pub_today, env = c(PUBLISH_MAX_BYTES = "4000"))
+  expect_false(res$status == 0L)
+  expect_true(any(grepl("::error::out/cran-code-metrics.db.zst is 50[0-9][0-9] bytes \\(> 4000\\)",
+                        res$output)), info = res$output)
+  expect_false(any(grepl("::warning::", res$output, fixed = TRUE)))
+  expect_length(.pub_log(world), 0L)
+})
+
+test_that("a database missing from out/ is named before anything is compressed or touched", {
+  for (missing in c("cran-code-metrics.db", "cran-release-text.db", "text-manifest.json")) {
+    world <- .pub_world(list(.pub_0912()), form = "zstd")
+    unlink(file.path(world$work, "out", missing))
+    res <- .pub_run(world, .pub_today)
+    expect_false(res$status == 0L)
+    expect_true(any(grepl(sprintf("::error::out/%s does not exist", missing),
+                          res$output, fixed = TRUE)), info = missing)
+    expect_length(.pub_log(world), 0L)
+  }
+})
+
+test_that("a PUBLISH_FORM that is neither zstd nor plain is refused", {
+  world <- .pub_world(list(.pub_0912()), form = "gzip")
+  res <- .pub_run(world, .pub_today)
+  expect_false(res$status == 0L)
+  expect_true(any(grepl("::error::PUBLISH_FORM is gzip", res$output, fixed = TRUE)))
+  expect_length(.pub_log(world), 0L)
+})
+
+test_that("a .zst upload that never lands fails the step and keeps yesterday as the baseline", {
+  world <- .pub_world(list(.pub_0912()), form = "zstd",
+                      faults = c("upload-cran-code-metrics.db.zst" = 99L))
+  expect_false(.pub_run(world, .pub_today)$status == 0L)
+  res <- .pub_run(world, 'echo "metrics=$(latest_tag metrics)"')
+  expect_true("metrics=metrics-2026-09-12" %in% res$output)
+  .pub_set_faults(world, integer(0L))
+  expect_equal(.pub_run(world, .pub_today)$status, 0L)
+  .pub_expect_whole(world, "metrics-2026-09-13")
+})
+
+test_that("a same-day republish that switches to zstd takes the plain copies off the release", {
+  # The first run of the switch day may have published plain, and a copy a
+  # replacement moved aside would be given the name back by the next day's
+  # sweep, so both go.
+  world <- .pub_world(list(.pub_0912(), .pub_out_today(extra = list(
+    .pub_asset(251L, "swap-prev-cran-code-metrics.db", 4990L),
+    .pub_asset(252L, "swap-next-cran-data-metrics.db", 2990L)))), form = "zstd")
+  res <- .pub_run(world, .pub_today)
+  expect_equal(res$status, 0L)
+  r <- .pub_expect_whole(world, "metrics-2026-09-13")
+  left <- names(.pub_asset_sizes(r))
+  expect_false(any(left %in% .pub_dbs))
+  expect_false(any(grepl("^swap-(prev|next)-.*\\.db$", left)))
+  # The manifests went through the swap as before.
+  expect_true("swap-prev-code-manifest.json" %in% left)
+  expect_true(any(grepl("clearing cran-code-metrics.db from metrics-2026-09-13",
+                        res$output, fixed = TRUE)))
+})
+
+test_that("a republish back to plain takes the .zst copies off, so no reader prefers a stale one", {
+  zst_today <- .pub_release(2L, "metrics-2026-09-13", latest = TRUE,
+    assets = c(stats::setNames(c(900L, 400L, 90L), paste0(.pub_dbs, ".zst")),
+               .pub_assets[names(.pub_manifest_db)] - 7L),
+    extra = list(.pub_asset(251L, "swap-prev-cran-code-metrics.db.zst", 880L)))
+  world <- .pub_world(list(.pub_0912(), zst_today), form = "plain")
+  res <- .pub_run(world, .pub_today)
+  expect_equal(res$status, 0L)
+  r <- .pub_expect_whole(world, "metrics-2026-09-13")
+  expect_false(any(grepl("\\.zst$", names(.pub_asset_sizes(r)))))
+})
+
+test_that("an other form that will not come off fails the publish", {
+  # Left beside a plain republish, a .zst is what every reader would take.
+  zst_today <- .pub_release(2L, "metrics-2026-09-13", latest = TRUE,
+    assets = c(stats::setNames(c(900L, 400L, 90L), paste0(.pub_dbs, ".zst")),
+               .pub_assets[names(.pub_manifest_db)] - 7L))
+  world <- .pub_world(list(.pub_0912(), zst_today), form = "plain",
+                      faults = c("api-delete" = 99L))
+  res <- .pub_run(world, .pub_today, 'echo "went on past the publish"')
+  expect_false(res$status == 0L)
+  expect_false("went on past the publish" %in% res$output)
+  expect_true(any(grepl("::error::could not take cran-release-text.db.zst off metrics-2026-09-13",
+                        res$output, fixed = TRUE)))
+
+  # One delete that fails is made again.
+  world <- .pub_world(list(.pub_0912(), zst_today), form = "plain",
+                      faults = c("api-delete" = 1L))
+  expect_equal(.pub_run(world, .pub_today)$status, 0L)
+  r <- .pub_expect_whole(world, "metrics-2026-09-13")
+  expect_false(any(grepl("\\.zst$", names(.pub_asset_sizes(r)))))
+})
+
+test_that("the harvest replaces the database in the form the release carries", {
+  harvest <- 'replace_published_asset metrics-2026-09-13 out/cran-code-metrics.db || exit 1'
+  zst_today <- function(extra_plain = FALSE) {
+    assets <- c(stats::setNames(c(900L, 400L, 90L), paste0(.pub_dbs, ".zst")),
+                .pub_assets[names(.pub_manifest_db)] - 7L)
+    if (extra_plain) assets <- c(assets, "cran-code-metrics.db" = 4993L)
+    .pub_release(2L, "metrics-2026-09-13", latest = TRUE, assets = assets)
+  }
+
+  # A release carrying the .zst gets a new .zst, whatever PUBLISH_FORM says.
+  for (form in c("zstd", "plain")) {
+    world <- .pub_world(list(.pub_0912(), zst_today()), form = form)
+    res <- .pub_run(world, harvest)
+    expect_equal(res$status, 0L, info = form)
+    sizes <- .pub_asset_sizes(.pub_only(world, "metrics-2026-09-13"))
+    expect_equal(sizes[["swap-prev-cran-code-metrics.db.zst"]], 400L, info = form)
+    expect_false("cran-code-metrics.db" %in% names(sizes), info = form)
+    got <- .pub_unzst(.pub_fetch(world, "metrics-2026-09-13", "cran-code-metrics.db.zst"))
+    expect_true(.pub_same_bytes(got, file.path(world$work, "out", "cran-code-metrics.db")))
+    expect_false(file.exists(file.path(world$work, "out", "cran-code-metrics.db.zst")))
+  }
+
+  # One carrying both forms keeps the .zst, which is what a reader takes.
+  world <- .pub_world(list(.pub_0912(), zst_today(extra_plain = TRUE)), form = "zstd")
+  expect_equal(.pub_run(world, harvest)$status, 0L)
+  sizes <- .pub_asset_sizes(.pub_only(world, "metrics-2026-09-13"))
+  expect_true("cran-code-metrics.db.zst" %in% names(sizes))
+  expect_false("cran-code-metrics.db" %in% names(sizes))
+
+  # A .zst an interrupted replacement set aside still counts as the form the
+  # release carries: the name goes back on it and it is what gets replaced.
+  aside <- .pub_release(2L, "metrics-2026-09-13", latest = TRUE,
+    assets = c("cran-code-metrics.db" = 4993L, .pub_assets[names(.pub_manifest_db)] - 7L),
+    extra = list(.pub_asset(251L, "swap-prev-cran-code-metrics.db.zst", 880L)))
+  world <- .pub_world(list(.pub_0912(), aside), form = "plain")
+  expect_equal(.pub_run(world, harvest)$status, 0L)
+  sizes <- .pub_asset_sizes(.pub_only(world, "metrics-2026-09-13"))
+  expect_equal(sizes[["swap-prev-cran-code-metrics.db.zst"]], 880L)
+  expect_true("cran-code-metrics.db.zst" %in% names(sizes))
+  expect_false("cran-code-metrics.db" %in% names(sizes))
+
+  # One carrying the plain file only is replaced plain, as before.
+  world <- .pub_world(list(.pub_0912(), .pub_out_today()), form = "zstd")
+  expect_equal(.pub_run(world, harvest)$status, 0L)
+  sizes <- .pub_asset_sizes(.pub_only(world, "metrics-2026-09-13"))
+  expect_equal(sizes[["cran-code-metrics.db"]], 5000L)
+  expect_false("cran-code-metrics.db.zst" %in% names(sizes))
+})
+
+test_that("the text database is read from the newest release that carries it in either form", {
+  step <- c(paste('TEXT_SRC=$(newest_tag_with_asset metrics',
+                  'cran-release-text.db.zst cran-release-text.db) || exit 1'),
+            'echo "text=<${TEXT_SRC}>"')
+  plain <- .pub_assets
+  zst <- c(.pub_assets[setdiff(names(.pub_assets), "cran-release-text.db")],
+           "cran-release-text.db.zst" = 300L)
+  neither <- .pub_assets[setdiff(names(.pub_assets), c("cran-release-text.db", "text-manifest.json"))]
+
+  world <- .pub_world(list(.pub_release(1L, "metrics-2026-09-12", assets = plain),
+                           .pub_release(2L, "metrics-2026-09-13", assets = zst)))
+  expect_true("text=<metrics-2026-09-13>" %in% .pub_run(world, step)$output)
+
+  # The newest carries it plain, from before the switch.
+  world <- .pub_world(list(.pub_release(1L, "metrics-2026-09-12", assets = zst),
+                           .pub_release(2L, "metrics-2026-09-13", assets = plain)))
+  expect_true("text=<metrics-2026-09-13>" %in% .pub_run(world, step)$output)
+
+  # The newest carries neither, so the one before it is the source.
+  world <- .pub_world(list(.pub_release(1L, "metrics-2026-09-12", assets = zst),
+                           .pub_release(2L, "metrics-2026-09-13", assets = neither)))
+  expect_true("text=<metrics-2026-09-12>" %in% .pub_run(world, step)$output)
+
+  # None ever did: the one cold start.
+  world <- .pub_world(list(.pub_release(1L, "metrics-2026-09-12", assets = neither)))
+  res <- .pub_run(world, step)
+  expect_equal(res$status, 0L)
+  expect_true("text=<>" %in% res$output)
+})
+
+test_that("the repair before a read covers both forms of a database, and names a database the release lost", {
+  # A replacement of the .zst stopped between its two renames: the name goes
+  # back on the copy it moved aside, and the plain form, never there, is not
+  # reported missing.
+  world <- .pub_world(list(.pub_0912(), .pub_release(2L, "metrics-2026-09-13",
+    assets = c("cran-data-metrics.db.zst" = 400L, "code-manifest.json" = 40L),
+    extra = list(.pub_asset(251L, "swap-prev-cran-code-metrics.db.zst", 900L)))))
+  res <- .pub_run(world,
+    "repair_release_assets metrics-2026-09-13 cran-code-metrics.db cran-data-metrics.db || exit 1")
+  expect_equal(res$status, 0L)
+  sizes <- .pub_asset_sizes(.pub_only(world, "metrics-2026-09-13"))
+  expect_equal(sizes[["cran-code-metrics.db.zst"]], 900L)
+  expect_false(any(grepl("::warning::.*carries no cran-(code|data)-metrics.db ", res$output)))
+  expect_false(any(grepl("carries neither", res$output, fixed = TRUE)))
+
+  # A release with neither form, and nothing set aside, says so once.
+  world <- .pub_world(list(.pub_0912(), .pub_release(2L, "metrics-2026-09-13",
+    assets = c("code-manifest.json" = 40L))))
+  res <- .pub_run(world, "repair_release_assets metrics-2026-09-13 cran-code-metrics.db || exit 1")
+  expect_equal(res$status, 0L)
+  expect_length(grep("::warning::", res$output), 1L)
+  expect_true(any(grepl(paste("::warning::metrics-2026-09-13 carries neither",
+                              "cran-code-metrics.db.zst nor cran-code-metrics.db"),
+                        res$output, fixed = TRUE)))
+})
+
+# ---------------------------------------------------------------------------
+# Reading a release back: the download step
+# ---------------------------------------------------------------------------
+
+# A world whose one release carries real bytes: `files` maps each asset name
+# to the local file whose bytes it holds. out/ starts empty, as on a runner.
+.pub_read_world <- function(files, faults = integer(0L), frame = parent.frame()) {
+  world <- .pub_world(list(), faults = faults, frame = frame, form = "zstd")
+  unlink(list.files(file.path(world$work, "out"), full.names = TRUE))
+  sizes <- vapply(files, function(f) as.integer(file.size(f)), integer(1L))
+  rel <- .pub_release(1L, "metrics-2026-09-12", assets = sizes, latest = TRUE)
+  for (i in seq_along(files)) {
+    file.copy(files[[i]], file.path(world$blobs, as.character(100L + i)))
+  }
+  .pub_set_state(world, list(rel))
+  world
+}
+
+.pub_read_step <- function(...) {
+  c("list_assets metrics-2026-09-12 out/.assets-metrics-2026-09-12 || exit 1", ...)
+}
+
+# A database as it would come back from the release, and the manifest that was
+# published with it by publish_metrics.
+.pub_published_pair <- function(dir, db = "cran-code-metrics.db", n = 6000L) {
+  src <- file.path(dir, db)
+  .pub_incompressible(src, n)
+  zst <- .pub_zst(src)
+  manifest <- file.path(dir, "code-manifest.json")
+  jsonlite::write_json(list(schema_version = 1L, series = "code", db_filename = db,
+                            db_bytes = n, db_sha256 = .pub_sha(src),
+                            asset_filename = basename(zst),
+                            asset_bytes = file.size(zst), asset_sha256 = .pub_sha(zst)),
+                       manifest, auto_unbox = TRUE, pretty = TRUE)
+  list(db = src, zst = zst, manifest = manifest)
+}
+
+test_that("the download step takes the .zst when a release lists it and decompresses it to the database", {
+  pair <- .pub_published_pair(withr::local_tempdir())
+  world <- .pub_read_world(list("cran-code-metrics.db.zst" = pair$zst,
+                                "cran-code-metrics.db" = pair$db,
+                                "code-manifest.json" = pair$manifest))
+  res <- .pub_run(world, .pub_read_step(
+    'have_db metrics-2026-09-12 cran-code-metrics.db || exit 1',
+    'get_db metrics-2026-09-12 cran-code-metrics.db || exit 1'))
+  expect_equal(res$status, 0L)
+  out <- file.path(world$work, "out")
+  expect_true(.pub_same_bytes(file.path(out, "cran-code-metrics.db"), pair$db))
+  expect_false(file.exists(file.path(out, "cran-code-metrics.db.zst")))
+  # Both forms listed: only the .zst is asked for.
+  downloads <- grep("^gh release download", .pub_log(world), value = TRUE)
+  expect_length(downloads, 1L)
+  expect_true(grepl("--pattern cran-code-metrics.db.zst ", downloads, fixed = TRUE))
+  expect_true(any(grepl("fetched cran-code-metrics.db from metrics-2026-09-12 (6000 bytes, from cran-code-metrics.db.zst",
+                        res$output, fixed = TRUE)), info = res$output)
+})
+
+test_that("a release from before the switch is read plain", {
+  pair <- .pub_published_pair(withr::local_tempdir())
+  world <- .pub_read_world(list("cran-code-metrics.db" = pair$db))
+  res <- .pub_run(world, .pub_read_step(
+    'get_db metrics-2026-09-12 cran-code-metrics.db || exit 1'))
+  expect_equal(res$status, 0L)
+  expect_true(.pub_same_bytes(file.path(world$work, "out", "cran-code-metrics.db"), pair$db))
+  expect_true(any(grepl("--pattern cran-code-metrics.db ", .pub_log(world), fixed = TRUE)))
+})
+
+test_that("a .zst that comes back cut short is fetched again, and one that never comes back whole stops the step", {
+  pair <- .pub_published_pair(withr::local_tempdir())
+  files <- list("cran-code-metrics.db.zst" = pair$zst)
+  step <- .pub_read_step('get_db metrics-2026-09-12 cran-code-metrics.db || exit 1',
+                         'echo "went on past the download"')
+
+  world <- .pub_read_world(files, faults = c("cut-cran-code-metrics.db.zst" = 1L))
+  res <- .pub_run(world, step)
+  expect_equal(res$status, 0L)
+  expect_true(any(grepl("^attempt 1: ", res$output)))
+  expect_true(.pub_same_bytes(file.path(world$work, "out", "cran-code-metrics.db"), pair$db))
+
+  # Never a cold start: nothing is left in out/ for a run to build on, and the
+  # step stops.
+  world <- .pub_read_world(files, faults = c("cut-cran-code-metrics.db.zst" = 99L))
+  res <- .pub_run(world, step)
+  expect_false(res$status == 0L)
+  expect_false("went on past the download" %in% res$output)
+  expect_length(grep("^gh release download", .pub_log(world)), 5L)
+  expect_true(any(grepl("::error::metrics-2026-09-12 lists cran-code-metrics.db.zst",
+                        res$output, fixed = TRUE)))
+  expect_false(file.exists(file.path(world$work, "out", "cran-code-metrics.db")))
+  expect_false(file.exists(file.path(world$work, "out", "cran-code-metrics.db.zst")))
+})
+
+test_that("a release that carries neither form is not read, and get_db on it stops the step", {
+  pair <- .pub_published_pair(withr::local_tempdir())
+  world <- .pub_read_world(list("code-manifest.json" = pair$manifest))
+  res <- .pub_run(world, .pub_read_step(
+    'if have_db metrics-2026-09-12 cran-code-metrics.db; then echo "has it"; fi',
+    'get_db metrics-2026-09-12 cran-code-metrics.db || exit 1',
+    'echo "went on past the download"'))
+  expect_false(res$status == 0L)
+  expect_false("has it" %in% res$output)
+  expect_false("went on past the download" %in% res$output)
+  expect_true(any(grepl("::error::metrics-2026-09-12 lists neither cran-code-metrics.db.zst nor cran-code-metrics.db",
+                        res$output, fixed = TRUE)))
+})
+
+test_that("a manifest check that fails or cannot be read is not taken as a match", {
+  pair <- .pub_published_pair(withr::local_tempdir())
+  world <- .pub_read_world(list("cran-code-metrics.db.zst" = pair$zst,
+                                "code-manifest.json" = pair$manifest))
+  fetch <- .pub_read_step(
+    'get_db metrics-2026-09-12 cran-code-metrics.db || exit 1',
+    'get_asset metrics-2026-09-12 code-manifest.json || exit 1',
+    'mv out/code-manifest.json out/prev-code-manifest.json')
+  check <- 'check_fetched_db out/cran-code-metrics.db out/prev-code-manifest.json || exit 1'
+
+  # Published together: the decompressed file is the one the manifest describes.
+  res <- .pub_run(world, fetch, check)
+  expect_equal(res$status, 0L)
+  expect_true(any(grepl(sprintf("cran-code-metrics.db matches the manifest published with it: 6000 bytes, sha256:%s",
+                                .pub_sha(pair$db)), res$output, fixed = TRUE)), info = res$output)
+
+  # The manifest names this asset, and the file is not what it describes.
+  out <- file.path(world$work, "out")
+  writeBin(as.raw(1:10), file.path(out, "cran-code-metrics.db"))
+  res <- .pub_run(world, check, 'echo "went on past the check"')
+  expect_false(res$status == 0L)
+  expect_false("went on past the check" %in% res$output)
+  expect_true(any(grepl("::error::cran-code-metrics.db is 10 bytes", res$output, fixed = TRUE)))
+
+  # A manifest published with other bytes (a database a shard ahead of it, or
+  # a harvest) or before checksums were recorded is left to preflight's rows.
+  for (edit in c('.asset_sha256 = "0000"', 'del(.asset_sha256, .db_sha256)')) {
+    world <- .pub_read_world(list("cran-code-metrics.db.zst" = pair$zst,
+                                  "code-manifest.json" = pair$manifest))
+    res <- .pub_run(world, fetch,
+      sprintf("jq '%s' out/prev-code-manifest.json > m && mv m out/prev-code-manifest.json", edit),
+      check)
+    expect_equal(res$status, 0L, info = edit)
+    expect_true(any(grepl("preflight checks cran-code-metrics.db by its rows",
+                          res$output, fixed = TRUE)), info = edit)
+  }
+
+  # Nothing fetched is nothing to check: a cold start.
+  world <- .pub_read_world(list("code-manifest.json" = pair$manifest))
+  res <- .pub_run(world, check)
+  expect_equal(res$status, 0L)
+
+  # A manifest that is not JSON stops the step.
+  world <- .pub_read_world(list("cran-code-metrics.db.zst" = pair$zst,
+                                "code-manifest.json" = pair$manifest))
+  res <- .pub_run(world, fetch, "echo 'not json' > out/prev-code-manifest.json", check)
+  expect_false(res$status == 0L)
+})
+
+test_that("what a zstd publish puts on the release is what the next run's download step reads back", {
+  world <- .pub_world(list(.pub_0912()), form = "zstd")
+  out <- file.path(world$work, "out")
+  for (db in .pub_dbs) .pub_incompressible(file.path(out, db), .pub_assets[[db]])
+  expect_equal(.pub_run(world, .pub_today)$status, 0L)
+  keep <- file.path(world$dir, "published")
+  dir.create(keep)
+  file.copy(file.path(out, .pub_dbs), keep)
+  unlink(list.files(out, full.names = TRUE))
+
+  step <- c("list_assets metrics-2026-09-13 out/.assets-metrics-2026-09-13 || exit 1")
+  for (m in names(.pub_manifest_db)) {
+    db <- .pub_manifest_db[[m]]
+    step <- c(step,
+      sprintf("get_db metrics-2026-09-13 %s || exit 1", db),
+      sprintf("get_asset metrics-2026-09-13 %s || exit 1", m),
+      sprintf("mv out/%s out/prev-%s", m, m),
+      sprintf("check_fetched_db out/%s out/prev-%s || exit 1", db, m))
+  }
+  res <- .pub_run(world, step)
+  expect_equal(res$status, 0L)
+  for (db in .pub_dbs) {
+    expect_true(.pub_same_bytes(file.path(out, db), file.path(keep, db)), info = db)
+    expect_true(any(grepl(sprintf("^%s matches ", db), res$output)), info = db)
+  }
+  expect_false(any(grepl("\\.zst$", list.files(out))))
 })

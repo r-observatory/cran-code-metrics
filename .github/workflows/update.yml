@@ -119,6 +119,10 @@ jobs:
           # by a failed publish is not one, and resolving it wedged every run.
           # shellcheck source=scripts/publish.sh
           source scripts/publish.sh
+          if ! command -v zstd >/dev/null; then
+            echo "::error::zstd is not installed, and the databases are published as .zst."
+            exit 1
+          fi
 
           # A single consolidated release per day (metrics-YYYY-MM-DD) carries both
           # the code and data DBs as assets. Fall back to the legacy split code-/data-
@@ -129,45 +133,10 @@ jobs:
           DATA_SRC="${METRICS_TAG:-$(latest_tag data)}"
           echo "prior metrics tag: ${METRICS_TAG:-none}; code src: ${CODE_SRC:-none}; data src: ${DATA_SRC:-none}"
 
-          # This pipeline is incremental: the prior release's database IS the
-          # accumulated state, and a run that starts without it rebuilds from
-          # empty and publishes that as latest, green. cran-queue lost 323,063
-          # snapshots covering four months exactly that way on 2026-07-16, when
-          # a single 503 on the asset download was swallowed by `|| true`. So
-          # every fetch below retries, a zero-length file counts as a failed
-          # download, and a release that advertises an asset we cannot get
-          # fails the run. "No prior release" stays distinguishable from "the
-          # download failed" because it is the resolved tag, not the presence
-          # of a file, that says which one we are in, and a cold start (empty
-          # tag) still works.
-          list_assets() {
-            local tag="$1" dest="$2" n
-            for n in 1 2 3 4 5; do
-              if gh release view "$tag" --json assets -q '.assets[].name' > "$dest"; then
-                return 0
-              fi
-              echo "attempt ${n}: could not list the assets of ${tag}"
-              if [ "$n" -lt 5 ]; then sleep $((n * 10)); fi
-            done
-            return 1
-          }
-
-          have_asset() { grep -qxF "$2" "out/.assets-$1"; }
-
-          get_asset() {
-            local tag="$1" name="$2" n
-            for n in 1 2 3 4 5; do
-              rm -f "out/$name"
-              if gh release download "$tag" --pattern "$name" --dir out && [ -s "out/$name" ]; then
-                echo "fetched ${name} from ${tag} ($(file_bytes "out/$name") bytes)"
-                return 0
-              fi
-              echo "attempt ${n}: ${name} did not arrive from ${tag}, or arrived empty"
-              if [ "$n" -lt 5 ]; then sleep $((n * 10)); fi
-            done
-            echo "::error::${tag} lists ${name} as an asset but five attempts failed to fetch a non-empty copy. Refusing to continue: this run would rebuild from an empty database and publish it as latest."
-            exit 1
-          }
+          # Every fetch retries and stops the step when it fails, rather than
+          # start from empty: scripts/publish.sh says why. A database comes down
+          # through get_db, which takes the .zst when the release lists one and
+          # the plain file from a release published before the switch.
 
           # An asset of a release that is already out is replaced by uploading
           # under a temporary name and swapping the names, and a run that died
@@ -190,8 +159,8 @@ jobs:
               echo "::error::could not read the asset list of ${CODE_SRC}; refusing to guess whether it carries a database."
               exit 1
             fi
-            if have_asset "$CODE_SRC" cran-code-metrics.db; then
-              get_asset "$CODE_SRC" cran-code-metrics.db
+            if have_db "$CODE_SRC" cran-code-metrics.db; then
+              get_db "$CODE_SRC" cran-code-metrics.db || exit 1
             fi
             # code-manifest.json only. The pre-split manifest.json still
             # attached to the `current` release cannot serve as a baseline: it
@@ -201,7 +170,7 @@ jobs:
             # is missing or unusable gets its baseline measured from the
             # database that did come back instead.
             if have_asset "$CODE_SRC" code-manifest.json; then
-              get_asset "$CODE_SRC" code-manifest.json
+              get_asset "$CODE_SRC" code-manifest.json || exit 1
               mv out/code-manifest.json out/prev-code-manifest.json
             fi
           fi
@@ -210,18 +179,18 @@ jobs:
               echo "::error::could not read the asset list of ${DATA_SRC}; refusing to guess whether it carries a database."
               exit 1
             fi
-            if have_asset "$DATA_SRC" cran-data-metrics.db; then
-              get_asset "$DATA_SRC" cran-data-metrics.db
+            if have_db "$DATA_SRC" cran-data-metrics.db; then
+              get_db "$DATA_SRC" cran-data-metrics.db || exit 1
             fi
             if have_asset "$DATA_SRC" data-manifest.json; then
-              get_asset "$DATA_SRC" data-manifest.json
+              get_asset "$DATA_SRC" data-manifest.json || exit 1
               mv out/data-manifest.json out/prev-data-manifest.json
             fi
           fi
 
           # The text history rides its own asset: take the newest release that carries
-          # it, and start empty only when no release ever has.
-          TEXT_SRC=$(newest_tag_with_asset metrics cran-release-text.db) || {
+          # it in either form, and start empty only when no release ever has.
+          TEXT_SRC=$(newest_tag_with_asset metrics cran-release-text.db.zst cran-release-text.db) || {
             echo "::error::could not tell which release carries cran-release-text.db; refusing to start the text history from empty."
             exit 1
           }
@@ -233,14 +202,20 @@ jobs:
                 exit 1
               fi
             fi
-            get_asset "$TEXT_SRC" cran-release-text.db
+            get_db "$TEXT_SRC" cran-release-text.db || exit 1
             if have_asset "$TEXT_SRC" text-manifest.json; then
-              get_asset "$TEXT_SRC" text-manifest.json
+              get_asset "$TEXT_SRC" text-manifest.json || exit 1
               mv out/text-manifest.json out/prev-text-manifest.json
             fi
           else
             echo "no release has carried cran-release-text.db yet; the text history starts empty"
           fi
+
+          # A database whose manifest was published with the very asset
+          # fetched must be the file it describes, byte for byte.
+          check_fetched_db out/cran-code-metrics.db out/prev-code-manifest.json || exit 1
+          check_fetched_db out/cran-data-metrics.db out/prev-data-manifest.json || exit 1
+          check_fetched_db out/cran-release-text.db out/prev-text-manifest.json || exit 1
 
           # A download can succeed and still hand back a truncated file, so
           # check each database against the manifest published with it before

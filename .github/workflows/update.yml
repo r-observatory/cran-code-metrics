@@ -314,6 +314,7 @@ jobs:
           # the publish.
 
           shard=0
+          START_QUEUE=""
           while :; do
             shard=$((shard + 1))
             echo "=== shard ${shard} (elapsed ${SECONDS}s) ==="
@@ -321,6 +322,8 @@ jobs:
             FORCE=""
             RELEASE=()
 
+            [ -n "$START_QUEUE" ] ||
+              START_QUEUE=$(jq -r '(.n_remaining // 0) + (.n_shard // 0)' out/run-status.json || echo 0)
             CHANGED=$(jq -r '.changed' out/run-status.json)
             COMPLETE=$(jq -r '.bootstrap_complete' out/run-status.json)
             echo "shard ${shard}: changed=${CHANGED} complete=${COMPLETE} analyzed=$(jq -r .n_analyzed out/run-status.json)/$(jq -r .n_universe out/run-status.json)"
@@ -337,6 +340,8 @@ jobs:
             fi
             [ "$SECONDS" -ge "$BUDGET" ] && { echo "Time budget reached."; break; }
           done
+          write_step_summary out/run-status.json "$SECONDS" "${START_QUEUE:-0}" >> "${GITHUB_STEP_SUMMARY:-/dev/null}" ||
+            echo "::warning::could not write the step summary"
 
       - name: Prune old dated releases
         if: ${{ github.event_name == 'schedule' }}

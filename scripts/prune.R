@@ -11,12 +11,17 @@ releases_to_prune <- function(tags, keep = 30L) {
   candidates[!grepl("-01$", candidates)]
 }
 
-# "all" keeps every release (Inf); anything else must be a whole number.
+# KEEP with surrounding whitespace trimmed: "all" in any case keeps every
+# release (Inf), and digits alone up to 2147483647 are read as an integer.
+# Anything else stops with an error naming KEEP.
 parse_keep <- function(x) {
-  x <- tolower(trimws(x))
-  if (identical(x, "all")) return(Inf)
-  n <- suppressWarnings(as.integer(x))
-  if (is.na(n)) stop("KEEP must be a number or \"all\", got: ", x, call. = FALSE)
+  x <- trimws(as.character(x))
+  if (identical(tolower(x), "all")) return(Inf)
+  n <- if (isTRUE(grepl("^[0-9]+$", x))) suppressWarnings(as.integer(x)) else NA_integer_
+  if (is.na(n)) {
+    stop("KEEP must be \"all\" or a whole number written in digits, at most ",
+         .Machine$integer.max, ", got: \"", x, "\"", call. = FALSE)
+  }
   n
 }
 

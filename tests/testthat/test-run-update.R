@@ -488,3 +488,208 @@ test_that("a package the reader looked at is marked scanned even with nothing to
   expect_true(isTRUE(res$summary$datasets_scanned[last]))
   expect_true(all(is.na(res$summary$datasets_scanned[-last])))
 })
+
+# ---------------------------------------------------------------------------
+# A DESCRIPTION that is not UTF-8
+# ---------------------------------------------------------------------------
+
+test_that("a package with a latin1 DESCRIPTION is analysed and gets its dependency columns", {
+  withr::local_locale(c(LC_CTYPE = "C.UTF-8"))
+  out_dir <- tempfile(); dir.create(out_dir)
+  on.exit(unlink(out_dir, recursive = TRUE, force = TRUE), add = TRUE)
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+
+  latin1_desc <- c(
+    charToRaw("Package: pkgLatin\nVersion: 1.0\nTitle: Latin One\nAuthor: S"),
+    as.raw(0xf8), charToRaw("ren H"), as.raw(0xf8),
+    charToRaw("jsgaard\nMaintainer: S"), as.raw(0xf8),
+    charToRaw("ren <s@example.com>\nImports: stats, utils\nLicense: GPL-2\nEncoding: latin1\n"))
+  io <- list(
+    package_list = function() data.frame(package = "pkgLatin", latest_version = "1.0",
+                                         stringsAsFactors = FALSE),
+    clone = function(pkg, dest) {
+      .make_fake_clone(pkg, dest, versions = "1.0")
+      writeBin(latin1_desc, file.path(dest, "DESCRIPTION"))
+      system2("git", c("-C", dest, "commit", "-q", "-a", "-m", "1.0"),
+              stdout = FALSE, stderr = FALSE)
+      system2("git", c("-C", dest, "tag", "-f", "1.0"), stdout = FALSE, stderr = FALSE)
+      TRUE
+    })
+
+  m <- suppressWarnings(run_update(io, out_dir, shard_size = 10L))
+
+  expect_equal(m$shard_failures$count, 0L)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out_dir, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  row <- DBI::dbGetQuery(con,
+    "SELECT imports FROM cran_code_summary WHERE package = 'pkgLatin'")
+  expect_identical(row$imports, "stats, utils")
+})
+
+# ---------------------------------------------------------------------------
+# A version that cannot be extracted fails the package and changes nothing
+# ---------------------------------------------------------------------------
+
+test_that("analyze_package fails as a whole when one version cannot be extracted", {
+  repo <- tempfile("ccm_xf_")
+  on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
+  .make_fake_clone("pkgX", repo, versions = c("1.0", "1.1"))
+  real <- extract_version
+  .local_global("extract_version", function(repo, ref, dest) {
+    if (identical(ref, "1.1")) stop(.extract_failure("archive", ref, 128L, "fatal: bad object"))
+    real(repo, ref, dest)
+  })
+  err <- tryCatch(analyze_package(repo, "pkgX"), error = function(e) e)
+  expect_s3_class(err, "extract_failure")
+  expect_identical(err$ref, "1.1")
+})
+
+test_that("a cap during extraction extracts again into an emptied directory", {
+  repo <- tempfile("ccm_xc_")
+  on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
+  .make_fake_clone("pkgX", repo, versions = c("1.0", "1.1"))
+  .local_global("analyze_with_binary", function(dir, kind = ANALYZER_INPUT_KIND) NULL)
+  want <- suppressWarnings(analyze_package(repo, "pkgX"))
+
+  real  <- extract_version
+  fired <- FALSE
+  .local_global("extract_version", function(repo, ref, dest) {
+    if (!fired && identical(ref, "1.1")) {
+      fired <<- TRUE
+      real(repo, ref, dest)
+      writeLines("leftover <- function() 1", file.path(dest, "R", "leftover.R"))
+      stop(.cap_error())
+    }
+    real(repo, ref, dest)
+  })
+  got <- suppressWarnings(analyze_package(repo, "pkgX"))
+  expect_true(fired)
+  expect_identical(got, want)
+})
+
+test_that("a version that cannot be extracted leaves the package's stored rows as they were", {
+  out_dir <- tempfile(); dir.create(out_dir)
+  on.exit(unlink(out_dir, recursive = TRUE, force = TRUE), add = TRUE)
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  orig_cores <- ANALYSIS_CORES
+  ANALYSIS_CORES <<- 1L
+  on.exit(ANALYSIS_CORES <<- orig_cores, add = TRUE)
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_analyzer_bin(
+    withr::local_tempdir(), "0.4.0-test", reads = c("1.0", "1.1")))
+
+  v1 <- data.frame(package = "pkgA", latest_version = "1.0", stringsAsFactors = FALSE)
+  run_update(.fake_io(v1, version_map = list(pkgA = "1.0")), out_dir, shard_size = 10L)
+  before <- .package_rows(out_dir, "pkgA")
+  expect_gt(nrow(before[[paste(DB_FILENAME, SUMMARY_TABLE)]]), 0L)
+
+  real <- extract_version
+  .local_global("extract_version", function(repo, ref, dest) {
+    if (identical(ref, "1.1")) stop(.extract_failure("archive", ref, 128L, "fatal: bad object"))
+    real(repo, ref, dest)
+  })
+  v2 <- data.frame(package = "pkgA", latest_version = "1.1", stringsAsFactors = FALSE)
+  logged <- capture.output(
+    m <- run_update(.fake_io(v2, version_map = list(pkgA = c("1.0", "1.1"))),
+                    out_dir, shard_size = 10L))
+
+  expect_identical(m$shard_failures$packages, "pkgA")
+  expect_true(any(grepl("FAIL pkgA: extract failed", logged, fixed = TRUE)))
+  expect_true(any(grepl("git archive of 1.1 exited 128", logged, fixed = TRUE)))
+  expect_identical(.package_rows(out_dir, "pkgA"), before)
+})
+
+# ---------------------------------------------------------------------------
+# An analyzer line that does not parse fails the package and changes nothing
+# ---------------------------------------------------------------------------
+
+# A stub analyzer that reads every version and, on `bad_version`, also prints
+# a line that is not JSON.
+.stub_bad_line_bin <- function(dir, bad_version) {
+  stub <- file.path(dir, "stub-bad-line.sh")
+  writeLines(c(
+    "#!/bin/sh",
+    'if [ "$1" = "--version" ]; then echo "rpkg-analyzer 0.4.0-test"; exit 0; fi',
+    'dir=$(echo "$1" | tr -d "\'")',
+    'v=$(sed -n "s/^Version: *//p" "$dir/DESCRIPTION" | head -1)',
+    'echo "{\\"rec\\":\\"summary\\",\\"loc_r\\":1,\\"n_fns_r\\":1}"',
+    sprintf('if [ "$v" = "%s" ]; then echo "{\\"rec\\":\\"function\\",\\"name\\":"; fi', bad_version),
+    "exit 0"), stub)
+  Sys.chmod(stub, mode = "0755")
+  stub
+}
+
+test_that("analyze_package fails with analyzer_parse_incomplete on a line that does not parse", {
+  skip_on_os("windows")
+  repo <- tempfile("ccm_pi_")
+  on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
+  .make_fake_clone("pkgP", repo, versions = c("1.0", "1.1"))
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_bad_line_bin(withr::local_tempdir(), "1.1"))
+  err <- tryCatch(analyze_package(repo, "pkgP"), error = function(e) e)
+  expect_s3_class(err, "analyzer_parse_incomplete")
+  expect_identical(err$n_bad, 1L)
+})
+
+test_that("an analyzer line that does not parse leaves stored rows and read attempts as they were", {
+  skip_on_os("windows")
+  out_dir <- tempfile(); dir.create(out_dir)
+  on.exit(unlink(out_dir, recursive = TRUE, force = TRUE), add = TRUE)
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_bad_line_bin(withr::local_tempdir(), "1.1"))
+
+  v1 <- data.frame(package = "pkgA", latest_version = "1.0", stringsAsFactors = FALSE)
+  run_update(.fake_io(v1, version_map = list(pkgA = "1.0")), out_dir, shard_size = 10L)
+  before <- .package_rows(out_dir, "pkgA")
+  expect_gt(nrow(before[[paste(DB_FILENAME, SUMMARY_TABLE)]]), 0L)
+
+  v2 <- data.frame(package = "pkgA", latest_version = "1.1", stringsAsFactors = FALSE)
+  m <- run_update(.fake_io(v2, version_map = list(pkgA = c("1.0", "1.1"))),
+                  out_dir, shard_size = 10L)
+
+  expect_identical(m$shard_failures$packages, "pkgA")
+  expect_identical(.package_rows(out_dir, "pkgA"), before)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out_dir, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(nrow(DBI::dbGetQuery(con,
+    "SELECT * FROM cran_analyzer_read_attempts WHERE package = 'pkgA'")), 0L)
+})
+
+# ---------------------------------------------------------------------------
+# A cap swallowed in analyze_package's per-version steps is evaluated again
+# ---------------------------------------------------------------------------
+
+test_that("a cap in a per-version step of analyze_package changes nothing it returns", {
+  repo <- tempfile("ccm_capsteps_")
+  on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
+  .make_fake_clone("pkgCap", repo, versions = c("1.0", "1.1"))
+  dir.create(file.path(repo, "vignettes"))
+  writeLines(c("---", "title: Intro", "vignette: >",
+               "  %\\VignetteEngine{knitr::rmarkdown}", "---", "Text."),
+             file.path(repo, "vignettes", "intro.Rmd"))
+  writeLines('old <- function() .Deprecated("hello")', file.path(repo, "R", "old.R"))
+  system2("git", c("-C", repo, "add", "-A"), stdout = FALSE, stderr = FALSE)
+  system2("git", c("-C", repo, "commit", "-m", "extras"), stdout = FALSE, stderr = FALSE)
+  system2("git", c("-C", repo, "tag", "-f", "1.1"), stdout = FALSE, stderr = FALSE)
+
+  metrics <- structure(list(loc_r = 1L),
+                       functions = .empty_functions_df()[, -(1:2), drop = FALSE],
+                       edges     = .empty_edges_df()[, -(1:2), drop = FALSE],
+                       datasets  = .datasets_frame(list()))
+  .local_global("analyze_with_binary", function(dir, kind = ANALYZER_INPUT_KIND) metrics)
+  # read_at is the clock at each reading, so it differs between any two runs.
+  analyse <- function() {
+    res <- analyze_package(repo, "pkgCap")
+    res$text$versions$read_at <- NULL
+    res
+  }
+  want <- analyse()
+  expect_gt(nrow(want$vignettes), 0L)
+
+  at_1.1 <- function(ctx) identical(ctx$version, "1.1")
+  .local_global("metrics_vignettes", .fires_cap_once(metrics_vignettes, when = at_1.1))
+  .local_global("deprecation_signals", .fires_cap_once(deprecation_signals, when = at_1.1))
+  .local_global("parse_namespace", .fires_cap_once(parse_namespace))
+  expect_identical(analyse(), want)
+})

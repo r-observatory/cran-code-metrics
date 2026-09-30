@@ -189,7 +189,7 @@ metrics_vignettes <- function(ctx) {
              else trimws(builder)
 
   rows <- lapply(files, function(f) {
-    txt <- tryCatch(ctx$read(f), error = function(e) "")
+    txt <- .retry_after_time_limit(ctx$read(f), error = function(e) "")
     txt <- txt %||% ""
     auth <- .vignette_authors(txt)
     engine <- .vignette_engine_declared(txt)

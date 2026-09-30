@@ -73,7 +73,7 @@ analyze_version <- function(ctx) {
   result <- list()
   for (nm in names(METRIC_GROUPS)) {
     fn <- METRIC_GROUPS[[nm]]
-    group_out <- tryCatch(
+    group_out <- .retry_after_time_limit(
       fn(ctx),
       error = function(e) {
         warning(sprintf(
@@ -173,8 +173,8 @@ deprecation_signals <- function(ctx) {
 # Classify the bump type between two consecutive version strings.
 # Returns one of "major", "minor", "patch", "other".
 .xv_classify_bump <- function(prev, curr) {
-  pv <- tryCatch(.xv_parse_ver(prev), error = function(e) rep(NA_integer_, 3L))
-  cv <- tryCatch(.xv_parse_ver(curr), error = function(e) rep(NA_integer_, 3L))
+  pv <- .retry_after_time_limit(.xv_parse_ver(prev), error = function(e) rep(NA_integer_, 3L))
+  cv <- .retry_after_time_limit(.xv_parse_ver(curr), error = function(e) rep(NA_integer_, 3L))
   if (any(is.na(pv)) || any(is.na(cv))) return("other")
   if (cv[1L] > pv[1L]) return("major")
   if (cv[2L] > pv[2L]) return("minor")
@@ -187,7 +187,7 @@ deprecation_signals <- function(ctx) {
 .xv_json_to_chr <- function(json_str) {
   if (is.null(json_str) || length(json_str) == 0L) return(character(0L))
   if (is.na(json_str)   || !nzchar(json_str))       return(character(0L))
-  tryCatch(
+  .retry_after_time_limit(
     as.character(jsonlite::fromJSON(json_str, simplifyVector = TRUE)),
     error = function(e) character(0L)
   )
@@ -229,7 +229,7 @@ deprecation_signals <- function(ctx) {
                      stringsAsFactors = FALSE)
   if (is.null(json_str) || length(json_str) == 0L) return(none)
   if (is.na(json_str)   || !nzchar(json_str))       return(none)
-  parsed <- tryCatch(
+  parsed <- .retry_after_time_limit(
     jsonlite::fromJSON(json_str, simplifyDataFrame = TRUE, simplifyVector = TRUE),
     error = function(e) NULL
   )
@@ -471,7 +471,7 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series,
   bump_type[1L] <- "initial"
   if (n >= 2L) {
     for (i in 2L:n) {
-      bump_type[i] <- tryCatch(
+      bump_type[i] <- .retry_after_time_limit(
         .xv_classify_bump(versions[i - 1L], versions[i]),
         error = function(e) "other"
       )
@@ -761,10 +761,14 @@ analyze_package <- function(repo_dir, package) {
       dir.create(tmp, recursive = TRUE)
       on.exit(unlink(tmp, recursive = TRUE, force = TRUE), add = TRUE)
 
-      files <- tryCatch(
-        extract_version(repo_dir, ref, tmp),
-        error = function(e) character(0L)
-      )
+      # A version that cannot be extracted fails the whole package, so every
+      # stored row stays as it was. A cap that fires here extracts again into
+      # an emptied directory.
+      files <- .retry_after_time_limit({
+        unlink(list.files(tmp, all.files = TRUE, no.. = TRUE, full.names = TRUE),
+               recursive = TRUE, force = TRUE)
+        extract_version(repo_dir, ref, tmp)
+      }, error = function(e) stop(e))
 
       # Build a read_fn closed over this iteration's extraction directory
       read_fn <- local({
@@ -833,7 +837,7 @@ analyze_package <- function(repo_dir, package) {
                            metrics[["analyzer_version"]])
       }
 
-      dep_sig <- tryCatch(
+      dep_sig <- .retry_after_time_limit(
         deprecation_signals(ctx),
         error = function(e) list(symbols = character(0L), uses_lifecycle = FALSE)
       )
@@ -856,7 +860,8 @@ analyze_package <- function(repo_dir, package) {
       })
 
       # API diff
-      curr_exports <- tryCatch(ctx$namespace$exports, error = function(e) character(0L))
+      curr_exports <- .retry_after_time_limit(ctx$namespace$exports,
+                                              error = function(e) character(0L))
       curr_exports <- curr_exports %||% character(0L)
       added_exp    <- setdiff(curr_exports, prev_exports %||% character(0L))
       removed_exp  <- setdiff(prev_exports %||% character(0L), curr_exports)
@@ -925,7 +930,8 @@ analyze_package <- function(repo_dir, package) {
       # One row per vignette this version ships, read from the same extracted
       # source everything else here comes from. is_current marks the latest so a
       # reader can ask what the package ships now without a subquery.
-      vg <- tryCatch(metrics_vignettes(ctx), error = function(e) .empty_vignettes_df())
+      vg <- .retry_after_time_limit(metrics_vignettes(ctx),
+                                    error = function(e) .empty_vignettes_df())
       vignettes_row <- if (nrow(vg) > 0L) {
         cbind(package = package, version = v, is_current = as.integer(is_latest),
               vg, stringsAsFactors = FALSE)

@@ -1779,8 +1779,9 @@ upsert_datasets <- function(data_con, datasets_df, pkgs) {
 #' @param stat_cols   Character vector of numeric columns to summarise.
 #' @param bootstrap   list(n_analyzed, n_universe, n_remaining,
 #'   bootstrap_complete, n_datasets_unscanned, n_datasets_unreadable,
-#'   n_datasets_unmeasured). n_universe/n_remaining and the three dataset
-#'   counts may be NULL, in which case they are left out.
+#'   n_datasets_unmeasured, analyzer_version, output_class,
+#'   n_latest_on_build). n_universe/n_remaining, the three dataset counts and
+#'   the three analyzer fields may be NULL, in which case they are left out.
 #' @param coverage    Optional frame from dataset_column_coverage(). When given,
 #'   the manifest carries how many declared columns hold nothing for anybody,
 #'   so the finding outlives the run that made it. NULL leaves the block out,
@@ -1886,7 +1887,12 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
       # beside it in this same file is its denominator. It is here rather than
       # only in a line the shard prints because that line scrolls away with the
       # run, and a shard where this number jumps is the one worth seeing.
-      n_datasets_unmeasured = bootstrap$n_datasets_unmeasured
+      n_datasets_unmeasured = bootstrap$n_datasets_unmeasured,
+      # The build that ran, the builds counted as it, and how many latest rows
+      # they wrote: a rescan's progress.
+      analyzer_version  = bootstrap$analyzer_version,
+      output_class      = bootstrap$output_class,
+      n_latest_on_build = bootstrap$n_latest_on_build
     )
   )
 

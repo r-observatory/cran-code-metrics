@@ -161,6 +161,25 @@ VACUUM_DISK_FACTOR <- 2
   if (is.null(a) || length(a) == 0L || (length(a) == 1L && is.na(a))) b else a
 }
 
+# The message R raises when the elapsed limit set by setTimeLimit fires.
+.time_limit_msg <- function() gettext("reached elapsed time limit", domain = "R")
+
+.is_time_limit <- function(e) {
+  grepl(.time_limit_msg(), conditionMessage(e), fixed = TRUE)
+}
+
+# tryCatch(expr, error = error), except that the elapsed limit firing inside
+# expr evaluates expr once more. R clears the limit when it fires, so a handler
+# that swallowed it would store its fallback as data. expr runs in the caller's
+# frame, as it does under tryCatch.
+.retry_after_time_limit <- function(expr, error) {
+  ex  <- substitute(expr)
+  env <- parent.frame()
+  tryCatch(eval(ex, env), error = function(e) {
+    if (.is_time_limit(e)) tryCatch(eval(ex, env), error = error) else error(e)
+  })
+}
+
 # Vignette source files, by the extensions R's registered vignette engines
 # build: Sweave (.Rnw, .Rtex), knitr (.Rmd, .Rhtml, .Rrst, .Rtex), Quarto
 # (.qmd) and litedown (.md). Case-insensitive on the leading R because both

@@ -322,7 +322,6 @@ jobs:
               break
             fi
             [ "$SECONDS" -ge "$BUDGET" ] && { echo "Time budget reached."; break; }
-            [ "$SECONDS" -ge "$BUDGET" ] && { echo "Time budget reached."; break; }
           done
 
       - name: Prune old dated releases

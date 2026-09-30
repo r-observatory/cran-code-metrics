@@ -16,9 +16,9 @@ the ordered version series.
 
 ## Output
 
-`cran-code-metrics.db` (published as a dated `metrics-YYYY-MM-DD` release; a
-release is immutable once a later day's release exists, and old releases are
-pruned on a retention schedule):
+`cran-code-metrics.db` (published as a dated `metrics-YYYY-MM-DD` release; no
+run uploads to a release once a later day's release exists, and old releases
+are kept; see Retention):
 
 - `cran_code_summary` - one row per package version, with the metric columns and
   a per-version release date.
@@ -85,6 +85,14 @@ Moving the rpkg-analyzer pin re-queues every package unless `ANALYZER_SAME_OUTPU
 Each worker gives rpkg-analyzer a directory of its own for the package it analyses, `work/.rpa/<package>`, and removes it when the package is done. `RPKG_ANALYZER_CACHE_DIR` names a cache there, so a compiled file that did not change between versions is parsed once, and `RPKG_ANALYZER_STATS` names a statistics file. Builds before 0.5.1 read neither variable. Set `RPA_CACHE` to `off` (or `false`, `no`, `0`) in the workflow's environment to leave the cache out; the output is the same either way.
 
 Each shard's log carries an `analyzer:` line (versions analysed, seconds, compiled files and the share taken from the cache, cache errors, verify mismatches, incomplete parses) and a `worker time:` line (clone, extract, analyzer, record parse, metrics, other). `run-status.json` keeps the same figures under `analyzer_stats` and `worker_phases`; the published manifests do not carry them.
+
+## Retention
+
+The update workflow's prune step runs on the schedule only. It lists the published `metrics-` releases and passes their tags to `scripts/prune.R` with `KEEP: "all"`, which selects none of them, so the step deletes no published release. The legacy `code-` and `data-` releases are not in that list. After surrounding whitespace is trimmed, `KEEP` takes `all` in any case or a whole number written in digits alone, at most 2147483647, and the step fails on any other value.
+
+Still deleted: drafts of `metrics-` releases from earlier days, `swap-prev-` and `swap-next-` staging assets (other than one that takes back the name of an asset the release has lost), an asset whose upload did not finish (cleared when a run repairs the release it builds on, when a same-day publish replaces an asset, and when the prune step sweeps an earlier release that still carries a staging copy of it), and, on today's release only, an unfinished draft and the other form of each database (compressed or not).
+
+Per-function and call-graph detail (`cran_functions`, `cran_call_edges`) covers each package's latest version only, so an older version's detail lives only in the dated releases published while it was the latest. The per-version summaries are in the newest release. `KEEP=all` stays until a retention rule for these metrics releases is approved on its own.
 
 ## Feedback
 

@@ -71,6 +71,8 @@ is reached. Set `GITHUB_TOKEN` so git fetches are authenticated.
 
 The tests run from the repository root and need R with RSQLite, DBI, jsonlite, digest, testthat and withr, plus bash, jq, zstd, git and sqlite3 on PATH. The release tests in `test-publish.R` skip without bash or jq, and those that read or write a `.zst` skip without zstd. Point `RPKG_ANALYZER_BIN` at an rpkg-analyzer binary (the workflows pin v0.4.0) to run the tests that need a real analyzer; without one they skip. A few tests skip when `rpkg-analyzer` is on PATH, so name the binary through the variable rather than PATH.
 
+`test-record-memo.R` also runs the builds that `RPA_TEST_BIN_040` and `RPA_TEST_BIN_050` name. `test-record-parse-corpus.R` holds the record parse and the dataset memo to the per-line parser over whole corpora of analyzer output when `RPA_PARSE_CORPUS_050` and `RPA_PARSE_CORPUS_040` name them as absolute paths: every `*.ndjson` or `*.ndjson.gz` file below, where the files under `mv/<package>/` are one package's versions in name order. With `RPA_PARSE_CORPUS_REPORT` set it appends one line per corpus, the label, the files read and the files found identical, separated by tabs.
+
 ## Notes
 
 Each package is cloned, analyzed across all its versions, and deleted before the

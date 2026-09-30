@@ -473,7 +473,7 @@ test_that("a package that failed to analyze says why in the run output", {
 .with_binary_returning <- function(value, expr) {
   env <- environment(analyze_package)
   old <- get("analyze_with_binary", envir = env)
-  assign("analyze_with_binary", function(dir) value, envir = env)
+  assign("analyze_with_binary", function(dir, ...) value, envir = env)
   on.exit(assign("analyze_with_binary", old, envir = env), add = TRUE)
   force(expr)
 }
@@ -568,7 +568,7 @@ test_that("a cap during extraction extracts again into an emptied directory", {
   repo <- tempfile("ccm_xc_")
   on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
   .make_fake_clone("pkgX", repo, versions = c("1.0", "1.1"))
-  .local_global("analyze_with_binary", function(dir, kind = ANALYZER_INPUT_KIND) NULL)
+  .local_global("analyze_with_binary", function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL) NULL)
   want <- suppressWarnings(analyze_package(repo, "pkgX"))
 
   real  <- extract_version
@@ -696,7 +696,7 @@ test_that("a cap in a per-version step of analyze_package changes nothing it ret
                        functions = .empty_functions_df()[, -(1:2), drop = FALSE],
                        edges     = .empty_edges_df()[, -(1:2), drop = FALSE],
                        datasets  = .datasets_frame(list()))
-  .local_global("analyze_with_binary", function(dir, kind = ANALYZER_INPUT_KIND) metrics)
+  .local_global("analyze_with_binary", function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL) metrics)
   # read_at is the clock at each reading, so it differs between any two runs.
   analyse <- function() {
     res <- analyze_package(repo, "pkgCap")

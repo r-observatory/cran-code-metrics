@@ -488,3 +488,41 @@ test_that("a package the reader looked at is marked scanned even with nothing to
   expect_true(isTRUE(res$summary$datasets_scanned[last]))
   expect_true(all(is.na(res$summary$datasets_scanned[-last])))
 })
+
+# ---------------------------------------------------------------------------
+# A DESCRIPTION that is not UTF-8
+# ---------------------------------------------------------------------------
+
+test_that("a package with a latin1 DESCRIPTION is analysed and gets its dependency columns", {
+  withr::local_locale(c(LC_CTYPE = "C.UTF-8"))
+  out_dir <- tempfile(); dir.create(out_dir)
+  on.exit(unlink(out_dir, recursive = TRUE, force = TRUE), add = TRUE)
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+
+  latin1_desc <- c(
+    charToRaw("Package: pkgLatin\nVersion: 1.0\nTitle: Latin One\nAuthor: S"),
+    as.raw(0xf8), charToRaw("ren H"), as.raw(0xf8),
+    charToRaw("jsgaard\nMaintainer: S"), as.raw(0xf8),
+    charToRaw("ren <s@example.com>\nImports: stats, utils\nLicense: GPL-2\nEncoding: latin1\n"))
+  io <- list(
+    package_list = function() data.frame(package = "pkgLatin", latest_version = "1.0",
+                                         stringsAsFactors = FALSE),
+    clone = function(pkg, dest) {
+      .make_fake_clone(pkg, dest, versions = "1.0")
+      writeBin(latin1_desc, file.path(dest, "DESCRIPTION"))
+      system2("git", c("-C", dest, "commit", "-q", "-a", "-m", "1.0"),
+              stdout = FALSE, stderr = FALSE)
+      system2("git", c("-C", dest, "tag", "-f", "1.0"), stdout = FALSE, stderr = FALSE)
+      TRUE
+    })
+
+  m <- suppressWarnings(run_update(io, out_dir, shard_size = 10L))
+
+  expect_equal(m$shard_failures$count, 0L)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out_dir, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  row <- DBI::dbGetQuery(con,
+    "SELECT imports FROM cran_code_summary WHERE package = 'pkgLatin'")
+  expect_identical(row$imports, "stats, utils")
+})

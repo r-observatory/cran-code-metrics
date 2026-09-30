@@ -88,7 +88,7 @@ Each shard's log carries an `analyzer:` line (versions analysed, seconds, compil
 
 ## Retention
 
-No dated release or asset is deleted. The update workflow's prune step runs with `KEEP: "all"`, so `scripts/prune.R` selects nothing; only drafts and the `swap-prev-`/`swap-next-` staging copies are cleaned up, and the legacy `code-` and `data-` releases are left as they are. Per-function and per-file detail is latest-version only, so an older version's detail lives only in the dated release where it was the latest. The per-version summaries are in the newest release. `KEEP=all` stays until a retention rule for these metrics releases is approved on its own.
+No dated release is deleted. The update workflow's prune step runs with `KEEP: "all"`, so `scripts/prune.R` selects nothing, and the legacy `code-` and `data-` releases are left as they are. The only things deleted are drafts, `swap-prev-` and `swap-next-` staging assets, and the assets a same-day publish replaces, which include today's unfinished draft and the other form of the database (compressed or not) on today's release. Half-uploaded assets are cleared by the repair step, not by pruning. Per-function and per-file detail is latest-version only, so an older version's detail lives only in the dated release where it was the latest. The per-version summaries are in the newest release. `KEEP=all` stays until a retention rule for these metrics releases is approved on its own.
 
 ## Feedback
 

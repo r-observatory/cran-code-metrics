@@ -496,3 +496,23 @@ test_that("R_SOURCE_RE takes .R and .r and nothing else under R/", {
   files <- c("R/a.R", "R/b.r", "R/sysdata.rda", "R/notes.md", "man/a.Rd", "README.Rmd")
   expect_setequal(grep(R_SOURCE_RE, files, value = TRUE), c("R/a.R", "R/b.r"))
 })
+
+# ---------------------------------------------------------------------------
+# A cap swallowed midway through the Makevars scan
+# ---------------------------------------------------------------------------
+
+test_that("a cap midway through the Makevars scan gives the flags a clean scan gives", {
+  map <- list(
+    "DESCRIPTION"      = "Package: p\nVersion: 1.0\n",
+    "src/Makevars"     = "CXX_STD = CXX17\nPKG_CXXFLAGS = -O3 -I/usr/local/include\n",
+    "src/Makevars.win" = "PKG_CFLAGS = -march=native -O3\n")
+  mk <- function() build_context("p", "1.0", "1.0", "2024-01-01",
+                                 names(map), function(p) map[[p]] %||% "")
+  want <- metrics_portability(mk())
+  ctx <- mk()
+  # The first file's flags are already collected when the second read fires.
+  ctx$lines <- .fires_cap_once(ctx$lines,
+                               when = function(p) identical(p, "src/Makevars.win"))
+  expect_identical(metrics_portability(ctx), want)
+  expect_identical(want$nonportable_compiler_flags, 3L)
+})

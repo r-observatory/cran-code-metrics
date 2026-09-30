@@ -28,7 +28,7 @@ metrics_portability <- function(ctx) {
   # -------------------------------------------------------------------------
   # system_requirements_count
   # -------------------------------------------------------------------------
-  system_requirements_count <- tryCatch({
+  system_requirements_count <- .retry_after_time_limit({
     sr <- ctx$desc[["SystemRequirements"]]
     if (is.null(sr) || !nzchar(trimws(sr %||% ""))) {
       NA_integer_
@@ -49,7 +49,7 @@ metrics_portability <- function(ctx) {
   cxx_standard_required <- NA_character_
   found_flags           <- character(0L)
 
-  tryCatch({
+  .retry_after_time_limit({
     for (mf in makevars_files) {
       lns <- ctx$lines(mf)
       for (ln in lns) {
@@ -92,7 +92,7 @@ metrics_portability <- function(ctx) {
   # -------------------------------------------------------------------------
   # min_r_version
   # -------------------------------------------------------------------------
-  min_r_version <- tryCatch({
+  min_r_version <- .retry_after_time_limit({
     dep <- ctx$desc[["Depends"]]
     if (is.null(dep) || !nzchar(trimws(dep %||% ""))) {
       NA_character_
@@ -124,7 +124,7 @@ metrics_portability <- function(ctx) {
   # table cannot disagree about whether a package ships vignettes. Computing it
   # twice from two patterns is how the .qmd gap survived: one place was fixed
   # and the other was not.
-  vig_rows      <- tryCatch(metrics_vignettes(ctx), error = function(e) NULL)
+  vig_rows      <- .retry_after_time_limit(metrics_vignettes(ctx), error = function(e) NULL)
   n_vignettes   <- if (is.null(vig_rows)) NA_integer_ else nrow(vig_rows)
   has_vignettes <- if (is.na(n_vignettes)) NA else n_vignettes > 0L
   vig_files     <- ctx$find(VIGNETTE_SOURCE_RE)
@@ -139,7 +139,7 @@ metrics_portability <- function(ctx) {
   # -------------------------------------------------------------------------
   # vignette_dynamic
   # -------------------------------------------------------------------------
-  vignette_dynamic <- tryCatch({
+  vignette_dynamic <- .retry_after_time_limit({
     if (!has_vignettes) {
       NA
     } else {

@@ -228,3 +228,19 @@ test_that("the count and the boolean come from the same rows", {
   expect_equal(metrics_portability(none)$n_vignettes, 0L)
   expect_false(metrics_portability(none)$has_vignettes)
 })
+
+test_that("a cap while reading one vignette reads it again", {
+  map <- list(
+    "DESCRIPTION"         = "Package: p\nVersion: 1.0\nVignetteBuilder: knitr\n",
+    "vignettes/intro.Rmd" = paste0(
+      "---\ntitle: \"Intro\"\nauthor: \"Ann Author\"\nvignette: >\n",
+      "  %\\VignetteEngine{knitr::rmarkdown}\n---\n```{r}\n1\n```\n"))
+  mk <- function() build_context("p", "1.0", "1.0", "2024-01-01",
+                                 names(map), function(p) map[[p]] %||% "")
+  want <- metrics_vignettes(mk())
+  ctx <- mk()
+  ctx$read <- .fires_cap_once(ctx$read,
+                              when = function(p) identical(p, "vignettes/intro.Rmd"))
+  expect_identical(metrics_vignettes(ctx), want)
+  expect_identical(want$title, "Intro")
+})

@@ -1249,3 +1249,68 @@ test_that("preflight.R logs a mixed pair, records it, and lets the run go on", {
   expect_true(check$text_code_mismatch)
   expect_identical(check$code_tag, "metrics-2026-08-14")
 })
+
+# ---------------------------------------------------------------------------
+# Failure verdicts and the ceiling
+# ---------------------------------------------------------------------------
+
+test_that("the standing failures warning says how many are parked, by class", {
+  cur <- .code_manifest_0814()
+  cur$tables$cran_metrics_failures <- 200L
+  cur$bootstrap$parked <- list(fetch = 20L, analyze = 3L, timeout = 7L, legacy = 150L)
+  w <- retention_warnings("code", cur)
+  expect_true(any(grepl("parked until the analyzer build or their release changes",
+                        w, fixed = TRUE)))
+  expect_true(any(grepl("(parked: fetch 20, analyze 3, timeout 7)", w, fixed = TRUE)))
+
+  # A manifest from before verdicts had classes keeps the warning, without a breakdown.
+  cur$bootstrap$parked <- NULL
+  w <- retention_warnings("code", cur)
+  expect_true(any(grepl("cran_metrics_failures holds 200 packages", w, fixed = TRUE)))
+  expect_false(any(grepl("(parked:", w, fixed = TRUE)))
+})
+
+test_that("releasing 204 legacy verdicts and re-failing 30 of them adds no rows", {
+  env <- environment(run_update)
+  old <- get("analyze_package", envir = env)
+  pkgs <- sprintf("p%03d", seq_len(204L))
+  failing <- pkgs[seq_len(30L)]
+  assign("analyze_package", function(dest, pkg) list(
+    summary = data.frame(package = pkg, version = "1.0", loc_r = 1L, n_fns_r = 1L,
+                         latest_release_date = "2026-01-01", datasets_scanned = 1L,
+                         detail_scanned = 1L, stringsAsFactors = FALSE),
+    churn = NULL, api = NULL, functions = NULL, edges = NULL, datasets = NULL),
+    envir = env)
+  on.exit(assign("analyze_package", old, envir = env), add = TRUE)
+  withr::local_envvar(c(PREV_CODE_TAG = "", PREV_DATA_TAG = "", PREV_TEXT_TAG = ""))
+  .local_global("WORK_DIR", withr::local_tempdir())
+  .local_global("ANALYSIS_CORES", 1L)
+
+  out <- withr::local_tempdir()
+  con <- open_or_init_db(file.path(out, DB_FILENAME))
+  DBI::dbWriteTable(con, "cran_metrics_failures", append = TRUE,
+                    data.frame(package = pkgs, consecutive_failures = 5L,
+                               last_attempt = "2026-08-01T00:00:00Z"))
+  DBI::dbDisconnect(con)
+  write_manifest(file.path(out, "prev-code-manifest.json"), list(
+    schema_version = 1L, series = "code", fingerprint = strrep("e", 64L),
+    tables = list(cran_metrics_failures = 204L)))
+
+  io <- list(
+    package_list = function() data.frame(package = pkgs, latest_version = "1.0",
+                                         stringsAsFactors = FALSE),
+    clone = function(pkg, dest) {
+      if (pkg %in% failing) return(structure(FALSE, status = 128L))
+      dir.create(dest, showWarnings = FALSE)
+      TRUE
+    })
+  m <- suppressWarnings(run_update(io, out, shard_size = 400L))
+
+  expect_identical(m$n_shard, 204L)
+  expect_identical(.ret_published_failures(out), 30)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n, SUM(stage = 'clone') c FROM cran_metrics_failures"),
+    data.frame(n = 30L, c = 30L))
+})

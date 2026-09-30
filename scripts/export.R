@@ -1392,13 +1392,39 @@ open_or_init_data_db <- function(path) {
   invisible(NULL)
 }
 
+# The columns a failure verdict adds to cran_metrics_failures, with their types.
+.FAILURE_VERDICT_COLUMNS <- c(
+  stage            = "TEXT",
+  analyzer_version = "TEXT",
+  worker_timeout   = "INTEGER",
+  fetch_failures   = "INTEGER NOT NULL DEFAULT 0",
+  fetch_version    = "TEXT",
+  analyze_failures = "INTEGER NOT NULL DEFAULT 0",
+  timeout_failures = "INTEGER NOT NULL DEFAULT 0",
+  last_run_id      = "TEXT",
+  elapsed_s        = "REAL",
+  reason           = "TEXT",
+  unparked_at      = "TEXT")
+
+# Give a failures table from an older release the verdict columns. Its rows
+# keep stage NULL, which is how the parking query knows to leave them free.
+.migrate_failure_columns <- function(con) {
+  have <- DBI::dbListFields(con, "cran_metrics_failures")
+  for (col in setdiff(names(.FAILURE_VERDICT_COLUMNS), have)) {
+    DBI::dbExecute(con, sprintf("ALTER TABLE cran_metrics_failures ADD COLUMN %s %s",
+                                col, .FAILURE_VERDICT_COLUMNS[[col]]))
+  }
+  invisible(NULL)
+}
+
 #' Open (or create) the pipeline SQLite database.
 #'
-#' If the file does not yet exist it is created. The four non-summary tables
+#' If the file does not yet exist it is created. The five non-summary tables
 #' (cran_code_churn, cran_api_history, cran_metrics_failures,
-#' cran_analyzer_read_attempts) are created with fixed schemas and indexes on
-#' first open, so a database downloaded from an older release gains the ones it
-#' does not have yet. cran_code_summary is created lazily by upsert_shard the
+#' cran_analyzer_read_attempts, cran_over_cap) are created with fixed schemas
+#' and indexes on first open, so a database downloaded from an older release
+#' gains the ones it does not have yet, and its failures table gains the
+#' verdict columns. cran_code_summary is created lazily by upsert_shard the
 #' first time data is written (its schema is dynamic).
 #'
 #' @param path File path for the SQLite database.
@@ -1431,11 +1457,28 @@ open_or_init_db <- function(path) {
   }
 
   if (!"cran_metrics_failures" %in% tables) {
-    DBI::dbExecute(con, "
+    DBI::dbExecute(con, sprintf("
       CREATE TABLE cran_metrics_failures (
         package              TEXT PRIMARY KEY,
         consecutive_failures INTEGER NOT NULL DEFAULT 0,
-        last_attempt         TEXT
+        last_attempt         TEXT,
+        %s
+      )", paste(names(.FAILURE_VERDICT_COLUMNS), .FAILURE_VERDICT_COLUMNS,
+                collapse = ",\n        ")))
+  } else {
+    .migrate_failure_columns(con)
+  }
+
+  # Packages whose last passing analysis ran past WORKER_TIMEOUT: the cap fired
+  # somewhere and the rest ran uncapped, so they wait for a cap that holds.
+  if (!"cran_over_cap" %in% tables) {
+    DBI::dbExecute(con, "
+      CREATE TABLE cran_over_cap (
+        package          TEXT PRIMARY KEY,
+        elapsed_s        REAL,
+        analyzer_version TEXT,
+        last_run_id      TEXT,
+        recorded_at      TEXT
       )")
   }
 
@@ -1895,6 +1938,14 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
       n_latest_on_build = bootstrap$n_latest_on_build
     )
   )
+
+  # The code series also carries the failure verdicts: parked by class, the
+  # packages failed this run, and the over-cap list.
+  if (identical(series, "code")) {
+    extra <- bootstrap[intersect(c("parked", "failed_this_run", "over_cap_ok",
+                                   "over_cap_this_run"), names(bootstrap))]
+    out$bootstrap <- c(out$bootstrap, Filter(Negate(is.null), extra))
+  }
 
   # The names are capped and the count is not. A reader chasing this wants the
   # number first, and enough names to start looking; the full list is a query
@@ -2631,6 +2682,21 @@ format_bytes <- function(n) {
   if (length(cur) == 0L) NULL else cur
 }
 
+# " (clone 1, timeout 2)" from a stage-to-count list, or "" without one.
+.stage_clause <- function(by_stage) {
+  if (!is.list(by_stage) || length(by_stage) == 0L) return("")
+  sprintf(" (%s)", paste(names(by_stage), unlist(by_stage), collapse = ", "))
+}
+
+# "; 30 are parked until ..." from the manifest's parked counts, or "" without them.
+.parked_clause <- function(parked) {
+  if (!is.list(parked)) return("")
+  n <- sum(vapply(c("fetch", "analyze", "timeout"),
+                  function(k) as.numeric(parked[[k]] %||% 0), numeric(1L)))
+  sprintf("; %s %s parked until the analyzer build or the release changes, or an operator releases them",
+          .fmt_n(n), if (n == 1) "is" else "are")
+}
+
 #' Build the one-paragraph headline: new/updated counts, catalog size, and
 #' the bootstrap clause.
 #'
@@ -2690,9 +2756,10 @@ format_bytes <- function(n) {
   # number is comparable run to run.
   n_fail <- suppressWarnings(as.numeric(.manifest_at(run_status, "shard_failures") %||% 0))
   fail_line <- if (length(n_fail) == 1L && !is.na(n_fail) && n_fail > 0) {
-    sprintf(
-      "%s of the %s packages in the most recent shard failed to analyze and are retried until %d consecutive failures retire them.",
-      .fmt_n(n_fail), .fmt_n(.manifest_at(run_status, "n_shard")), MAX_CLONE_FAILURES)
+    sprintf("%s of the %s packages in the most recent shard failed to analyze%s%s.",
+            .fmt_n(n_fail), .fmt_n(.manifest_at(run_status, "n_shard")),
+            .stage_clause(.manifest_at(run_status, "failed_by_stage")),
+            .parked_clause(.manifest_at(code_manifest, "bootstrap", "parked")))
   } else {
     character(0L)
   }

@@ -37,6 +37,15 @@ MAX_ANALYZER_READ_ATTEMPTS <- 2L
 # alone, so leaving one out costs a rescan and never skips one.
 ANALYZER_SAME_OUTPUT <- c("0.4.0")
 
+# Timeouts, crashes and git timeouts a package may take under one analyzer
+# build and one WORKER_TIMEOUT before it is parked. Each costs a worker at
+# least WORKER_TIMEOUT, and three in three runs is not one slow runner.
+MAX_TIMEOUT_FAILURES <- 3L
+
+# Days after which a fetch-parked package with no stored rows is tried once
+# more, for a mirror that lagged or a repository that appeared later.
+FETCH_RECHECK_DAYS <- 7L
+
 # Release notes: what GitHub refuses, and how much of it we allow ourselves.
 #
 # GitHub rejects a release body over 125,000 characters. The workflow publishes

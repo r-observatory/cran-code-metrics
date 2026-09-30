@@ -334,6 +334,25 @@ test_that("package hitting MAX_CLONE_FAILURES is excluded from todo and counted 
   expect_equal(m_final$shard_failures$count, 0L)
 })
 
+test_that("the MAX_CLONE_FAILURES path parks the same way when Actions sets GITHUB_RUN_ID", {
+  # Actions sets GITHUB_RUN_ID in the unit-test step too; a run id read from it
+  # would skip pkgFail on calls 2 to 5 in CI only.
+  withr::local_envvar(c(GITHUB_RUN_ID = "ci"))
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_analyzer_bin(
+    withr::local_tempdir(), "0.4.0-test", reads = "1.0"))
+  out_dir <- withr::local_tempdir()
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  pkg_df <- data.frame(package = c("pkgFail", "pkgOk"), latest_version = c("1.0", "1.0"),
+                       stringsAsFactors = FALSE)
+  io_mixed <- .fake_io(pkg_df, fail_clones = "pkgFail")
+  for (i in seq_len(MAX_CLONE_FAILURES)) run_update(io_mixed, out_dir, shard_size = 10L)
+  m_final <- run_update(io_mixed, out_dir, shard_size = 10L)
+  expect_equal(m_final$permanent_failures, 1L)
+  expect_equal(m_final$n_shard, 0L)
+  expect_equal(m_final$shard_failures$count, 0L)
+})
+
 # ---------------------------------------------------------------------------
 # Test 6: transient failure followed by success resets the failure counter
 # ---------------------------------------------------------------------------
@@ -382,7 +401,7 @@ test_that("transient failure that later succeeds resets the failure counter", {
 test_that(".worker_line carries the reason a package failed", {
   line <- .worker_line(3L, 400L, FALSE, "pkgX", "analyze", 0L, 12.34,
                        "cannot open file 'DESCRIPTION'")
-  expect_true(grepl("[3/400] FAIL pkgX: analyze failed in 12.3s", line, fixed = TRUE))
+  expect_true(grepl("[3/400] FAIL pkgX: analyze after 12.3s", line, fixed = TRUE))
   expect_true(grepl("cannot open file 'DESCRIPTION'", line, fixed = TRUE))
   # One write, one line: two would let another fork's output land between them.
   expect_identical(nchar(gsub("[^\n]", "", line)), 1L)
@@ -595,7 +614,7 @@ test_that("a version that cannot be extracted leaves the package's stored rows a
                     out_dir, shard_size = 10L))
 
   expect_identical(m$shard_failures$packages, "pkgA")
-  expect_true(any(grepl("FAIL pkgA: extract failed", logged, fixed = TRUE)))
+  expect_true(any(grepl("FAIL pkgA: extract after", logged, fixed = TRUE)))
   expect_true(any(grepl("git archive of 1.1 exited 128", logged, fixed = TRUE)))
   expect_identical(.package_rows(out_dir, "pkgA"), before)
 })
@@ -692,4 +711,101 @@ test_that("a cap in a per-version step of analyze_package changes nothing it ret
   .local_global("deprecation_signals", .fires_cap_once(deprecation_signals, when = at_1.1))
   .local_global("parse_namespace", .fires_cap_once(parse_namespace))
   expect_identical(analyse(), want)
+})
+
+# ---------------------------------------------------------------------------
+# A git killed at GIT_TIMEOUT is a timeout, not a fetch failure
+# ---------------------------------------------------------------------------
+
+# Put a git in front of PATH that exits 124 on `archive`, as system2 reports a
+# kill at GIT_TIMEOUT, and runs the real git for everything else.
+.local_git_archive_124 <- function(frame = parent.frame()) {
+  dir  <- withr::local_tempdir(.local_envir = frame)
+  real <- Sys.which("git")
+  writeLines(c("#!/bin/sh",
+               'for a in "$@"; do [ "$a" = archive ] && exit 124; done',
+               sprintf('exec %s "$@"', shQuote(real))), file.path(dir, "git"))
+  Sys.chmod(file.path(dir, "git"), mode = "0755")
+  withr::local_envvar(PATH = paste(dir, Sys.getenv("PATH"), sep = .Platform$path.sep),
+                      .local_envir = frame)
+}
+
+test_that("an archive killed at GIT_TIMEOUT parks as a timeout and is released by a new build", {
+  skip_on_os("windows")
+  out_dir <- withr::local_tempdir()
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  stub_dir <- withr::local_tempdir()
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_analyzer_bin(stub_dir, "0.4.0-test",
+                                                             reads = "1.0"))
+  .local_git_archive_124()
+  io <- .fake_io(data.frame(package = "pkgT", latest_version = "1.0",
+                            stringsAsFactors = FALSE))
+  failures <- function() {
+    con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out_dir, DB_FILENAME))
+    on.exit(DBI::dbDisconnect(con))
+    DBI::dbGetQuery(con, "SELECT stage, fetch_failures, timeout_failures
+                            FROM cran_metrics_failures WHERE package = 'pkgT'")
+  }
+
+  for (i in seq_len(MAX_TIMEOUT_FAILURES)) run_update(io, out_dir, shard_size = 10L)
+  expect_identical(failures(), data.frame(stage = "git_timeout", fetch_failures = 0L,
+                                          timeout_failures = MAX_TIMEOUT_FAILURES,
+                                          stringsAsFactors = FALSE))
+  expect_identical(run_update(io, out_dir, shard_size = 10L)$n_shard, 0L)
+
+  .stub_analyzer_bin(stub_dir, "0.4.1-test", reads = "1.0")
+  expect_identical(run_update(io, out_dir, shard_size = 10L)$n_shard, 1L)
+  expect_identical(failures()$timeout_failures, 1L)
+})
+
+# ---------------------------------------------------------------------------
+# The shard loop ends although a package failed this run
+# ---------------------------------------------------------------------------
+
+# The workflow's loop: run_update as the shard, then shard_loop_done read
+# through bash, as update.yml runs them. Returns each shard's run status.
+.run_shard_loop <- function(io, out_dir, max_shards = 10L) {
+  script <- normalizePath(test_path("..", "..", "scripts", "publish.sh"))
+  status_path <- file.path(out_dir, "run-status.json")
+  statuses <- list()
+  for (i in seq_len(max_shards)) {
+    run_update(io, out_dir, shard_size = 2L)
+    statuses[[i]] <- jsonlite::read_json(status_path)
+    rc <- system2("bash", c("-c", shQuote(sprintf("source %s && shard_loop_done %s",
+                                                  shQuote(script), shQuote(status_path)))),
+                  stdout = FALSE, stderr = FALSE)
+    if (identical(rc, 0L)) break
+  }
+  statuses
+}
+
+test_that("the shard loop stops at the shard that drains its queue and publishes no empty shard", {
+  skip_on_os("windows")
+  skip_if(!nzchar(Sys.which("jq")), "jq is not installed")
+  withr::local_envvar(c(PIPELINE_RUN_ID = "r1", PREV_CODE_TAG = "", PREV_DATA_TAG = "",
+                        PREV_TEXT_TAG = ""))
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_analyzer_bin(
+    withr::local_tempdir(), "0.4.0-test", reads = "1.0"))
+  out_dir <- withr::local_tempdir()
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  pkgs <- c("pkgA", "pkgB", "pkgC", "pkgD", "pkgE", "pkgF")
+  io <- .fake_io(data.frame(package = pkgs, latest_version = rep("1.0", 6L),
+                            stringsAsFactors = FALSE), fail_clones = "pkgC")
+  # A baseline whose fingerprint the first shard moves, so every later shard of
+  # the run reads as changed against it.
+  write_manifest(file.path(out_dir, "prev-code-manifest.json"),
+                 list(schema_version = 1L, series = "code", fingerprint = strrep("0", 64L)))
+
+  statuses <- .run_shard_loop(io, out_dir)
+
+  expect_lte(length(statuses), 3L)
+  published <- Filter(function(s) isTRUE(s$changed), statuses)
+  expect_true(all(vapply(published, function(s) s$n_shard > 0L, logical(1L))))
+  expect_false(statuses[[length(statuses)]]$bootstrap_complete)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out_dir, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(DBI::dbGetQuery(con,
+    "SELECT consecutive_failures FROM cran_metrics_failures WHERE package = 'pkgC'")[[1L]], 1L)
 })

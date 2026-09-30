@@ -267,3 +267,37 @@ test_that("render_notes treats an absent seed-packages.txt as an empty seed set"
   expect_true(any(grepl("^2 packages new to the catalog, 0 updated\\.", code_md)))
   expect_true(any(grepl("data\\.table \\| 1\\.15\\.0 \\(new\\)", code_md)))
 })
+
+test_that("a shard that only failed says how many by stage and how many are parked", {
+  out <- withr::local_tempdir()
+  .setup_notes_fixture(out, run_status = list(
+    changed = TRUE, bootstrap_complete = FALSE, n_analyzed = 1000L,
+    n_universe = 2000L, n_remaining = 0L, n_fresh = 0L, n_shard = 3L,
+    n_versions = 0L, shard_failures = 3L,
+    failed_by_stage = list(clone = 1L, timeout = 2L)))
+  cm <- jsonlite::read_json(file.path(out, "code-manifest.json"))
+  cm$bootstrap$parked <- list(fetch = 20L, analyze = 3L, timeout = 7L, legacy = 0L)
+  write_manifest(file.path(out, "code-manifest.json"), cm)
+  # A shard that analysed nothing never writes the changed-package file.
+  unlink(file.path(out, "changed-packages.txt"))
+  render_notes(out)
+
+  md <- readLines(file.path(out, "release-notes-code.md"))
+  expect_true(any(md == paste0(
+    "3 of the 3 packages in the most recent shard failed to analyze (clone 1, ",
+    "timeout 2); 30 are parked until the analyzer build or the release changes, ",
+    "or an operator releases them.")))
+  expect_true(any(grepl("^0 packages new to the catalog, 0 updated\\.", md)))
+  expect_true(any(grepl("^No package changes in this release\\.$", md)))
+})
+
+test_that("a failure line from a run status without stages still reads whole", {
+  out <- withr::local_tempdir()
+  .setup_notes_fixture(out, run_status = list(
+    changed = TRUE, bootstrap_complete = FALSE, n_analyzed = 1000L,
+    n_universe = 2000L, n_remaining = 1000L, n_fresh = 2L, n_shard = 400L,
+    n_versions = 2L, shard_failures = 3L))
+  render_notes(out)
+  md <- readLines(file.path(out, "release-notes-code.md"))
+  expect_true(any(md == "3 of the 400 packages in the most recent shard failed to analyze."))
+})

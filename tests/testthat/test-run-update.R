@@ -693,3 +693,49 @@ test_that("a cap in a per-version step of analyze_package changes nothing it ret
   .local_global("parse_namespace", .fires_cap_once(parse_namespace))
   expect_identical(analyse(), want)
 })
+
+# ---------------------------------------------------------------------------
+# A git killed at GIT_TIMEOUT is a timeout, not a fetch failure
+# ---------------------------------------------------------------------------
+
+# Put a git in front of PATH that exits 124 on `archive`, as system2 reports a
+# kill at GIT_TIMEOUT, and runs the real git for everything else.
+.local_git_archive_124 <- function(frame = parent.frame()) {
+  dir  <- withr::local_tempdir(.local_envir = frame)
+  real <- Sys.which("git")
+  writeLines(c("#!/bin/sh",
+               'for a in "$@"; do [ "$a" = archive ] && exit 124; done',
+               sprintf('exec %s "$@"', shQuote(real))), file.path(dir, "git"))
+  Sys.chmod(file.path(dir, "git"), mode = "0755")
+  withr::local_envvar(PATH = paste(dir, Sys.getenv("PATH"), sep = .Platform$path.sep),
+                      .local_envir = frame)
+}
+
+test_that("an archive killed at GIT_TIMEOUT parks as a timeout and is released by a new build", {
+  skip_on_os("windows")
+  out_dir <- withr::local_tempdir()
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  stub_dir <- withr::local_tempdir()
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_analyzer_bin(stub_dir, "0.4.0-test",
+                                                             reads = "1.0"))
+  .local_git_archive_124()
+  io <- .fake_io(data.frame(package = "pkgT", latest_version = "1.0",
+                            stringsAsFactors = FALSE))
+  failures <- function() {
+    con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out_dir, DB_FILENAME))
+    on.exit(DBI::dbDisconnect(con))
+    DBI::dbGetQuery(con, "SELECT stage, fetch_failures, timeout_failures
+                            FROM cran_metrics_failures WHERE package = 'pkgT'")
+  }
+
+  for (i in seq_len(MAX_TIMEOUT_FAILURES)) run_update(io, out_dir, shard_size = 10L)
+  expect_identical(failures(), data.frame(stage = "git_timeout", fetch_failures = 0L,
+                                          timeout_failures = MAX_TIMEOUT_FAILURES,
+                                          stringsAsFactors = FALSE))
+  expect_identical(run_update(io, out_dir, shard_size = 10L)$n_shard, 0L)
+
+  .stub_analyzer_bin(stub_dir, "0.4.1-test", reads = "1.0")
+  expect_identical(run_update(io, out_dir, shard_size = 10L)$n_shard, 1L)
+  expect_identical(failures()$timeout_failures, 1L)
+})

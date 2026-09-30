@@ -32,6 +32,11 @@ WORK_DIR           <- "work"
 # as the reader it was measured against.
 MAX_ANALYZER_READ_ATTEMPTS <- 2L
 
+# Builds whose output the pinned build reproduces record for record, as the
+# analyzer gate report quoted in the pin PR shows. A build not listed stands
+# alone, so leaving one out costs a rescan and never skips one.
+ANALYZER_SAME_OUTPUT <- c("0.4.0")
+
 # Release notes: what GitHub refuses, and how much of it we allow ourselves.
 #
 # GitHub rejects a release body over 125,000 characters. The workflow publishes

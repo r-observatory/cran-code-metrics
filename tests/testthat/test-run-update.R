@@ -526,3 +526,76 @@ test_that("a package with a latin1 DESCRIPTION is analysed and gets its dependen
     "SELECT imports FROM cran_code_summary WHERE package = 'pkgLatin'")
   expect_identical(row$imports, "stats, utils")
 })
+
+# ---------------------------------------------------------------------------
+# A version that cannot be extracted fails the package and changes nothing
+# ---------------------------------------------------------------------------
+
+test_that("analyze_package fails as a whole when one version cannot be extracted", {
+  repo <- tempfile("ccm_xf_")
+  on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
+  .make_fake_clone("pkgX", repo, versions = c("1.0", "1.1"))
+  real <- extract_version
+  .local_global("extract_version", function(repo, ref, dest) {
+    if (identical(ref, "1.1")) stop(.extract_failure("archive", ref, 128L, "fatal: bad object"))
+    real(repo, ref, dest)
+  })
+  err <- tryCatch(analyze_package(repo, "pkgX"), error = function(e) e)
+  expect_s3_class(err, "extract_failure")
+  expect_identical(err$ref, "1.1")
+})
+
+test_that("a cap during extraction extracts again into an emptied directory", {
+  repo <- tempfile("ccm_xc_")
+  on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
+  .make_fake_clone("pkgX", repo, versions = c("1.0", "1.1"))
+  .local_global("analyze_with_binary", function(dir, kind = ANALYZER_INPUT_KIND) NULL)
+  want <- suppressWarnings(analyze_package(repo, "pkgX"))
+
+  real  <- extract_version
+  fired <- FALSE
+  .local_global("extract_version", function(repo, ref, dest) {
+    if (!fired && identical(ref, "1.1")) {
+      fired <<- TRUE
+      real(repo, ref, dest)
+      writeLines("leftover <- function() 1", file.path(dest, "R", "leftover.R"))
+      stop(.cap_error())
+    }
+    real(repo, ref, dest)
+  })
+  got <- suppressWarnings(analyze_package(repo, "pkgX"))
+  expect_true(fired)
+  expect_identical(got, want)
+})
+
+test_that("a version that cannot be extracted leaves the package's stored rows as they were", {
+  out_dir <- tempfile(); dir.create(out_dir)
+  on.exit(unlink(out_dir, recursive = TRUE, force = TRUE), add = TRUE)
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  orig_cores <- ANALYSIS_CORES
+  ANALYSIS_CORES <<- 1L
+  on.exit(ANALYSIS_CORES <<- orig_cores, add = TRUE)
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_analyzer_bin(
+    withr::local_tempdir(), "0.4.0-test", reads = c("1.0", "1.1")))
+
+  v1 <- data.frame(package = "pkgA", latest_version = "1.0", stringsAsFactors = FALSE)
+  run_update(.fake_io(v1, version_map = list(pkgA = "1.0")), out_dir, shard_size = 10L)
+  before <- .package_rows(out_dir, "pkgA")
+  expect_gt(nrow(before[[paste(DB_FILENAME, SUMMARY_TABLE)]]), 0L)
+
+  real <- extract_version
+  .local_global("extract_version", function(repo, ref, dest) {
+    if (identical(ref, "1.1")) stop(.extract_failure("archive", ref, 128L, "fatal: bad object"))
+    real(repo, ref, dest)
+  })
+  v2 <- data.frame(package = "pkgA", latest_version = "1.1", stringsAsFactors = FALSE)
+  logged <- capture.output(
+    m <- run_update(.fake_io(v2, version_map = list(pkgA = c("1.0", "1.1"))),
+                    out_dir, shard_size = 10L))
+
+  expect_identical(m$shard_failures$packages, "pkgA")
+  expect_true(any(grepl("FAIL pkgA: extract failed", logged, fixed = TRUE)))
+  expect_true(any(grepl("git archive of 1.1 exited 128", logged, fixed = TRUE)))
+  expect_identical(.package_rows(out_dir, "pkgA"), before)
+})

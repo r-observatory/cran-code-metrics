@@ -803,15 +803,17 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # run was a package name and no cause. It rides out on the same line the
     # failure already prints: one write, on the fd the forks share.
     reason <- NULL
+    stage  <- "analyze"
     res <- tryCatch(
       analyze_package(dest, pkg),
       error = function(e) {
         reason <<- conditionMessage(e)
+        if (inherits(e, "extract_failure")) stage <<- "extract"
         NULL
       }
     )
     if (is.null(res)) {
-      .done(FALSE, "analyze", 0L, reason)
+      .done(FALSE, stage, 0L, reason)
       return(list(package = pkg, ok = FALSE))
     }
     .done(TRUE, "ok", nrow(res$summary))

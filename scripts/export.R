@@ -2682,6 +2682,21 @@ format_bytes <- function(n) {
   if (length(cur) == 0L) NULL else cur
 }
 
+# " (clone 1, timeout 2)" from a stage-to-count list, or "" without one.
+.stage_clause <- function(by_stage) {
+  if (!is.list(by_stage) || length(by_stage) == 0L) return("")
+  sprintf(" (%s)", paste(names(by_stage), unlist(by_stage), collapse = ", "))
+}
+
+# "; 30 are parked until ..." from the manifest's parked counts, or "" without them.
+.parked_clause <- function(parked) {
+  if (!is.list(parked)) return("")
+  n <- sum(vapply(c("fetch", "analyze", "timeout"),
+                  function(k) as.numeric(parked[[k]] %||% 0), numeric(1L)))
+  sprintf("; %s %s parked until the analyzer build or the release changes, or an operator releases them",
+          .fmt_n(n), if (n == 1) "is" else "are")
+}
+
 #' Build the one-paragraph headline: new/updated counts, catalog size, and
 #' the bootstrap clause.
 #'
@@ -2741,9 +2756,10 @@ format_bytes <- function(n) {
   # number is comparable run to run.
   n_fail <- suppressWarnings(as.numeric(.manifest_at(run_status, "shard_failures") %||% 0))
   fail_line <- if (length(n_fail) == 1L && !is.na(n_fail) && n_fail > 0) {
-    sprintf(
-      "%s of the %s packages in the most recent shard failed to analyze and are retried until %d consecutive failures retire them.",
-      .fmt_n(n_fail), .fmt_n(.manifest_at(run_status, "n_shard")), MAX_CLONE_FAILURES)
+    sprintf("%s of the %s packages in the most recent shard failed to analyze%s%s.",
+            .fmt_n(n_fail), .fmt_n(.manifest_at(run_status, "n_shard")),
+            .stage_clause(.manifest_at(run_status, "failed_by_stage")),
+            .parked_clause(.manifest_at(code_manifest, "bootstrap", "parked")))
   } else {
     character(0L)
   }

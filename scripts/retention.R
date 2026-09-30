@@ -296,12 +296,19 @@ retention_warnings <- function(series, current) {
   universe <- .ret_at(current, "bootstrap.n_universe")
   if (!is.null(fails) && !is.null(universe) && universe > 0 &&
       fails >= FAILURE_COUNT_WARN && fails > universe * FAILURE_SHARE_WARN) {
+    # Parked by class, when the manifest is new enough to say.
+    classes <- c("fetch", "analyze", "timeout")
+    parked  <- vapply(classes, function(k) {
+      .ret_at(current, paste0("bootstrap.parked.", k)) %||% NA_real_
+    }, numeric(1L))
+    by_class <- if (anyNA(parked)) "" else
+      sprintf(" (parked: %s)", paste(classes, .ret_fmt(parked), collapse = ", "))
     out <- c(out, sprintf(paste0(
       "cran_metrics_failures holds %s packages, %.2f%% of the %s in the ",
-      "universe: that many packages are failing to clone or to analyse and ",
-      "the ones past %d attempts have been dropped from the queue for good"),
-      .ret_fmt(fails), 100 * fails / universe, .ret_fmt(universe),
-      MAX_CLONE_FAILURES))
+      "universe: that many packages are failing to clone or to analyse, and ",
+      "the ones past their cap are parked until the analyzer build or their ",
+      "release changes, or an operator releases them%s"),
+      .ret_fmt(fails), 100 * fails / universe, .ret_fmt(universe), by_class))
   }
 
   n_ver <- .ret_at(current, "n_versions")
@@ -379,16 +386,18 @@ retention_failure_advice <- function() {
     "reason it failed on one line, and a jump this size is usually one cause ",
     "shared by all of them and upstream of the pipeline (the cran mirror ",
     "refusing clones, the runner losing the network, an analyzer meeting a ",
-    "shape it did not handle before). `SELECT package, consecutive_failures, ",
-    "last_attempt FROM cran_metrics_failures ORDER BY last_attempt DESC` in ",
-    "this run's database lists them.\n",
+    "shape it did not handle before). `SELECT package, stage, reason, ",
+    "consecutive_failures, last_attempt FROM cran_metrics_failures ORDER BY ",
+    "last_attempt DESC` in this run's database lists them.\n",
     "A package leaves this table the moment it is analysed successfully, so ",
     "the repair is to fix that cause and re-run. Leaving it is not free: a ",
-    "package that fails %d times in a row is dropped from the queue for good. ",
+    "package parks after %d failed fetches or analyses, or %d timeouts, until ",
+    "the analyzer build or its release changes; the workflow's unpark input ",
+    "releases parked packages once the cause is fixed. ",
     "Do not reach for the previous release, which did not cause this, and do ",
     "not reach for force_full, which re-analyses through the same failure and ",
     "republishes a 400-package catalog while doing it."),
-    MAX_CLONE_FAILURES)
+    MAX_CLONE_FAILURES, MAX_TIMEOUT_FAILURES)
 }
 
 #' The whole refusal a run stops with, worded for the guards that tripped.

@@ -18,7 +18,7 @@ the ordered version series.
 
 `cran-code-metrics.db` (published as a dated `metrics-YYYY-MM-DD` release; a
 release is immutable once a later day's release exists, and old releases are
-pruned on a retention schedule):
+kept; see Retention):
 
 - `cran_code_summary` - one row per package version, with the metric columns and
   a per-version release date.
@@ -85,6 +85,10 @@ Moving the rpkg-analyzer pin re-queues every package unless `ANALYZER_SAME_OUTPU
 Each worker gives rpkg-analyzer a directory of its own for the package it analyses, `work/.rpa/<package>`, and removes it when the package is done. `RPKG_ANALYZER_CACHE_DIR` names a cache there, so a compiled file that did not change between versions is parsed once, and `RPKG_ANALYZER_STATS` names a statistics file. Builds before 0.5.1 read neither variable. Set `RPA_CACHE` to `off` (or `false`, `no`, `0`) in the workflow's environment to leave the cache out; the output is the same either way.
 
 Each shard's log carries an `analyzer:` line (versions analysed, seconds, compiled files and the share taken from the cache, cache errors, verify mismatches, incomplete parses) and a `worker time:` line (clone, extract, analyzer, record parse, metrics, other). `run-status.json` keeps the same figures under `analyzer_stats` and `worker_phases`; the published manifests do not carry them.
+
+## Retention
+
+No dated release or asset is deleted. The update workflow's prune step runs with `KEEP: "all"`, so `scripts/prune.R` selects nothing; only drafts and the `swap-prev-`/`swap-next-` staging copies are cleaned up, and the legacy `code-` and `data-` releases are left as they are. Per-function and per-file detail is latest-version only, so an older version's detail lives only in the dated release where it was the latest. The per-version summaries are in the newest release. `KEEP=all` stays until a retention rule for these metrics releases is approved on its own.
 
 ## Feedback
 

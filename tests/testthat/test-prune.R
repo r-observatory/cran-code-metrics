@@ -16,3 +16,42 @@ test_that("nothing is pruned when under the keep threshold", {
   expect_identical(releases_to_prune(sprintf("code-2026-06-%02d", 1:10), keep = 30L),
                    character(0L))
 })
+
+test_that("keep = Inf selects nothing among 400 tags", {
+  tags <- format(as.Date("2025-01-01") + 0:399)
+  expect_identical(releases_to_prune(paste0("metrics-", tags), keep = Inf),
+                   character(0L))
+})
+
+test_that("parse_keep maps all to Inf and leaves numbers alone", {
+  expect_identical(parse_keep("all"), Inf)
+  expect_identical(parse_keep(" ALL "), Inf)
+  expect_identical(parse_keep("30"), 30L)
+  expect_identical(parse_keep("5"), 5L)
+  expect_error(parse_keep("lots"), "KEEP")
+})
+
+test_that("the script prints nothing for KEEP=all and still prunes for a number", {
+  tags <- paste0("metrics-", format(as.Date("2025-01-01") + 0:399))
+  script <- file.path("..", "..", "scripts", "prune.R")
+  run <- function(keep) {
+    f <- tempfile(); on.exit(unlink(f)); writeLines(tags, f)
+    system2("Rscript", script, stdin = f, stdout = TRUE,
+            env = paste0("KEEP=", keep))
+  }
+  out_all <- run("all")
+  expect_null(attr(out_all, "status"))
+  expect_length(out_all, 0L)
+  out_30 <- run("30")
+  expect_null(attr(out_30, "status"))
+  expect_gt(length(out_30), 0L)
+})
+
+test_that("the workflow prune step sets KEEP to all", {
+  yml <- readLines(file.path("..", "..", ".github", "workflows", "update.yml"))
+  start <- grep("- name: Prune old dated releases", yml, fixed = TRUE)
+  expect_length(start, 1L)
+  step <- yml[start:length(yml)]
+  expect_true(any(grepl('^\\s*KEEP: "all"\\s*$', step)))
+  expect_false(any(grepl('KEEP: "30"', step, fixed = TRUE)))
+})

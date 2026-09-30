@@ -34,6 +34,12 @@ on:
       requeue:
         description: "Analyse packages again from scratch: package names separated by commas, and over_cap for the standing over-cap list."
         default: ""
+      chain_depth:
+        description: "Set by the run before, which started this one to carry on with a long queue. Leave at 0."
+        default: "0"
+      chain_remaining:
+        description: "Set by the run before: the packages it left queued. Leave empty."
+        default: ""
 
 permissions:
   contents: write
@@ -83,6 +89,10 @@ jobs:
   update:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    # actions: write lets a run that ran out of time start the next one.
+    permissions:
+      contents: write
+      actions: write
     steps:
       - uses: actions/checkout@v7
       - uses: r-lib/actions/setup-r@v2
@@ -315,6 +325,7 @@ jobs:
 
           shard=0
           START_QUEUE=""
+          LOOP_END=""
           while :; do
             shard=$((shard + 1))
             echo "=== shard ${shard} (elapsed ${SECONDS}s) ==="
@@ -336,12 +347,34 @@ jobs:
             # scripts/publish.sh says when the loop is done, and why a drained
             # queue ends it.
             if shard_loop_done out/run-status.json; then
+              LOOP_END="done"
               break
             fi
-            [ "$SECONDS" -ge "$BUDGET" ] && { echo "Time budget reached."; break; }
+            if [ "$SECONDS" -ge "$BUDGET" ]; then
+              echo "Time budget reached."
+              LOOP_END="budget"
+              break
+            fi
           done
           write_step_summary out/run-status.json "$SECONDS" "${START_QUEUE:-0}" >> "${GITHUB_STEP_SUMMARY:-/dev/null}" ||
             echo "::warning::could not write the step summary"
+          # The next step reads these to decide whether to start another run.
+          { echo "LOOP_END=${LOOP_END}"; echo "START_QUEUE=${START_QUEUE:-0}"; } >> "$GITHUB_ENV"
+
+      - name: Start the next run while the queue has work left
+        # A rescan outlasts one run's budget, and the schedule can leave hours
+        # between runs. scripts/publish.sh bounds the chain.
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHAIN_DEPTH: ${{ inputs.chain_depth }}
+          CHAIN_REMAINING: ${{ inputs.chain_remaining }}
+          TIME_BUDGET: ${{ inputs.time_budget_seconds }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/publish.sh
+          source scripts/publish.sh
+          chain_next_run out/run-status.json "${LOOP_END:-}" "${START_QUEUE:-0}" "${CHAIN_DEPTH:-0}" "${CHAIN_REMAINING:-}" "${TIME_BUDGET:-}"
 
       - name: Prune old dated releases
         if: ${{ github.event_name == 'schedule' }}

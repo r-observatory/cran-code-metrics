@@ -1226,3 +1226,59 @@ write_step_summary() {  # $1=run-status.json $2=seconds so far $3=packages queue
       "| ETA at this run'"'"'s rate | \(if $left == 0 then "done" elif $done > 0 and $secs > 0 then "about \(($left * $secs / $done / 360 | round) / 10) h" else "n/a" end) |"
   ' "$1"
 }
+
+# The most runs a chain adds after the one the schedule or the owner started.
+CHAIN_MAX_DEPTH=8
+
+# Whether this run starts the next one: its shard loop stopped on the time
+# budget with work left, the queue shrank this run and since the run before,
+# and the chain is short of CHAIN_MAX_DEPTH. Says why either way.
+chain_wanted() {  # $1=run-status.json $2=why the loop ended $3=queued at the start $4=this run's depth $5=left by the run before, or ""
+  local left
+  if [ "$2" != "budget" ]; then
+    echo "No next run: the shard loop did not stop on the time budget."
+    return 1
+  fi
+  if ! [[ "$3" =~ ^[0-9]+$ && "$4" =~ ^[0-9]+$ ]] || { [ -n "$5" ] && ! [[ "$5" =~ ^[0-9]+$ ]]; }; then
+    echo "::warning::the chain's counts are not whole numbers (start '$3', depth '$4', left before '$5'); no next run."
+    return 1
+  fi
+  if [ "$4" -ge "$CHAIN_MAX_DEPTH" ]; then
+    echo "No next run: this run is number $4 of a chain capped at ${CHAIN_MAX_DEPTH}."
+    return 1
+  fi
+  left=$(jq -r '.n_remaining' "$1" 2>/dev/null) || left=""
+  if ! [[ "$left" =~ ^[0-9]+$ ]]; then
+    echo "::warning::could not read n_remaining from $1; no next run."
+    return 1
+  fi
+  if [ "$left" -eq 0 ]; then
+    echo "No next run: nothing is left in the queue."
+    return 1
+  fi
+  if [ "$left" -ge "$3" ]; then
+    echo "No next run: the queue did not shrink this run ($3 at the start, ${left} left)."
+    return 1
+  fi
+  if [ -n "$5" ] && [ "$left" -ge "$5" ]; then
+    echo "No next run: the queue did not shrink since the run before ($5 left then, ${left} now)."
+    return 1
+  fi
+  echo "Starting the next run (chain depth $(( 10#$4 + 1 )) of ${CHAIN_MAX_DEPTH}): ${left} packages left, $3 at the start of this run."
+  return 0
+}
+
+# Start the next run of update.yml when chain_wanted says so. It carries only
+# the chain's counts and the time budget, so a rebuild, a recollect or an
+# operator release never runs twice. A failed dispatch leaves it to the schedule.
+chain_next_run() {  # $1=run-status.json $2=why the loop ended $3=queued at the start $4=depth $5=left by the run before $6=time budget
+  local left budget=()
+  chain_wanted "$1" "$2" "$3" "$4" "$5" || return 0
+  left=$(jq -r '.n_remaining' "$1")
+  if [[ "${6:-}" =~ ^[0-9]+$ ]]; then budget=(-f "time_budget_seconds=$6"); fi
+  if ! gh workflow run update.yml --ref main -f "chain_depth=$(( 10#$4 + 1 ))" \
+       -f "chain_remaining=${left}" ${budget[@]+"${budget[@]}"}; then
+    echo "::warning::could not start the next run; the next scheduled run carries on."
+  fi
+  return 0
+}

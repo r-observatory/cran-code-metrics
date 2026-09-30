@@ -353,3 +353,60 @@ test_that("the shard step leaves a summary of the run on the Actions page", {
     'write_step_summary out/run-status.json "$SECONDS" "${START_QUEUE:-0}" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"',
     yml, fixed = TRUE)))
 })
+
+test_that("a run that ran out of time with work left starts the next one, on main only", {
+  yml <- .update_yml()
+  steps <- split(yml, findInterval(seq_along(yml), grep("^      - ", yml)))
+  step <- function(name) {
+    hit <- Filter(function(s) any(grepl(paste0("name: ", name), s, fixed = TRUE)), steps)
+    expect_length(hit, 1L)
+    unname(unlist(hit))
+  }
+  chain <- step("Start the next run while the queue has work left")
+  expect_true("        if: github.ref == 'refs/heads/main'" %in% chain)
+  expect_true(paste0('          chain_next_run out/run-status.json "${LOOP_END:-}" ',
+                     '"${START_QUEUE:-0}" "${CHAIN_DEPTH:-0}" "${CHAIN_REMAINING:-}" ',
+                     '"${TIME_BUDGET:-}"') %in% chain)
+  expect_true("          TIME_BUDGET: ${{ inputs.time_budget_seconds }}" %in% chain)
+  # The chain's inputs reach that step through env, never pasted into a script.
+  expect_setequal(trimws(grep("inputs\\.chain_", yml, value = TRUE)),
+                  c("CHAIN_DEPTH: ${{ inputs.chain_depth }}",
+                    "CHAIN_REMAINING: ${{ inputs.chain_remaining }}"))
+  expect_true(all(c("          CHAIN_DEPTH: ${{ inputs.chain_depth }}",
+                    "          CHAIN_REMAINING: ${{ inputs.chain_remaining }}") %in% chain))
+  # After the shard step, whose loop says why it ended, and before the prune.
+  at <- vapply(c("Analyze shards and publish after each",
+                 "Start the next run while the queue has work left",
+                 "Prune old dated releases"),
+               function(n) grep(paste0("name: ", n), yml, fixed = TRUE)[[1L]], integer(1L))
+  expect_false(is.unsorted(at))
+  shard <- step("Analyze shards and publish after each")
+  expect_true(all(c("          LOOP_END=\"\"", "              LOOP_END=\"done\"",
+                    "              LOOP_END=\"budget\"") %in% shard))
+  expect_true(paste0('          { echo "LOOP_END=${LOOP_END}"; ',
+                     'echo "START_QUEUE=${START_QUEUE:-0}"; } >> "$GITHUB_ENV"') %in% shard)
+  # A drained queue ends the loop before the budget is looked at, so a run
+  # whose last shard emptied the queue never starts another.
+  expect_lt(match('              LOOP_END="done"', shard),
+            match('              LOOP_END="budget"', shard))
+  # No status function in the condition, so a failed shard step starts nothing.
+  expect_false(any(grepl("(always|failure|cancelled|success)\\(\\)", chain)))
+  # Only chain_next_run starts a run.
+  expect_false(any(grepl("gh workflow run", yml, fixed = TRUE)))
+})
+
+test_that("the update job may start a run, and the chain's inputs default to a fresh chain", {
+  yml <- .update_yml()
+  job <- yml[grep("^  update:$", yml):length(yml)]
+  job <- job[seq_len(grep("^    steps:$", job)[[1L]])]
+  expect_true(all(c("    permissions:", "      contents: write", "      actions: write") %in% job))
+  depth <- grep("^      chain_depth:$", yml)
+  left  <- grep("^      chain_remaining:$", yml)
+  expect_length(depth, 1L)
+  expect_length(left, 1L)
+  expect_identical(trimws(yml[depth + 2L]), 'default: "0"')
+  expect_identical(trimws(yml[left + 2L]), 'default: ""')
+  body <- .sh_function(.publish_sh(), "chain_next_run")
+  expect_false(any(grepl("force_full|recollect|unpark|requeue|harvest", body)))
+  expect_true("CHAIN_MAX_DEPTH=8" %in% .publish_sh())
+})

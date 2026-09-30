@@ -1187,3 +1187,21 @@ check_fetched_db() {  # $1=database $2=manifest published with it
   fi
   echo "${name} matches the manifest published with it: ${bytes} bytes, sha256:${sha}"
 }
+
+# Whether the shard loop is done: bootstrap complete, nothing changed, or the queue
+# drained (a failed package waits for the next run). Unreadable status stops it too.
+shard_loop_done() {  # $1=run-status.json
+  local vals complete changed remaining shard
+  if ! vals=$(jq -r '[.bootstrap_complete, .changed, .n_remaining, .n_shard]
+                     | map(tostring) | join(" ")' "$1" 2>/dev/null) || [ -z "$vals" ]; then
+    echo "::warning::could not read $1; stopping the shard loop."
+    return 0
+  fi
+  read -r complete changed remaining shard <<< "$vals"
+  if [ "$complete" = "false" ] && [ "$changed" = "true" ] &&
+     [[ "$remaining" =~ ^[1-9][0-9]*$ ]] && [[ "$shard" =~ ^[1-9][0-9]*$ ]]; then
+    return 1
+  fi
+  echo "Nothing left to do (complete=${complete}, changed=${changed}, remaining=${remaining}, shard=${shard})."
+  return 0
+}

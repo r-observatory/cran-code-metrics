@@ -758,3 +758,54 @@ test_that("an archive killed at GIT_TIMEOUT parks as a timeout and is released b
   expect_identical(run_update(io, out_dir, shard_size = 10L)$n_shard, 1L)
   expect_identical(failures()$timeout_failures, 1L)
 })
+
+# ---------------------------------------------------------------------------
+# The shard loop ends although a package failed this run
+# ---------------------------------------------------------------------------
+
+# The workflow's loop: run_update as the shard, then shard_loop_done read
+# through bash, as update.yml runs them. Returns each shard's run status.
+.run_shard_loop <- function(io, out_dir, max_shards = 10L) {
+  script <- normalizePath(test_path("..", "..", "scripts", "publish.sh"))
+  status_path <- file.path(out_dir, "run-status.json")
+  statuses <- list()
+  for (i in seq_len(max_shards)) {
+    run_update(io, out_dir, shard_size = 2L)
+    statuses[[i]] <- jsonlite::read_json(status_path)
+    rc <- system2("bash", c("-c", shQuote(sprintf("source %s && shard_loop_done %s",
+                                                  shQuote(script), shQuote(status_path)))),
+                  stdout = FALSE, stderr = FALSE)
+    if (identical(rc, 0L)) break
+  }
+  statuses
+}
+
+test_that("the shard loop stops at the shard that drains its queue and publishes no empty shard", {
+  skip_on_os("windows")
+  skip_if(!nzchar(Sys.which("jq")), "jq is not installed")
+  withr::local_envvar(c(PIPELINE_RUN_ID = "r1", PREV_CODE_TAG = "", PREV_DATA_TAG = "",
+                        PREV_TEXT_TAG = ""))
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_analyzer_bin(
+    withr::local_tempdir(), "0.4.0-test", reads = "1.0"))
+  out_dir <- withr::local_tempdir()
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  pkgs <- c("pkgA", "pkgB", "pkgC", "pkgD", "pkgE", "pkgF")
+  io <- .fake_io(data.frame(package = pkgs, latest_version = rep("1.0", 6L),
+                            stringsAsFactors = FALSE), fail_clones = "pkgC")
+  # A baseline whose fingerprint the first shard moves, so every later shard of
+  # the run reads as changed against it.
+  write_manifest(file.path(out_dir, "prev-code-manifest.json"),
+                 list(schema_version = 1L, series = "code", fingerprint = strrep("0", 64L)))
+
+  statuses <- .run_shard_loop(io, out_dir)
+
+  expect_lte(length(statuses), 3L)
+  published <- Filter(function(s) isTRUE(s$changed), statuses)
+  expect_true(all(vapply(published, function(s) s$n_shard > 0L, logical(1L))))
+  expect_false(statuses[[length(statuses)]]$bootstrap_complete)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out_dir, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(DBI::dbGetQuery(con,
+    "SELECT consecutive_failures FROM cran_metrics_failures WHERE package = 'pkgC'")[[1L]], 1L)
+})

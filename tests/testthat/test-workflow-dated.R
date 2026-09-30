@@ -308,3 +308,19 @@ test_that("the databases are compressed at level 3, without --long, and checked 
   expect_false(any(grepl("--long", body, fixed = TRUE)))
   expect_true(any(grepl('^PUBLISH_FORM="\\$\\{PUBLISH_FORM:-zstd\\}"$', .publish_sh())))
 })
+
+test_that("PIPELINE_RUN_ID is set in the shard step's env and in no other step", {
+  # Actions sets GITHUB_RUN_ID in every step, the unit tests included, so the
+  # run id the pipeline reads must reach the shard step alone.
+  steps_of <- function(name) {
+    yml <- readLines(file.path("..", "..", ".github", "workflows", name))
+    split(yml, findInterval(seq_along(yml), grep("^      - ", yml)))
+  }
+  hits <- Filter(function(s) any(grepl("PIPELINE_RUN_ID", s, fixed = TRUE)),
+                 c(steps_of("update.yml"), steps_of("test.yml")))
+  expect_length(hits, 1L)
+  step <- unname(unlist(hits))
+  expect_true(any(grepl("name: Analyze shards and publish after each", step, fixed = TRUE)))
+  expect_identical(grep("PIPELINE_RUN_ID", step, value = TRUE, fixed = TRUE),
+                   "          PIPELINE_RUN_ID: ${{ github.run_id }}")
+})

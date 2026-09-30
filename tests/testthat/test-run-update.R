@@ -334,6 +334,25 @@ test_that("package hitting MAX_CLONE_FAILURES is excluded from todo and counted 
   expect_equal(m_final$shard_failures$count, 0L)
 })
 
+test_that("the MAX_CLONE_FAILURES path parks the same way when Actions sets GITHUB_RUN_ID", {
+  # Actions sets GITHUB_RUN_ID in the unit-test step too; a run id read from it
+  # would skip pkgFail on calls 2 to 5 in CI only.
+  withr::local_envvar(c(GITHUB_RUN_ID = "ci"))
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_analyzer_bin(
+    withr::local_tempdir(), "0.4.0-test", reads = "1.0"))
+  out_dir <- withr::local_tempdir()
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  pkg_df <- data.frame(package = c("pkgFail", "pkgOk"), latest_version = c("1.0", "1.0"),
+                       stringsAsFactors = FALSE)
+  io_mixed <- .fake_io(pkg_df, fail_clones = "pkgFail")
+  for (i in seq_len(MAX_CLONE_FAILURES)) run_update(io_mixed, out_dir, shard_size = 10L)
+  m_final <- run_update(io_mixed, out_dir, shard_size = 10L)
+  expect_equal(m_final$permanent_failures, 1L)
+  expect_equal(m_final$n_shard, 0L)
+  expect_equal(m_final$shard_failures$count, 0L)
+})
+
 # ---------------------------------------------------------------------------
 # Test 6: transient failure followed by success resets the failure counter
 # ---------------------------------------------------------------------------

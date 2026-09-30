@@ -249,6 +249,9 @@ jobs:
           # its exemption on the flag or it would refuse shard 2 of the
           # operator's own rebuild. The dispatch input covers the whole step.
           FORCE_FULL_REBUILD: ${{ inputs.force_full }}
+          # One failed attempt per package per run. Set in this step alone, so
+          # the unit tests never run with it.
+          PIPELINE_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           # shellcheck source=scripts/publish.sh

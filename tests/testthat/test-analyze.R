@@ -187,3 +187,18 @@ test_that("analyze_package persists the five typed dependency columns per versio
   expect_true(is.na(row$depends))                 # absent field -> honest NA
   expect_true(is.na(row$enhances))
 })
+
+test_that("a cap inside one R-fallback group runs the group again rather than NA", {
+  file_map <- list(
+    "DESCRIPTION" = "Package: p\nVersion: 1.0\nImports: stats\n",
+    "NAMESPACE"   = "export(f)\n",
+    "R/f.R"       = "f <- function(x) x + 1\n"
+  )
+  mk  <- function() build_context("p", "1.0", "1.0", "2024-01-01",
+                                  names(file_map), function(p) file_map[[p]] %||% "")
+  want <- analyze_version(mk())
+  groups <- METRIC_GROUPS
+  groups$meta <- .fires_cap_once(groups$meta)
+  .local_global("METRIC_GROUPS", groups)
+  expect_identical(analyze_version(mk()), want)
+})

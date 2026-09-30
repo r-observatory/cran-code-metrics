@@ -655,3 +655,41 @@ test_that("an analyzer line that does not parse leaves stored rows and read atte
   expect_identical(nrow(DBI::dbGetQuery(con,
     "SELECT * FROM cran_analyzer_read_attempts WHERE package = 'pkgA'")), 0L)
 })
+
+# ---------------------------------------------------------------------------
+# A cap swallowed in analyze_package's per-version steps is evaluated again
+# ---------------------------------------------------------------------------
+
+test_that("a cap in a per-version step of analyze_package changes nothing it returns", {
+  repo <- tempfile("ccm_capsteps_")
+  on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
+  .make_fake_clone("pkgCap", repo, versions = c("1.0", "1.1"))
+  dir.create(file.path(repo, "vignettes"))
+  writeLines(c("---", "title: Intro", "vignette: >",
+               "  %\\VignetteEngine{knitr::rmarkdown}", "---", "Text."),
+             file.path(repo, "vignettes", "intro.Rmd"))
+  writeLines('old <- function() .Deprecated("hello")', file.path(repo, "R", "old.R"))
+  system2("git", c("-C", repo, "add", "-A"), stdout = FALSE, stderr = FALSE)
+  system2("git", c("-C", repo, "commit", "-m", "extras"), stdout = FALSE, stderr = FALSE)
+  system2("git", c("-C", repo, "tag", "-f", "1.1"), stdout = FALSE, stderr = FALSE)
+
+  metrics <- structure(list(loc_r = 1L),
+                       functions = .empty_functions_df()[, -(1:2), drop = FALSE],
+                       edges     = .empty_edges_df()[, -(1:2), drop = FALSE],
+                       datasets  = .datasets_frame(list()))
+  .local_global("analyze_with_binary", function(dir, kind = ANALYZER_INPUT_KIND) metrics)
+  # read_at is the clock at each reading, so it differs between any two runs.
+  analyse <- function() {
+    res <- analyze_package(repo, "pkgCap")
+    res$text$versions$read_at <- NULL
+    res
+  }
+  want <- analyse()
+  expect_gt(nrow(want$vignettes), 0L)
+
+  at_1.1 <- function(ctx) identical(ctx$version, "1.1")
+  .local_global("metrics_vignettes", .fires_cap_once(metrics_vignettes, when = at_1.1))
+  .local_global("deprecation_signals", .fires_cap_once(deprecation_signals, when = at_1.1))
+  .local_global("parse_namespace", .fires_cap_once(parse_namespace))
+  expect_identical(analyse(), want)
+})

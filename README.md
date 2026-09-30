@@ -71,6 +71,8 @@ is reached. Set `GITHUB_TOKEN` so git fetches are authenticated.
 
 The tests run from the repository root and need R with RSQLite, DBI, jsonlite, digest, testthat and withr, plus bash, jq, zstd, git and sqlite3 on PATH. The release tests in `test-publish.R` skip without bash or jq, and those that read or write a `.zst` skip without zstd. Point `RPKG_ANALYZER_BIN` at an rpkg-analyzer binary (the workflows pin v0.4.0) to run the tests that need a real analyzer; without one they skip. A few tests skip when `rpkg-analyzer` is on PATH, so name the binary through the variable rather than PATH.
 
+`test-record-memo.R` also runs the builds that `RPA_TEST_BIN_040` and `RPA_TEST_BIN_050` name. `test-record-parse-corpus.R` holds the record parse and the dataset memo to the per-line parser over whole corpora of analyzer output when `RPA_PARSE_CORPUS_050` and `RPA_PARSE_CORPUS_040` name them as absolute paths: every `*.ndjson` or `*.ndjson.gz` file below, where the files under `mv/<package>/` are one package's versions in name order. With `RPA_PARSE_CORPUS_REPORT` set it appends one line per corpus, the label, the files read and the files found identical, separated by tabs.
+
 ## Notes
 
 Each package is cloned, analyzed across all its versions, and deleted before the
@@ -79,6 +81,10 @@ and recorded in the manifest. All metrics are computed from git and the package
 source; there is no external `cloc` dependency.
 
 Moving the rpkg-analyzer pin re-queues every package unless `ANALYZER_SAME_OUTPUT` in `scripts/config.R` also names the build the stored rows came from. Add a build there only when the analyzer gate has shown that it reproduces the pinned build record for record, and quote the gate report in the pin PR; to rescan on purpose, set the list to the new pin alone. `test-output-class.R` fails while the pinned build is missing from the list, so the choice is made in the PR that moves the pin. Each run prints the output class and how many latest rows it covers, and the manifests carry `analyzer_version`, `output_class` and `n_latest_on_build` under `bootstrap`.
+
+Each worker gives rpkg-analyzer a directory of its own for the package it analyses, `work/.rpa/<package>`, and removes it when the package is done. `RPKG_ANALYZER_CACHE_DIR` names a cache there, so a compiled file that did not change between versions is parsed once, and `RPKG_ANALYZER_STATS` names a statistics file. Builds before 0.5.1 read neither variable. Set `RPA_CACHE` to `off` (or `false`, `no`, `0`) in the workflow's environment to leave the cache out; the output is the same either way.
+
+Each shard's log carries an `analyzer:` line (versions analysed, seconds, compiled files and the share taken from the cache, cache errors, verify mismatches, incomplete parses) and a `worker time:` line (clone, extract, analyzer, record parse, metrics, other). `run-status.json` keeps the same figures under `analyzer_stats` and `worker_phases`; the published manifests do not carry them.
 
 ## Feedback
 

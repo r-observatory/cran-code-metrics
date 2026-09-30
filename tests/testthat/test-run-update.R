@@ -382,7 +382,7 @@ test_that("transient failure that later succeeds resets the failure counter", {
 test_that(".worker_line carries the reason a package failed", {
   line <- .worker_line(3L, 400L, FALSE, "pkgX", "analyze", 0L, 12.34,
                        "cannot open file 'DESCRIPTION'")
-  expect_true(grepl("[3/400] FAIL pkgX: analyze failed in 12.3s", line, fixed = TRUE))
+  expect_true(grepl("[3/400] FAIL pkgX: analyze after 12.3s", line, fixed = TRUE))
   expect_true(grepl("cannot open file 'DESCRIPTION'", line, fixed = TRUE))
   # One write, one line: two would let another fork's output land between them.
   expect_identical(nchar(gsub("[^\n]", "", line)), 1L)
@@ -595,7 +595,7 @@ test_that("a version that cannot be extracted leaves the package's stored rows a
                     out_dir, shard_size = 10L))
 
   expect_identical(m$shard_failures$packages, "pkgA")
-  expect_true(any(grepl("FAIL pkgA: extract failed", logged, fixed = TRUE)))
+  expect_true(any(grepl("FAIL pkgA: extract after", logged, fixed = TRUE)))
   expect_true(any(grepl("git archive of 1.1 exited 128", logged, fixed = TRUE)))
   expect_identical(.package_rows(out_dir, "pkgA"), before)
 })

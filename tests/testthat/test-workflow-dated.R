@@ -333,3 +333,16 @@ test_that("the shard loop stops where shard_loop_done says, and nowhere else", {
   expect_true(any(grepl("Time budget reached", yml, fixed = TRUE)))
   expect_gt(length(.sh_function(.publish_sh(), "shard_loop_done")), 1L)
 })
+
+test_that("unpark and requeue reach the first shard only, through env", {
+  yml <- .update_yml()
+  expect_true(any(grepl("^      unpark:$", yml)))
+  expect_true(any(grepl("^      requeue:$", yml)))
+  # Read through env, never pasted into the script, so their text cannot run.
+  uses <- trimws(grep("inputs\\.(unpark|requeue)", yml, value = TRUE))
+  expect_setequal(uses, c("UNPARK: ${{ inputs.unpark }}", "REQUEUE: ${{ inputs.requeue }}"))
+  expect_true(any(grepl(
+    'Rscript scripts/update.R out/ ${FORCE} ${RECOLLECT} ${RELEASE[@]+"${RELEASE[@]}"}',
+    yml, fixed = TRUE)))
+  expect_true(any(grepl("^            RELEASE=\\(\\)$", yml)))
+})

@@ -375,6 +375,57 @@ test_that("one build parks a package at five analyze failures or three timeouts"
   expect_identical(.permanent_failures(con, "0.5.0", 900L, u), "pkgA")
 })
 
+# WORKER_TIMEOUT as scripts/config.R sets it, with the variable unset or given.
+.fv_config_timeout <- function(value = NA) {
+  withr::with_envvar(c(WORKER_TIMEOUT = value), {
+    cfg <- new.env()
+    sys.source(test_path("..", "..", "scripts", "config.R"), envir = cfg)
+    cfg$WORKER_TIMEOUT
+  })
+}
+
+test_that("a package gets 2,400 s unless WORKER_TIMEOUT says otherwise", {
+  expect_identical(.fv_config_timeout(), 2400L)
+  expect_identical(.fv_config_timeout("900"), 900L)
+})
+
+test_that("three timeouts at 600 s do not park under the default limit, and the count starts again", {
+  con <- .fv_con()
+  u   <- .fv_universe("pkgSlow")
+  wt  <- .fv_config_timeout()
+  for (i in seq_len(MAX_TIMEOUT_FAILURES)) .fv_fail(con, "pkgSlow", "timeout", wt = 600L)
+  expect_identical(.permanent_failures(con, "0.5.0", 600L, u), "pkgSlow")
+  expect_identical(.permanent_failures(con, "0.5.0", wt, u), character(0L))
+  .fv_fail(con, "pkgSlow", "timeout", wt = wt)
+  row <- .fv_row(con, "pkgSlow")
+  expect_identical(c(row$timeout_failures, row$worker_timeout), c(1L, wt))
+  expect_identical(.permanent_failures(con, "0.5.0", wt, u), character(0L))
+})
+
+test_that("a package parked on timeouts at 600 s is analysed again by a run under the default limit", {
+  out <- withr::local_tempdir()
+  con <- open_or_init_db(file.path(out, DB_FILENAME))
+  for (i in seq_len(MAX_TIMEOUT_FAILURES)) {
+    .fv_fail(con, "pkgSlow", "timeout", build = NA_character_, wt = 600L)
+  }
+  DBI::dbDisconnect(con)
+  .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
+  io <- .fv_io("pkgSlow")
+
+  .local_global("WORKER_TIMEOUT", 600L)
+  parked <- .fv_run(io, out)
+  expect_identical(c(parked$n_shard, parked$permanent_failures), c(0L, 1L))
+
+  .local_global("WORKER_TIMEOUT", .fv_config_timeout())
+  released <- .fv_run(io, out)
+  expect_identical(c(released$n_shard, released$permanent_failures), c(1L, 0L))
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(nrow(.fv_row(con, "pkgSlow")), 0L)
+  expect_identical(DBI::dbGetQuery(con, "SELECT package, version FROM cran_code_summary"),
+                   data.frame(package = "pkgSlow", version = "1.0", stringsAsFactors = FALSE))
+})
+
 test_that("five fetch failures park a package across builds until its release changes", {
   con <- .fv_con()
   for (i in seq_len(MAX_CLONE_FAILURES)) .fv_fail(con, "pkgF", "clone", build = "0.4.0")

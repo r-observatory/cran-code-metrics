@@ -100,6 +100,45 @@ test_that("the step summary says done, or n/a, when there is no rate to go on", 
 })
 
 # ---------------------------------------------------------------------------
+# The cores a dispatched run analyses on
+# ---------------------------------------------------------------------------
+
+# Run set_analysis_cores on `value` with ANALYSIS_CORES unset, then `then`.
+.cores_bash <- function(value, then = 'echo "ANALYSIS_CORES=${ANALYSIS_CORES-unset}"') {
+  skip_on_os("windows")
+  withr::local_envvar(ANALYSIS_CORES = NA)
+  out <- suppressWarnings(system2("bash", c("-c", shQuote(sprintf(
+    "source %s && set_analysis_cores %s && %s", shQuote(.loop_script()), shQuote(value), then))),
+    stdout = TRUE, stderr = TRUE))
+  list(status = attr(out, "status") %||% 0L, output = as.character(out))
+}
+
+test_that("a run that names no cores leaves ANALYSIS_CORES unset, and one that does exports it", {
+  expect_identical(.cores_bash(""), list(status = 0L, output = "ANALYSIS_CORES=unset"))
+  expect_identical(.cores_bash("2"), list(status = 0L, output = "ANALYSIS_CORES=2"))
+  expect_identical(.cores_bash("16"), list(status = 0L, output = "ANALYSIS_CORES=16"))
+})
+
+test_that("a cores value that is not a whole number of at least 1 stops the step", {
+  for (bad in c("0", "two", "2.5", " 2", "-1", "1e1")) {
+    res <- .cores_bash(bad)
+    expect_identical(res$status, 1L, info = bad)
+    expect_identical(res$output, sprintf(
+      "::error::analysis_cores must be a whole number of at least 1, got '%s'.", bad))
+  }
+})
+
+test_that("config.R reads a core count with the input and without it", {
+  config <- normalizePath(test_path("..", "..", "scripts", "config.R"), mustWork = TRUE)
+  read <- sprintf("%s -e %s", shQuote(file.path(R.home("bin"), "Rscript")),
+                  shQuote(sprintf("source(%s); cat(ANALYSIS_CORES)", deparse(config))))
+  expect_identical(.cores_bash("3", read), list(status = 0L, output = "3"))
+  none <- .cores_bash("", read)
+  expect_identical(none$status, 0L)
+  expect_match(none$output, "^[1-9][0-9]*$")
+})
+
+# ---------------------------------------------------------------------------
 # Starting the next run while the queue has work left
 # ---------------------------------------------------------------------------
 
@@ -122,9 +161,10 @@ test_that("the step summary says done, or n/a, when there is no rate to go on", 
   log
 }
 
-.chain_next <- function(end, start, depth, before = "", budget = "", left = 300L) {
-  .loop_bash(sprintf("chain_next_run %%s %s %s %s %s %s", shQuote(end), shQuote(start),
-                     shQuote(depth), shQuote(before), shQuote(budget)),
+.chain_next <- function(end, start, depth, before = "", budget = "", left = 300L,
+                        cores = "") {
+  .loop_bash(sprintf("chain_next_run %%s %s %s %s %s %s %s", shQuote(end), shQuote(start),
+                     shQuote(depth), shQuote(before), shQuote(budget), shQuote(cores)),
              .loop_status(remaining = left))
 }
 
@@ -185,13 +225,28 @@ test_that("counts that are not whole numbers, or a status that cannot be read, s
   }
 })
 
-test_that("the next run carries the chain's counts and the time budget, and nothing else", {
+test_that("the next run carries the chain's counts, the time budget and the cores, and nothing else", {
   log <- .chain_gh()
   res <- .chain_next("budget", 700, 2, before = "400", budget = "7200")
   expect_identical(res$status, 0L)
   expect_identical(readLines(log), paste(
     "workflow run update.yml --ref main -f chain_depth=3 -f chain_remaining=300",
     "-f time_budget_seconds=7200"))
+  unlink(log)
+  .chain_next("budget", 700, 2, before = "400", budget = "7200", cores = "2")
+  expect_identical(readLines(log), paste(
+    "workflow run update.yml --ref main -f chain_depth=3 -f chain_remaining=300",
+    "-f time_budget_seconds=7200 -f analysis_cores=2"))
+  unlink(log)
+  .chain_next("budget", 700, 0, cores = "2")
+  expect_identical(readLines(log), paste(
+    "workflow run update.yml --ref main -f chain_depth=1 -f chain_remaining=300",
+    "-f analysis_cores=2"))
+  # A budget or a core count that is not a whole number is left to the default.
+  unlink(log)
+  .chain_next("budget", 700, 0, budget = "5h", cores = "two")
+  expect_identical(readLines(log),
+                   "workflow run update.yml --ref main -f chain_depth=1 -f chain_remaining=300")
   unlink(log)
   .chain_next("budget", 700, 0)
   expect_identical(readLines(log),

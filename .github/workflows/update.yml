@@ -22,8 +22,11 @@ on:
         type: boolean
         default: false
       time_budget_seconds:
-        description: "Stop starting new shards after this many seconds (default 18000 = 5h)."
-        default: "18000"
+        description: "Stop starting new shards after this many seconds (default 16800 = 4h40m)."
+        default: "16800"
+      analysis_cores:
+        description: "Packages analysed at once. Leave empty for every core of the runner."
+        default: ""
       harvest_descriptions:
         description: "Backfill archived-package title/description from their tarball DESCRIPTIONs (heavy, one-time; idempotent/resumable)."
         type: boolean
@@ -270,10 +273,13 @@ jobs:
           PIPELINE_RUN_ID: ${{ github.run_id }}
           UNPARK: ${{ inputs.unpark }}
           REQUEUE: ${{ inputs.requeue }}
+          CORES_INPUT: ${{ inputs.analysis_cores }}
         run: |
           set -euo pipefail
           # shellcheck source=scripts/publish.sh
           source scripts/publish.sh
+          # Exports ANALYSIS_CORES only when the dispatch names a core count.
+          set_analysis_cores "${CORES_INPUT:-}" || exit 1
           TODAY="$(date -u +%Y-%m-%d)"
           METRICS_TAG="metrics-${TODAY}"
           # The prune step cleans up around this tag, hours later. Working the
@@ -302,7 +308,9 @@ jobs:
             exit 0
           fi
 
-          BUDGET="${{ inputs.time_budget_seconds || '18000' }}"
+          # The last shard starts before the budget is reached and has what is
+          # left of the job's 350 minutes to finish.
+          BUDGET="${{ inputs.time_budget_seconds || '16800' }}"
           FORCE=""; [ "${{ inputs.force_full }}" = "true" ] && FORCE="--bootstrap"
           RECOLLECT=""; [ "${{ inputs.recollect }}" = "true" ] && RECOLLECT="--recollect"
           # Operator releases go to the first shard only, as --bootstrap does,
@@ -329,6 +337,7 @@ jobs:
           while :; do
             shard=$((shard + 1))
             echo "=== shard ${shard} (elapsed ${SECONDS}s) ==="
+            free -m || true
             Rscript scripts/update.R out/ ${FORCE} ${RECOLLECT} ${RELEASE[@]+"${RELEASE[@]}"}
             FORCE=""
             RELEASE=()
@@ -370,11 +379,12 @@ jobs:
           CHAIN_DEPTH: ${{ inputs.chain_depth }}
           CHAIN_REMAINING: ${{ inputs.chain_remaining }}
           TIME_BUDGET: ${{ inputs.time_budget_seconds }}
+          CORES_INPUT: ${{ inputs.analysis_cores }}
         run: |
           set -euo pipefail
           # shellcheck source=scripts/publish.sh
           source scripts/publish.sh
-          chain_next_run out/run-status.json "${LOOP_END:-}" "${START_QUEUE:-0}" "${CHAIN_DEPTH:-0}" "${CHAIN_REMAINING:-}" "${TIME_BUDGET:-}"
+          chain_next_run out/run-status.json "${LOOP_END:-}" "${START_QUEUE:-0}" "${CHAIN_DEPTH:-0}" "${CHAIN_REMAINING:-}" "${TIME_BUDGET:-}" "${CORES_INPUT:-}"
 
       - name: Prune old dated releases
         if: ${{ github.event_name == 'schedule' }}

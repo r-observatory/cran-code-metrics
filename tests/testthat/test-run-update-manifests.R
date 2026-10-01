@@ -6,7 +6,7 @@
 
 test_that("run_update writes both manifests and the changed-packages file", {
   old <- analyze_package
-  assign("analyze_package", function(dest, pkg) list(
+  assign("analyze_package", function(dest, pkg, ...) list(
     summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
       latest_release_date = "2026-01-01", datasets_scanned = 1L, detail_scanned = 1L,
       stringsAsFactors = FALSE),
@@ -44,7 +44,7 @@ test_that("the run says which dataset columns hold nothing, and the manifest kee
   # being told. The run has to say so, and the manifest has to carry the number
   # past the log that scrolls away.
   old <- analyze_package
-  assign("analyze_package", function(dest, pkg) list(
+  assign("analyze_package", function(dest, pkg, ...) list(
     summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
       latest_release_date = "2026-01-01", datasets_scanned = 1L, detail_scanned = 1L,
       stringsAsFactors = FALSE),
@@ -76,7 +76,7 @@ test_that("both manifests report the packages no dataset scan reached", {
   # scanned. Only the new count says so, and it has to reach the file: the log
   # line that would have said it scrolls away with the run.
   old <- analyze_package
-  assign("analyze_package", function(dest, pkg) list(
+  assign("analyze_package", function(dest, pkg, ...) list(
     summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
       latest_release_date = "2026-01-01", datasets_scanned = NA, detail_scanned = 1L,
       stringsAsFactors = FALSE),
@@ -101,7 +101,7 @@ test_that("both manifests report the datasets nothing could measure", {
   # cannot fingerprint. It keeps its place in the catalog with no profile, and
   # the manifest is where that fact outlives the run.
   old <- analyze_package
-  assign("analyze_package", function(dest, pkg) list(
+  assign("analyze_package", function(dest, pkg, ...) list(
     summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
       latest_release_date = "2026-01-01", datasets_scanned = 1L, detail_scanned = 1L,
       stringsAsFactors = FALSE),

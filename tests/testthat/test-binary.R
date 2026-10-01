@@ -285,7 +285,7 @@ test_that("analyze_with_binary passes the input kind after the directory", {
 # A crashed analyzer, and a cap while asking the analyzer its version
 # ---------------------------------------------------------------------------
 
-test_that("an analyzer that prints its summary and then exits non-zero gives the R fallback", {
+test_that("an analyzer that prints its summary and then exits non-zero is not parsed: a panic gives the R fallback, a kill fails the version", {
   skip_on_os("windows")
   dir <- withr::local_tempdir()
   for (ending in c("exit 101", "kill -9 $$")) {
@@ -295,7 +295,11 @@ test_that("an analyzer that prints its summary and then exits non-zero gives the
                  ending), stub)
     Sys.chmod(stub, mode = "0755")
     withr::local_envvar(RPKG_ANALYZER_BIN = stub)
-    expect_null(analyze_with_binary(dir), info = ending)
+    if (identical(ending, "exit 101")) {
+      expect_null(analyze_with_binary(dir), info = ending)
+    } else {
+      expect_error(analyze_with_binary(dir), class = "analyzer_killed", info = ending)
+    }
   }
 })
 

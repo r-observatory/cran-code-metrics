@@ -100,6 +100,7 @@
     return(if (isTRUE(e$status == 124L)) "git_timeout" else "extract")
   }
   if (inherits(e, "analyzer_parse_incomplete")) return("analyze")
+  if (inherits(e, c("analyzer_killed", "analyzer_failed"))) return("crash")
   if ((inherits(e, "condition") && .is_time_limit(e)) ||
       isTRUE(elapsed >= worker_timeout)) {
     return("timeout")
@@ -471,6 +472,28 @@
                                 now = Sys.time()) {
   st <- .verdict_state(con, build, worker_timeout, universe, now)
   st$package[st$parked]
+}
+
+# The versions of each package whose stored summary row names an analyzer
+# build, any build: the rows a failed analyzer must not hand to the R fallback.
+# A list of version vectors named by package; a package with none is absent.
+.stamped_versions <- function(con, pkgs) {
+  pkgs <- as.character(pkgs)
+  if (!length(pkgs) || !SUMMARY_TABLE %in% DBI::dbListTables(con) ||
+      !"analyzer_version" %in% DBI::dbListFields(con, SUMMARY_TABLE)) {
+    return(list())
+  }
+  rows <- lapply(split(pkgs, ceiling(seq_along(pkgs) / 500)), function(p) {
+    DBI::dbGetQuery(con, sprintf(
+      'SELECT package, version FROM "%s"
+        WHERE LENGTH(analyzer_version) > 0 AND package IN (%s)
+        ORDER BY package, version',
+      SUMMARY_TABLE, paste(rep("?", length(p)), collapse = ", ")),
+      params = as.list(p))
+  })
+  df <- do.call(rbind, unname(rows))
+  if (!nrow(df)) return(list())
+  split(as.character(df$version), as.character(df$package))
 }
 
 # ---------------------------------------------------------------------------
@@ -1121,8 +1144,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # the rows this shard writes. Asking twice would let a binary swapped
   # mid-run clear markers it then never restores.
   analyzer_version <- rpkg_analyzer_version()
-  # A build that rejected the flag would exit 2 on every package and leave every
-  # row to the R fallback, so a 0.5.0 build proves it reads the flag first.
+  # A build that rejected the flag would exit 2 on every package: a crash for
+  # each one with analyzer rows and the R fallback for the rest. So a 0.5.0
+  # build proves it reads the flag first.
   if (analyzer_at_least(analyzer_version, "0.5.0") &&
       !rpkg_analyzer_selfcheck(ANALYZER_INPUT_KIND)) {
     stop(sprintf(paste0(
@@ -1321,6 +1345,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # Each clone's seconds go to the worker tally; its value and status do not change.
   io$clone <- .timed_phase("clone_s", io$clone)
 
+  # Read before the fork: a worker cannot ask which versions have analyzer rows.
+  stamped_of <- .stamped_versions(con, shard_pkgs)
+
   # Worker: clone + analyze one package. No database access.
   # Returns list(package, ok = TRUE, elapsed, summary, churn, ...) or, when the
   # package failed, list(package, ok = FALSE, stage, elapsed, reason).
@@ -1368,7 +1395,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     if (!isTRUE(ok)) return(.fail(.clone_stage(ok), .clone_reason(ok)))
     err <- NULL
     res <- tryCatch(
-      analyze_package(dest, pkg),
+      analyze_package(dest, pkg, stamped = stamped_of[[pkg]] %||% character(0L)),
       error = function(e) {
         err <<- e
         NULL

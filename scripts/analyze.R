@@ -704,11 +704,14 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series,
 #'
 #' @param repo_dir  Path to the cloned git repository.
 #' @param package   Package name string.
+#' @param stamped   Versions whose stored row an analyzer build wrote. On these
+#'   an analyzer that gives no result fails the package rather than taking the
+#'   R fallback.
 #' @return Named list: $summary, $churn, $api, $functions, $edges, $datasets,
 #'   $vignettes, $text (DESCRIPTION and release-notes rows from
 #'   .release_text_collect()), and $binary_versions: the versions whose metrics
 #'   the analyzer binary produced, as opposed to the pure-R fallback.
-analyze_package <- function(repo_dir, package) {
+analyze_package <- function(repo_dir, package, stamped = character(0L)) {
   versions_df <- list_versions(repo_dir)
   churn_all   <- package_churn(repo_dir)
 
@@ -738,6 +741,8 @@ analyze_package <- function(repo_dir, package) {
   .hb_last <- .hb_t0
   # Dataset records shared by this package's versions, two versions at a time.
   memo <- .record_memo()
+  # Where each analyzer run appends its statistics line, asked once a package.
+  stats_file <- .analyzer_stats_file()
 
   for (i in seq_len(nrow(versions_df))) {
     v      <- versions_df$version[i]
@@ -812,7 +817,9 @@ analyze_package <- function(repo_dir, package) {
 
       # Prefer the rpkg-analyzer binary (a superset of analyze_version, computed
       # from the same extracted source); fall back to the R groups when absent.
-      metrics <- analyze_with_binary(tmp, memo = memo)
+      # A version with an analyzer row is never handed to the fallback.
+      metrics <- analyze_with_binary(tmp, memo = memo, protect = v %in% stamped,
+                                     stats = stats_file)
       binary_ran <- !is.null(metrics)
       if (is.null(metrics)) {
         metrics <- .null_repository_only_metrics(analyze_version(ctx))

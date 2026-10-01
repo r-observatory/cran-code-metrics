@@ -1675,7 +1675,7 @@ test_that("a columns profile within the bound is stored untouched", {
 .ds_stub_analyze <- function(version = "0.4.0-test") {
   env <- environment(run_update)
   old <- get("analyze_package", envir = env)
-  assign("analyze_package", function(dest, pkg) {
+  assign("analyze_package", function(dest, pkg, ...) {
     # With no build named, the run stamps the running one, and the text names it too.
     build <- if (is.na(version)) rpkg_analyzer_version() else version
     # The analyzer prints a dcf record, and from 0.5.0 a release_notes record too.
@@ -1704,7 +1704,7 @@ test_that("a columns profile within the bound is stored untouched", {
 .ds_stub_fallback <- function() {
   env <- environment(run_update)
   old <- get("analyze_package", envir = env)
-  assign("analyze_package", function(dest, pkg) list(
+  assign("analyze_package", function(dest, pkg, ...) list(
     summary = data.frame(package = pkg, version = "1.0", loc_r = 10L,
       latest_release_date = "2026-01-01", datasets_scanned = NA, detail_scanned = TRUE,
       stringsAsFactors = FALSE),

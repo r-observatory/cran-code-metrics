@@ -450,7 +450,7 @@ test_that("a package that failed to analyze says why in the run output", {
 
   old <- analyze_package
   assign("analyze_package",
-         function(dest, pkg) stop("no tags on this clone"),
+         function(dest, pkg, ...) stop("no tags on this clone"),
          envir = environment(run_update))
   on.exit(assign("analyze_package", old, envir = environment(run_update)), add = TRUE)
 
@@ -568,7 +568,7 @@ test_that("a cap during extraction extracts again into an emptied directory", {
   repo <- tempfile("ccm_xc_")
   on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
   .make_fake_clone("pkgX", repo, versions = c("1.0", "1.1"))
-  .local_global("analyze_with_binary", function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL) NULL)
+  .local_global("analyze_with_binary", function(dir, ...) NULL)
   want <- suppressWarnings(analyze_package(repo, "pkgX"))
 
   real  <- extract_version
@@ -696,7 +696,7 @@ test_that("a cap in a per-version step of analyze_package changes nothing it ret
                        functions = .empty_functions_df()[, -(1:2), drop = FALSE],
                        edges     = .empty_edges_df()[, -(1:2), drop = FALSE],
                        datasets  = .datasets_frame(list()))
-  .local_global("analyze_with_binary", function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL) metrics)
+  .local_global("analyze_with_binary", function(dir, ...) metrics)
   # read_at is the clock at each reading, so it differs between any two runs.
   analyse <- function() {
     res <- analyze_package(repo, "pkgCap")

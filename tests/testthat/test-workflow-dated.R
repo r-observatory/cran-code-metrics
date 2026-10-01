@@ -366,8 +366,9 @@ test_that("a run that ran out of time with work left starts the next one, on mai
   expect_true("        if: github.ref == 'refs/heads/main'" %in% chain)
   expect_true(paste0('          chain_next_run out/run-status.json "${LOOP_END:-}" ',
                      '"${START_QUEUE:-0}" "${CHAIN_DEPTH:-0}" "${CHAIN_REMAINING:-}" ',
-                     '"${TIME_BUDGET:-}"') %in% chain)
+                     '"${TIME_BUDGET:-}" "${CORES_INPUT:-}"') %in% chain)
   expect_true("          TIME_BUDGET: ${{ inputs.time_budget_seconds }}" %in% chain)
+  expect_true("          CORES_INPUT: ${{ inputs.analysis_cores }}" %in% chain)
   # The chain's inputs reach that step through env, never pasted into a script.
   expect_setequal(trimws(grep("inputs\\.chain_", yml, value = TRUE)),
                   c("CHAIN_DEPTH: ${{ inputs.chain_depth }}",
@@ -409,4 +410,57 @@ test_that("the update job may start a run, and the chain's inputs default to a f
   body <- .sh_function(.publish_sh(), "chain_next_run")
   expect_false(any(grepl("force_full|recollect|unpark|requeue|harvest", body)))
   expect_true("CHAIN_MAX_DEPTH=8" %in% .publish_sh())
+})
+
+# ---------------------------------------------------------------------------
+# The run's time budget, its cores, and the memory each shard starts with
+# ---------------------------------------------------------------------------
+
+# The lines of the one step of update.yml called `name`.
+.update_step <- function(name) {
+  yml <- .update_yml()
+  steps <- split(yml, findInterval(seq_along(yml), grep("^      - ", yml)))
+  hit <- Filter(function(s) any(grepl(paste0("name: ", name), s, fixed = TRUE)), steps)
+  expect_length(hit, 1L)
+  unname(unlist(hit))
+}
+
+test_that("a run stops starting shards after 16,800 s unless the dispatch says otherwise", {
+  yml <- .update_yml()
+  at <- grep("^      time_budget_seconds:$", yml)
+  expect_length(at, 1L)
+  expect_identical(trimws(yml[at + 2L]), 'default: "16800"')
+  # A scheduled run has no inputs, so the shard step names the same default.
+  expect_true("          BUDGET=\"${{ inputs.time_budget_seconds || '16800' }}\"" %in% yml)
+  expect_false(any(grepl("18000", yml, fixed = TRUE)))
+})
+
+test_that("the cores input reaches the analysis through set_analysis_cores and no env block", {
+  yml <- .update_yml()
+  at <- grep("^      analysis_cores:$", yml)
+  expect_length(at, 1L)
+  expect_identical(trimws(yml[at + 2L]), 'default: ""')
+  # An env block would hand the script an empty ANALYSIS_CORES on every run
+  # that names no cores, and config.R reads an empty value as NA.
+  expect_false(any(grepl("^\\s*ANALYSIS_CORES:", yml)))
+  expect_identical(trimws(grep("inputs.analysis_cores", yml, value = TRUE, fixed = TRUE)),
+                   rep("CORES_INPUT: ${{ inputs.analysis_cores }}", 2L))
+
+  shard <- .update_step("Analyze shards and publish after each")
+  expect_true("          CORES_INPUT: ${{ inputs.analysis_cores }}" %in% shard)
+  set <- match('          set_analysis_cores "${CORES_INPUT:-}" || exit 1', shard)
+  expect_false(is.na(set))
+  # After the helpers are sourced and before anything is analysed.
+  expect_gt(set, grep("source scripts/publish.sh", shard, fixed = TRUE)[[1L]])
+  expect_lt(set, min(grep("Rscript scripts/update.R", shard, fixed = TRUE)))
+})
+
+test_that("each shard logs free memory before it is analysed", {
+  shard <- .update_step("Analyze shards and publish after each")
+  header <- grep('echo "=== shard ${shard} (elapsed ${SECONDS}s) ==="', shard, fixed = TRUE)
+  expect_length(header, 1L)
+  expect_gt(header, grep("while :; do", shard, fixed = TRUE)[[1L]])
+  # A runner without free still analyses the shard.
+  expect_identical(trimws(shard[header + 1L]), "free -m || true")
+  expect_true(startsWith(trimws(shard[header + 2L]), "Rscript scripts/update.R out/"))
 })

@@ -1269,16 +1269,30 @@ chain_wanted() {  # $1=run-status.json $2=why the loop ended $3=queued at the st
 }
 
 # Start the next run of update.yml when chain_wanted says so. It carries only
-# the chain's counts and the time budget, so a rebuild, a recollect or an
-# operator release never runs twice. A failed dispatch leaves it to the schedule.
-chain_next_run() {  # $1=run-status.json $2=why the loop ended $3=queued at the start $4=depth $5=left by the run before $6=time budget
-  local left budget=()
+# the chain's counts, the time budget and the cores, so a rebuild, a recollect
+# or an operator release never runs twice. A failed dispatch leaves it to the
+# schedule.
+chain_next_run() {  # $1=run-status.json $2=why the loop ended $3=queued at the start $4=depth $5=left by the run before $6=time budget $7=cores
+  local left budget=() cores=()
   chain_wanted "$1" "$2" "$3" "$4" "$5" || return 0
   left=$(jq -r '.n_remaining' "$1")
   if [[ "${6:-}" =~ ^[0-9]+$ ]]; then budget=(-f "time_budget_seconds=$6"); fi
+  if [[ "${7:-}" =~ ^[1-9][0-9]*$ ]]; then cores=(-f "analysis_cores=$7"); fi
   if ! gh workflow run update.yml --ref main -f "chain_depth=$(( 10#$4 + 1 ))" \
-       -f "chain_remaining=${left}" ${budget[@]+"${budget[@]}"}; then
+       -f "chain_remaining=${left}" ${budget[@]+"${budget[@]}"} \
+       ${cores[@]+"${cores[@]}"}; then
     echo "::warning::could not start the next run; the next scheduled run carries on."
   fi
   return 0
+}
+
+# Export ANALYSIS_CORES when the run names a core count, and leave it unset
+# when it names none: scripts/config.R reads an empty value as NA.
+set_analysis_cores() {  # $1=the analysis_cores input, or ""
+  if [ -z "${1:-}" ]; then return 0; fi
+  if ! [[ "$1" =~ ^[1-9][0-9]*$ ]]; then
+    echo "::error::analysis_cores must be a whole number of at least 1, got '$1'."
+    return 1
+  fi
+  export ANALYSIS_CORES="$1"
 }

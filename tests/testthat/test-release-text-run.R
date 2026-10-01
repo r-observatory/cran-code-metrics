@@ -11,7 +11,7 @@
   env <- environment(run_update)
   old <- get("analyze_package", envir = env)
   withr::defer(assign("analyze_package", old, envir = env), envir = frame)
-  assign("analyze_package", function(dest, pkg) {
+  assign("analyze_package", function(dest, pkg, ...) {
     res <- list(
       summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
         latest_release_date = "2026-01-01", datasets_scanned = TRUE,

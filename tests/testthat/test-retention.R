@@ -320,7 +320,7 @@ test_that("preflight_prior_dbs reports a baseline manifest whose database never 
       withr::local_tempdir(.local_envir = frame), "0.4.0-test"),
     .local_envir = frame)
   old <- get("analyze_package", envir = env)
-  assign("analyze_package", function(dest, pkg) {
+  assign("analyze_package", function(dest, pkg, ...) {
     build <- rpkg_analyzer_version()
     # The analyzer prints a dcf record, and from 0.5.0 a release_notes record too.
     notes <- if (analyzer_at_least(build, "0.5.0")) {
@@ -1275,7 +1275,7 @@ test_that("releasing 204 legacy verdicts and re-failing 30 of them adds no rows"
   old <- get("analyze_package", envir = env)
   pkgs <- sprintf("p%03d", seq_len(204L))
   failing <- pkgs[seq_len(30L)]
-  assign("analyze_package", function(dest, pkg) list(
+  assign("analyze_package", function(dest, pkg, ...) list(
     summary = data.frame(package = pkg, version = "1.0", loc_r = 1L, n_fns_r = 1L,
                          latest_release_date = "2026-01-01", datasets_scanned = 1L,
                          detail_scanned = 1L, stringsAsFactors = FALSE),

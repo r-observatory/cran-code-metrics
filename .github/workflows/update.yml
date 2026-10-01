@@ -25,7 +25,7 @@ on:
         description: "Stop starting new shards after this many seconds (default 16800 = 4h40m)."
         default: "16800"
       analysis_cores:
-        description: "Packages analysed at once. Leave empty for every core of the runner."
+        description: "Packages analysed at once. Empty: the ANALYSIS_CORES repository variable when set, otherwise every core of the runner."
         default: ""
       harvest_descriptions:
         description: "Backfill archived-package title/description from their tarball DESCRIPTIONs (heavy, one-time; idempotent/resumable)."
@@ -273,12 +273,13 @@ jobs:
           PIPELINE_RUN_ID: ${{ github.run_id }}
           UNPARK: ${{ inputs.unpark }}
           REQUEUE: ${{ inputs.requeue }}
-          CORES_INPUT: ${{ inputs.analysis_cores }}
+          CORES_INPUT: ${{ inputs.analysis_cores || vars.ANALYSIS_CORES }}
         run: |
           set -euo pipefail
           # shellcheck source=scripts/publish.sh
           source scripts/publish.sh
-          # Exports ANALYSIS_CORES only when the dispatch names a core count.
+          # Exports ANALYSIS_CORES only when the dispatch or the repository
+          # variable names a core count.
           set_analysis_cores "${CORES_INPUT:-}" || exit 1
           TODAY="$(date -u +%Y-%m-%d)"
           METRICS_TAG="metrics-${TODAY}"
@@ -379,7 +380,7 @@ jobs:
           CHAIN_DEPTH: ${{ inputs.chain_depth }}
           CHAIN_REMAINING: ${{ inputs.chain_remaining }}
           TIME_BUDGET: ${{ inputs.time_budget_seconds }}
-          CORES_INPUT: ${{ inputs.analysis_cores }}
+          CORES_INPUT: ${{ inputs.analysis_cores || vars.ANALYSIS_CORES }}
         run: |
           set -euo pipefail
           # shellcheck source=scripts/publish.sh

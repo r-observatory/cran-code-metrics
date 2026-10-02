@@ -1013,17 +1013,29 @@ default_io <- function() {
   }
 }
 
+# How many of a shard's largest analyzer peaks run-status.json keeps.
+ANALYZER_PEAKS_KEPT <- 5L
+
 # The analyzer's statistics lines (RPKG_ANALYZER_STATS, 0.5.1 and later) summed
-# over a shard; a line that does not parse is counted as unreadable.
-.sum_analyzer_stats <- function(lines) {
+# over a shard; a line that does not parse is counted as unreadable. `packages`
+# names each line's package, for the memory figures; an absent or null key is NA.
+.sum_analyzer_stats <- function(lines, packages = NULL) {
   out <- list(runs = 0L, unreadable = 0L, builds = "",
               ms = 0, ms_compiled = 0, ms_r = 0, ms_tests = 0, ms_data = 0, ms_other = 0,
               compiled_files = 0, compiled_hits = 0, r_files = 0, tests_files = 0,
-              data_files = 0, cache_errors = 0, verify_mismatch = 0)
+              data_files = 0, cache_errors = 0, verify_mismatch = 0,
+              peak_rss_kb = NA_real_, peak_rss_package = NA_character_,
+              peak_vm_kb = NA_real_, peak_vm_package = NA_character_,
+              data_kept_max = NA_real_, data_over_budget = I(character(0L)),
+              peaks = list())
   num <- function(x) if (is.numeric(x) && length(x) == 1L && !is.na(x)) x else 0
+  fig <- function(x) if (is.numeric(x) && length(x) == 1L && !is.na(x)) as.numeric(x) else NA_real_
+  packages <- as.character(packages %||% rep(NA_character_, length(lines)))
   builds <- character(0L)
-  for (l in lines) {
-    s <- tryCatch(jsonlite::parse_json(l), error = function(e) NULL)
+  rss <- vm <- kept <- numeric(0L)
+  over <- character(0L)
+  for (i in seq_along(lines)) {
+    s <- tryCatch(jsonlite::parse_json(lines[[i]]), error = function(e) NULL)
     if (!is.list(s) || !is.numeric(s$ms)) {
       out$unreadable <- out$unreadable + 1L
       next
@@ -1038,9 +1050,39 @@ default_io <- function() {
       out[[paste0(kind, "_files")]] <- out[[paste0(kind, "_files")]] + num(s[[kind]]$files)
     }
     out$compiled_hits <- out$compiled_hits + num(s$compiled$hits)
+    pkg <- packages[[i]]
+    rss <- c(rss, stats::setNames(fig(s$peak_rss_kb), pkg))
+    vm  <- c(vm,  stats::setNames(fig(s$peak_vm_kb), pkg))
+    kept <- c(kept, fig(s$data_kept_max))
+    if (num(s$data_over_budget) > 0 && !is.na(pkg)) over <- c(over, pkg)
   }
   out$builds <- paste(sort(unique(builds)), collapse = " ")
+  if (any(!is.na(kept))) out$data_kept_max <- max(kept, na.rm = TRUE)
+  if (any(!is.na(rss))) {
+    out$peak_rss_kb      <- max(rss, na.rm = TRUE)
+    out$peak_rss_package <- names(rss)[[which.max(rss)]]
+  }
+  if (any(!is.na(vm))) {
+    out$peak_vm_kb      <- max(vm, na.rm = TRUE)
+    out$peak_vm_package <- names(vm)[[which.max(vm)]]
+  }
+  out$data_over_budget <- I(sort(unique(over)))
+  out$peaks <- .analyzer_peaks(rss, vm)
   out
+}
+
+# Each package's largest resident and virtual peak over its versions, largest
+# resident first and ties by name. `rss` and `vm` are named by package.
+.analyzer_peaks <- function(rss, vm, keep = ANALYZER_PEAKS_KEPT) {
+  has <- !is.na(rss) & !is.na(names(rss))
+  if (!any(has)) return(list())
+  top <- function(x) if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE)
+  by_rss <- tapply(rss[has], names(rss)[has], top)
+  by_vm  <- tapply(vm[has],  names(rss)[has], top)
+  pkgs   <- names(by_rss)[order(-by_rss, names(by_rss))]
+  lapply(utils::head(pkgs, keep), function(p) {
+    list(package = p, peak_rss_kb = by_rss[[p]], peak_vm_kb = by_vm[[p]])
+  })
 }
 
 # A shard's analyzer statistics and worker time by phase, from the worker
@@ -1050,8 +1092,11 @@ default_io <- function() {
   tally <- function(name) {
     sum(vapply(rs, function(r) as.numeric(r$tally[[name]] %||% 0), numeric(1L)))
   }
-  analyzer <- .sum_analyzer_stats(unlist(lapply(rs, function(r) r$analyzer_stats),
-                                         use.names = FALSE))
+  lines <- lapply(rs, function(r) as.character(r$analyzer_stats))
+  analyzer <- .sum_analyzer_stats(
+    unlist(lines, use.names = FALSE),
+    packages = rep(vapply(rs, function(r) as.character(r$package %||% NA_character_),
+                          character(1L)), lengths(lines)))
   analyzer$incomplete_parses <- as.integer(tally("incomplete_parses"))
   versions <- tally("versions_s")
   phases <- list(
@@ -1078,6 +1123,43 @@ default_io <- function() {
           a$runs, a$ms / 1000, a$compiled_files,
           if (a$compiled_files > 0) 100 * a$compiled_hits / a$compiled_files else 0,
           a$cache_errors, a$verify_mismatch, a$incomplete_parses)
+}
+
+# kB as MiB, to one decimal.
+.kb_mib <- function(kb) sprintf("%.1f MiB", kb / 1024)
+
+# The shard's analyzer memory line for the run log, from .sum_analyzer_stats.
+# The peaks come from Linux alone; the data figures only from a build that
+# counts what its data files keep.
+.analyzer_memory_line <- function(a, max_names = 20L) {
+  peaks <- c(
+    if (!is.na(a$peak_rss_kb))
+      sprintf("peak resident %s (%s)", .kb_mib(a$peak_rss_kb), a$peak_rss_package),
+    if (!is.na(a$peak_vm_kb))
+      sprintf("peak virtual %s (%s)", .kb_mib(a$peak_vm_kb), a$peak_vm_package))
+  over <- as.character(a$data_over_budget)
+  data <- if (!is.na(a$data_kept_max) || length(over)) {
+    shown <- utils::head(over, max_names)
+    c(if (!is.na(a$data_kept_max))
+        sprintf("largest data kept %s", .kb_mib(a$data_kept_max / 1024)),
+      paste0("over the data budget: ",
+             if (length(over)) paste(shown, collapse = " ") else "none",
+             if (length(over) > length(shown))
+               sprintf(" and %d more", length(over) - length(shown)) else ""))
+  }
+  if (is.null(peaks) && is.null(data)) {
+    return("analyzer memory: no memory figures from this build")
+  }
+  paste0("analyzer memory: ",
+         paste(c(if (length(peaks)) peaks else "no peak figures on this platform", data),
+               collapse = ", "))
+}
+
+# x with every single NA as a logical NA, which write_manifest writes as null;
+# a number that is NA would be written as the string "NA".
+.na_as_null <- function(x) {
+  if (is.list(x) && !inherits(x, "AsIs")) return(lapply(x, .na_as_null))
+  if (length(x) == 1L && is.na(x)) NA else x
 }
 
 # The shard's worker time by phase for the run log.
@@ -1585,6 +1667,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # ---- 8a. Analyzer statistics and worker time ------------------------------
   telemetry <- .shard_telemetry(results)
   cat(.analyzer_stats_line(telemetry$analyzer), "\n",
+      .analyzer_memory_line(telemetry$analyzer), "\n",
       .worker_phase_line(telemetry$phases), "\n", sep = "", file = stdout())
 
   # ---- 8b. Shard receipt ----------------------------------------------------
@@ -1746,7 +1829,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       n_tried_skipped = length(tried_pkgs),
                       n_recheck_due = length(recheck_pkgs),
                       latest_by_build = .latest_by_build(con),
-                      analyzer_stats = telemetry$analyzer,
+                      analyzer_stats = .na_as_null(telemetry$analyzer),
                       worker_phases = telemetry$phases))
 
   # ---- 8e. Retention guard --------------------------------------------------

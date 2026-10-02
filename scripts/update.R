@@ -992,9 +992,20 @@ default_io <- function() {
   }
 }
 
+# A kB figure of this process from /proc/self/status, such as VmHWM, its peak
+# resident size. NA where there is no such file or line, as anywhere but Linux.
+.proc_status_kb <- function(key, path = "/proc/self/status") {
+  if (!file.exists(path) || dir.exists(path)) return(NA_real_)
+  lines <- tryCatch(readLines(path, warn = FALSE), error = function(e) character(0L))
+  hit   <- grep(sprintf("^%s:[[:space:]]*[0-9]+", key), lines, value = TRUE)
+  if (!length(hit)) return(NA_real_)
+  as.numeric(sub("^[^:]*:[[:space:]]*([0-9]+).*$", "\\1", hit[[1L]]))
+}
+
 # worker, run in its own analyzer directory WORK_DIR/.rpa/<pkg> (no clone can land
 # there) with RPKG_ANALYZER_STATS set and, unless RPA_CACHE is off, a cache dir.
-# A list result gains the worker tally and the statistics lines.
+# A list result gains the worker tally, the statistics lines and `memory`: the
+# worker's peak resident size and the in-memory size of its result.
 .with_worker_telemetry <- function(worker) {
   force(worker)
   function(pkg) {
@@ -1019,6 +1030,9 @@ default_io <- function() {
     res <- worker(pkg)
     .tally_add("package_s", .secs_since(t0))
     if (is.list(res)) {
+      # Read before the result is copied to the parent, so that copy is not in it.
+      res$memory <- list(peak_rss_kb = .proc_status_kb("VmHWM"),
+                         result_bytes = as.numeric(utils::object.size(res)))
       res$tally <- .tally_snapshot()
       res$analyzer_stats <- if (file.exists(stats)) readLines(stats, warn = FALSE) else character(0L)
     }
@@ -1098,8 +1112,30 @@ ANALYZER_PEAKS_KEPT <- 5L
   })
 }
 
-# A shard's analyzer statistics and worker time by phase, from the worker
-# results; a fork that crashed returned no list and adds nothing.
+# The largest worker peak and the largest result over a shard's worker results,
+# each with its package; NA where no worker gave the figure.
+.worker_memory <- function(rs) {
+  out <- list(peak_rss_kb = NA_real_, peak_rss_package = NA_character_,
+              result_bytes = NA_real_, result_package = NA_character_)
+  pkg <- vapply(rs, function(r) as.character(r$package %||% NA_character_), character(1L))
+  fig <- function(name) {
+    vapply(rs, function(r) as.numeric(r$memory[[name]] %||% NA_real_), numeric(1L))
+  }
+  rss   <- fig("peak_rss_kb")
+  bytes <- fig("result_bytes")
+  if (any(!is.na(rss))) {
+    out$peak_rss_kb      <- max(rss, na.rm = TRUE)
+    out$peak_rss_package <- pkg[[which.max(rss)]]
+  }
+  if (any(!is.na(bytes))) {
+    out$result_bytes   <- max(bytes, na.rm = TRUE)
+    out$result_package <- pkg[[which.max(bytes)]]
+  }
+  out
+}
+
+# A shard's analyzer statistics, worker time by phase and worker memory, from
+# the worker results; a fork that crashed returned no list and adds nothing.
 .shard_telemetry <- function(results) {
   rs <- Filter(is.list, results)
   tally <- function(name) {
@@ -1122,7 +1158,7 @@ ANALYZER_PEAKS_KEPT <- 5L
     other_s    = max(0, tally("package_s") - tally("clone_s") - versions),
     dataset_memo_hits   = as.integer(tally("memo_hits")),
     dataset_memo_misses = as.integer(tally("memo_misses")))
-  list(analyzer = analyzer, phases = phases)
+  list(analyzer = analyzer, phases = phases, workers = .worker_memory(rs))
 }
 
 # The shard's analyzer line for the run log.
@@ -1166,6 +1202,18 @@ ANALYZER_PEAKS_KEPT <- 5L
   paste0("analyzer memory: ",
          paste(c(if (length(peaks)) peaks else "no peak figures on this platform", data),
                collapse = ", "))
+}
+
+# The shard's worker memory line for the run log, from .worker_memory. The
+# peak is the worker's alone: the copy of its result to the parent comes later.
+.worker_memory_line <- function(w) {
+  if (is.na(w$peak_rss_kb) && is.na(w$result_bytes)) return("worker memory: no memory figures")
+  paste0("worker memory: ",
+         if (is.na(w$peak_rss_kb)) "no peak figure on this platform"
+         else sprintf("peak resident %s (%s)", .kb_mib(w$peak_rss_kb), w$peak_rss_package),
+         if (!is.na(w$result_bytes))
+           sprintf(", largest result %s (%s)", .kb_mib(w$result_bytes / 1024), w$result_package)
+         else "")
 }
 
 # x with every single NA as a logical NA, which write_manifest writes as null;
@@ -1679,11 +1727,12 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     n_versions           = nrow(fresh_summary)
   )
 
-  # ---- 8a. Analyzer statistics and worker time ------------------------------
+  # ---- 8a. Analyzer statistics, worker time and memory ----------------------
   telemetry <- .shard_telemetry(results)
   cat(.analyzer_stats_line(telemetry$analyzer), "\n",
       .analyzer_memory_line(telemetry$analyzer), "\n",
-      .worker_phase_line(telemetry$phases), "\n", sep = "", file = stdout())
+      .worker_phase_line(telemetry$phases), "\n",
+      .worker_memory_line(telemetry$workers), "\n", sep = "", file = stdout())
 
   # ---- 8b. Shard receipt ----------------------------------------------------
   # One-line closing summary, printed after the collection loop and before the
@@ -1845,7 +1894,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       n_recheck_due = length(recheck_pkgs),
                       latest_by_build = .latest_by_build(con),
                       analyzer_stats = .na_as_null(telemetry$analyzer),
-                      worker_phases = telemetry$phases))
+                      worker_phases = telemetry$phases,
+                      worker_memory = .na_as_null(telemetry$workers)))
 
   # ---- 8e. Retention guard --------------------------------------------------
   # The published database is the pipeline's accumulated state, so publishing a

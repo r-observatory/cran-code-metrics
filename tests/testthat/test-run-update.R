@@ -1272,3 +1272,116 @@ test_that("a package whose analyzer exited non-zero prints its line with the sta
   expect_length(grep("pkgC", log), 0L)
   expect_length(grep("^\\[4/4\\] ok pkgD: 1 versions in [0-9.]+s$", log), 1L)
 })
+
+# ---------------------------------------------------------------------------
+# The shard's worker memory line
+# ---------------------------------------------------------------------------
+
+test_that("a figure is read from the process status file, and is NA where there is none", {
+  status <- withr::local_tempfile()
+  writeLines(c("Name:\tR", "VmPeak:\t 2101248 kB", "VmHWM:\t  239616 kB", "Threads:\t1"), status)
+  expect_equal(.proc_status_kb("VmHWM", status), 239616)
+  expect_equal(.proc_status_kb("VmPeak", status), 2101248)
+  expect_true(is.na(.proc_status_kb("VmSwap", status)))
+  expect_true(is.na(.proc_status_kb("VmHWM", file.path(withr::local_tempdir(), "none"))))
+  # A directory, or a line that is no number, is no figure and no error.
+  expect_true(is.na(.proc_status_kb("VmHWM", withr::local_tempdir())))
+  writeLines("VmHWM:\tunknown", status)
+  expect_true(is.na(.proc_status_kb("VmHWM", status)))
+  here <- .proc_status_kb("VmHWM")
+  if (file.exists("/proc/self/status")) expect_gt(here, 0) else expect_true(is.na(here))
+})
+
+test_that("a worker returns its peak and the size of its result, and fails nowhere", {
+  .local_global("WORK_DIR", withr::local_tempdir())
+  res <- .with_worker_telemetry(function(pkg) {
+    list(package = pkg, ok = TRUE, summary = data.frame(x = seq_len(1000L)))
+  })("pkgA")
+  expect_setequal(names(res$memory), c("peak_rss_kb", "result_bytes"))
+  expect_gt(res$memory$result_bytes, 4000)
+  if (file.exists("/proc/self/status")) {
+    expect_gt(res$memory$peak_rss_kb, 0)
+  } else {
+    expect_true(is.na(res$memory$peak_rss_kb))
+  }
+  # The size is the result's own, before the tally and the statistics lines join it.
+  bare <- list(package = "pkgA", ok = TRUE, summary = data.frame(x = seq_len(1000L)))
+  expect_equal(res$memory$result_bytes, as.numeric(utils::object.size(bare)))
+  # A fork that raised returned no list, and gains nothing.
+  expect_identical(.with_worker_telemetry(function(pkg) "boom")("pkgB"), "boom")
+})
+
+test_that("the shard keeps the largest worker peak and the largest result, each with its package", {
+  tel <- .shard_telemetry(list(
+    list(package = "pkgA", memory = list(peak_rss_kb = 239616, result_bytes = 1048576)),
+    NULL, structure("boom", class = "try-error"),
+    list(package = "pkgB", memory = list(peak_rss_kb = 102400, result_bytes = 52428800)),
+    list(package = "pkgC")))
+  expect_equal(tel$workers, list(peak_rss_kb = 239616, peak_rss_package = "pkgA",
+                                 result_bytes = 52428800, result_package = "pkgB"))
+  expect_identical(.worker_memory_line(tel$workers),
+                   "worker memory: peak resident 234.0 MiB (pkgA), largest result 50.0 MiB (pkgB)")
+
+  off_linux <- .shard_telemetry(list(
+    list(package = "pkgA", memory = list(peak_rss_kb = NA_real_, result_bytes = 2097152))))
+  expect_true(is.na(off_linux$workers$peak_rss_kb))
+  expect_true(is.na(off_linux$workers$peak_rss_package))
+  expect_identical(.worker_memory_line(off_linux$workers),
+                   "worker memory: no peak figure on this platform, largest result 2.0 MiB (pkgA)")
+  expect_identical(.worker_memory_line(.shard_telemetry(list(NULL))$workers),
+                   "worker memory: no memory figures")
+})
+
+test_that("the shard prints its worker memory line and writes it to run-status.json alone", {
+  skip_on_os("windows")
+  out_dir <- withr::local_tempdir()
+  .local_global("WORK_DIR", withr::local_tempdir())
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_memory_bin(withr::local_tempdir()),
+                      RPA_CACHE = NA, RPKG_ANALYZER_STATS = NA)
+  pkg_df <- data.frame(package = c("pkgA", "pkgB"), latest_version = c("1.1", "1.0"),
+                       stringsAsFactors = FALSE)
+  log <- capture.output(run_update(
+    .fake_io(pkg_df, version_map = list(pkgA = c("1.0", "1.1"))), out_dir, shard_size = 10L))
+
+  line <- grep("^worker memory: ", log, value = TRUE)
+  expect_length(line, 1L)
+  expect_match(line, "largest result [0-9.]+ MiB \\(pkg[AB]\\)$")
+  if (file.exists("/proc/self/status")) {
+    expect_match(line, "^worker memory: peak resident [0-9.]+ MiB \\(pkg[AB]\\), ")
+  } else {
+    expect_match(line, "^worker memory: no peak figure on this platform, ")
+  }
+  # After the worker time, which it follows in the log.
+  expect_identical(grep("^worker memory: ", log), grep("^worker time: ", log) + 1L)
+
+  st <- .run_status(out_dir)$worker_memory
+  expect_setequal(names(st),
+                  c("peak_rss_kb", "peak_rss_package", "result_bytes", "result_package"))
+  expect_gt(st$result_bytes, 0)
+  expect_true(st$result_package %in% c("pkgA", "pkgB"))
+  if (file.exists("/proc/self/status")) {
+    expect_gt(st$peak_rss_kb, 0)
+  } else {
+    expect_null(st$peak_rss_kb)
+    expect_null(st$peak_rss_package)
+  }
+  for (f in c("code-manifest.json", "data-manifest.json", "text-manifest.json")) {
+    published <- jsonlite::fromJSON(file.path(out_dir, f), simplifyVector = FALSE)
+    expect_false("worker_memory" %in% c(names(published), names(published$bootstrap)), info = f)
+  }
+})
+
+test_that("a package that failed still reports its worker's memory", {
+  skip_on_os("windows")
+  out_dir <- withr::local_tempdir()
+  .local_global("WORK_DIR", withr::local_tempdir())
+  .local_global("ANALYSIS_CORES", 1L)
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_memory_bin(
+    withr::local_tempdir(), exits = c("pkgA/1.0" = 134L)), RPA_CACHE = NA,
+    RPKG_ANALYZER_STATS = NA)
+  pkg_df <- data.frame(package = "pkgA", latest_version = "1.0", stringsAsFactors = FALSE)
+  log <- capture.output(run_update(.fake_io(pkg_df), out_dir, shard_size = 10L))
+  expect_match(grep("^worker memory: ", log, value = TRUE),
+               "largest result [0-9.]+ MiB \\(pkgA\\)$")
+  expect_identical(.run_status(out_dir)$worker_memory$result_package, "pkgA")
+})

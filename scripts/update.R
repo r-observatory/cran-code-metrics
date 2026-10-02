@@ -406,6 +406,16 @@
           p$timeout, p$legacy, as.integer(n_tried), sum(st$recheck_due))
 }
 
+# The shard plan's line on the analyzer's address-space limit.
+.memory_limit_line <- function(limit_mb = ANALYZER_MEMORY_LIMIT_MB) {
+  if (.memory_limit_in_force(limit_mb) > 0) {
+    return(sprintf("analyzer memory limit: %.0f MiB of address space for each analyzer",
+                   limit_mb))
+  }
+  sprintf("analyzer memory limit: none%s (ANALYZER_MEMORY_LIMIT_MB is %.0f)",
+          if (isTRUE(limit_mb > 0)) ", prlimit was not found" else "", limit_mb)
+}
+
 # The shard receipt's verdict line.
 .verdict_receipt_line <- function(stages, over_cap, n_standing) {
   by <- .stage_counts(stages)
@@ -1292,9 +1302,11 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # build proves it reads the flag first.
   if (analyzer_at_least(analyzer_version, "0.5.0") &&
       !rpkg_analyzer_selfcheck(ANALYZER_INPUT_KIND)) {
+    limit_mb <- .memory_limit_in_force()
     stop(sprintf(paste0(
-      "rpkg-analyzer %s did not answer --input-kind %s with a summary naming it; ",
-      "stopping before any shard"), analyzer_version, ANALYZER_INPUT_KIND),
+      "rpkg-analyzer %s did not answer --input-kind %s with a summary naming it%s; ",
+      "stopping before any shard"), analyzer_version, ANALYZER_INPUT_KIND,
+      if (limit_mb > 0) sprintf(" under its %.0f MiB address-space limit", limit_mb) else ""),
       call. = FALSE)
   }
 
@@ -1463,6 +1475,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     file = stdout())
   cat(.verdict_plan_line(analyzer_version, n_released, verdicts, length(tried_pkgs)),
       file = stdout())
+  cat(.memory_limit_line(), "\n", sep = "", file = stdout())
   flush(stdout())
 
   # ---- 6. Analyze the shard (parallel) -------------------------------------
@@ -1893,6 +1906,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       n_tried_skipped = length(tried_pkgs),
                       n_recheck_due = length(recheck_pkgs),
                       latest_by_build = .latest_by_build(con),
+                      analyzer_memory_limit_mb = .memory_limit_in_force(),
                       analyzer_stats = .na_as_null(telemetry$analyzer),
                       worker_phases = telemetry$phases,
                       worker_memory = .na_as_null(telemetry$workers)))

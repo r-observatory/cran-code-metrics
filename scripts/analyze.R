@@ -813,6 +813,8 @@ analyze_package <- function(repo_dir, package, stamped = character(0L)) {
   memo <- .record_memo()
   # Where each analyzer run appends its statistics line, asked once a package.
   stats_file <- .analyzer_stats_file()
+  # What holds each analyzer run to its memory limit, looked for once a package.
+  prlimit <- .prlimit_bin()
 
   for (i in seq_len(nrow(versions_df))) {
     v      <- versions_df$version[i]
@@ -889,7 +891,7 @@ analyze_package <- function(repo_dir, package, stamped = character(0L)) {
       # from the same extracted source); fall back to the R groups when absent.
       # A version with an analyzer row is never handed to the fallback.
       metrics <- analyze_with_binary(tmp, memo = memo, protect = v %in% stamped,
-                                     stats = stats_file)
+                                     stats = stats_file, prlimit = prlimit)
       binary_ran <- !is.null(metrics)
       if (is.null(metrics)) {
         metrics <- .null_repository_only_metrics(analyze_version(ctx))

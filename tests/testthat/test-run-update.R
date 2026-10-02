@@ -1265,8 +1265,8 @@ test_that("a package whose analyzer exited non-zero prints its line with the sta
   expect_length(grep("^\\[1/4\\] ok pkgA: 2 versions in [0-9.]+s \\[analyzer exit 101 x2\\]$",
                      log), 1L)
   expect_length(grep(paste0("^\\[2/4\\] FAIL pkgB: crash after [0-9.]+s ",
-                            "\\[analyzer exit 134 x1\\]: analyzer exited with status 134$"),
-                     log), 1L)
+                            "\\[analyzer exit 134 x1\\]: analyzer exited with status 134",
+                            .limit_note(.memory_limit_in_force()), "$"), log), 1L)
   # A package whose analyzer exited 0 is still thinned out of the log, and the
   # last one still prints as it did.
   expect_length(grep("pkgC", log), 0L)

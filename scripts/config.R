@@ -92,6 +92,20 @@ ANALYSIS_CORES <- {
 # Overridable via WORKER_TIMEOUT env var.
 WORKER_TIMEOUT <- as.integer(Sys.getenv("WORKER_TIMEOUT", unset = "2400"))
 
+# The limit an ANALYZER_MEMORY_LIMIT_MB value asks for, in MiB: 0 for no limit,
+# and the default for a value that is empty or not a whole number of 0 or more.
+.memory_limit_mb <- function(value, default = 3072) {
+  value <- trimws(value)
+  if (grepl("^[0-9]+$", value)) as.numeric(value) else default
+}
+
+# The most address space one analyzer process may take, in MiB; 0 for no limit.
+# An analyzer that asks for more aborts, which fails its package as a crash and
+# leaves its stored rows alone. Held with prlimit, so it is in force only where
+# prlimit is on the path. Overridable via ANALYZER_MEMORY_LIMIT_MB env var.
+ANALYZER_MEMORY_LIMIT_MB <- .memory_limit_mb(
+  Sys.getenv("ANALYZER_MEMORY_LIMIT_MB", unset = ""))
+
 # The most one worker's progress line may be, in bytes.
 #
 # The workers are mclapply forks, all writing to the same inherited fd 1. A

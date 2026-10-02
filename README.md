@@ -94,6 +94,8 @@ An `analyzer memory:` line follows the `analyzer:` line. From a build that write
 
 A `worker memory:` line follows the `worker time:` line: the largest peak resident size of any worker, read from its own `/proc/self/status` when its package is done, and the largest result a worker returned, as R holds it in memory, each with its package. `run-status.json` keeps them under `worker_memory`. The peak leaves out the copy of the result the worker then sends to the parent, and there is no peak off Linux.
 
+Each analyzer run is held to `ANALYZER_MEMORY_LIMIT_MB` MiB of address space with `prlimit --as`, where `prlimit` is on the path. The default is 3072 and `0` means no limit. The analyzer aborts when an allocation fails, so a run that asks for more exits with status 134: its package fails with stage `crash`, nothing is written for it and its stored rows stay as they were. A failure with a non-zero exit names the limit it ran under in its reason, so an abort at the limit can be told from another crash. The self-check runs under the same limit. The shard plan prints the limit in force and `run-status.json` keeps it as `analyzer_memory_limit_mb`. Without `prlimit`, as on macOS, there is no limit and the plan line says so. A value of `ANALYZER_MEMORY_LIMIT_MB` that is not a whole number of zero or more leaves the default. A build before 0.5.2 can write a wrong record under a limit instead of aborting, so the limit belongs with a 0.5.2 pin or later.
+
 A package's own line in the shard log names each non-zero exit status its analyzer runs ended with and how many versions ended that way, as in `[analyzer exit 134 x1]`. Such a package always prints its line, whether it then failed or its versions fell back to the R metrics.
 
 ## Retention

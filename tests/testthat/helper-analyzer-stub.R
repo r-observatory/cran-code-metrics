@@ -23,11 +23,18 @@
 #' @param reads   Package versions the stub will read, matched against the
 #'   Version field of the DESCRIPTION in the directory it is pointed at.
 #' @param input_kind When set, each summary names it, as a 0.5.0 build does.
+#' @param stats When TRUE, each read appends a statistics line to the file
+#'   RPKG_ANALYZER_STATS names, as a 0.5.1 build does.
 .stub_analyzer_bin <- function(dir, version, reads = character(0L),
-                              input_kind = NULL) {
+                              input_kind = NULL, stats = FALSE) {
   stub <- file.path(dir, "stub-analyzer.sh")
   kind <- if (is.null(input_kind)) "" else
     sprintf(',\\"input_kind\\":\\"%s\\"', input_kind)
+  stats_line <- if (isTRUE(stats)) {
+    sprintf(paste0("  if [ -n \"${RPKG_ANALYZER_STATS:-}\" ]; then ",
+                   "echo '{\"build\":\"%s\",\"ms\":1}' >> \"$RPKG_ANALYZER_STATS\"; fi"),
+            version)
+  }
   read_branch <- if (length(reads) > 0L) {
     c(
       'dir=$(echo "$1" | tr -d "\'")',
@@ -38,6 +45,7 @@
              '\\"file\\":\\"data/d.rda\\",\\"class\\":\\"data.frame\\",',
              '\\"kind\\":\\"table\\",\\"confidence\\":\\"exact\\",',
              '\\"content_fp\\":\\"cf\\",\\"schema_fp\\":\\"sf\\"}"'),
+      stats_line,
       "  exit 0",
       "  ;;",
       "esac")

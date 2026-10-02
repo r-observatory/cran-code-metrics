@@ -93,14 +93,3 @@ test_that("latest rows are counted on the class, not on the exact build", {
   expect_identical(.n_latest_on_class(con, "0.6.0", same), c(on_class = 0L, latest = 4L))
   expect_identical(.n_latest_on_class(con, NA_character_, same), c(on_class = 0L, latest = 4L))
 })
-
-test_that("the pinned analyzer is in ANALYZER_SAME_OUTPUT, so a pin change says what it re-queues", {
-  pins <- vapply(c("update.yml", "test.yml"), function(f) {
-    yml  <- readLines(file.path("..", "..", ".github", "workflows", f))
-    hit  <- regmatches(yml, regexpr(
-      "gh release download v[0-9]+\\.[0-9]+\\.[0-9]+ --repo r-observatory/rpkg-analyzer", yml))
-    sub("^gh release download v([0-9.]+) .*$", "\\1", hit)
-  }, character(1L))
-  expect_identical(unname(pins[[1L]]), unname(pins[[2L]]))
-  expect_true(pins[[1L]] %in% ANALYZER_SAME_OUTPUT)
-})

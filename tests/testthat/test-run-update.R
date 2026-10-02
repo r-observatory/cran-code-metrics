@@ -1194,3 +1194,81 @@ test_that("a build that writes no memory keys says so, and run-status.json holds
   expect_identical(st$data_over_budget, list())
   expect_identical(st$peaks, list())
 })
+
+# ---------------------------------------------------------------------------
+# The analyzer's exit status on the worker's line
+# ---------------------------------------------------------------------------
+
+test_that(".worker_line carries the analyzer's non-zero exits, ok or not", {
+  expect_identical(
+    .worker_line(2L, 9L, TRUE, "pkgA", "ok", 3L, 1.5, analyzer_exit = "101 x2"),
+    "[2/9] ok pkgA: 3 versions in 1.5s [analyzer exit 101 x2]\n")
+  expect_identical(
+    .worker_line(1L, 9L, FALSE, "pkgB", "crash", 0L, 0.5, "it died", analyzer_exit = "134 x1"),
+    "[1/9] FAIL pkgB: crash after 0.5s [analyzer exit 134 x1]: it died\n")
+  expect_identical(
+    .worker_line(3L, 9L, TRUE, "pkgC", "ok", 1L, 700, worker_timeout = 600L,
+                 analyzer_exit = "1 x1"),
+    "[3/9] ok pkgC: 1 versions in 700.0s (past the 600s cap) [analyzer exit 1 x1]\n")
+  expect_identical(.worker_line(2L, 9L, TRUE, "pkgA", "ok", 3L, 1.5, analyzer_exit = ""),
+                   .worker_line(2L, 9L, TRUE, "pkgA", "ok", 3L, 1.5))
+  # The exits count toward the one pipe write the line must fit in.
+  long <- .worker_line(1L, 9L, FALSE, "pkgB", "crash", 0L, 0.5, strrep("x", 2000L),
+                       analyzer_exit = "134 x1")
+  expect_lte(nchar(long, type = "bytes"), WORKER_LINE_MAX_BYTES)
+  expect_match(long, "^\\[1/9\\] FAIL pkgB: crash after 0.5s \\[analyzer exit 134 x1\\]: x+\\.\\.\\.\n$")
+})
+
+test_that("the exits a worker counted read as status and count, and as nothing when all were 0", {
+  expect_identical(.analyzer_exit_text(list(analyzer_s = 2, package_s = 3)), "")
+  expect_identical(.analyzer_exit_text(list()), "")
+  expect_identical(.analyzer_exit_text(list(analyzer_exit_134 = 1, analyzer_exit_101 = 2,
+                                            analyzer_exit_2 = 11, analyzer_s = 2)),
+                   "2 x11, 101 x2, 134 x1")
+})
+
+test_that("analyze_with_binary counts each non-zero exit in the worker tally, and no zero exit", {
+  skip_on_os("windows")
+  tree <- withr::local_tempdir()
+  writeLines(c("Package: pkgA", "Version: 1.0"), file.path(tree, "DESCRIPTION"))
+  dir <- withr::local_tempdir()
+  withr::local_envvar(RPKG_ANALYZER_STATS = NA)
+  .tally_reset()
+  withr::defer(.tally_reset())
+
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_memory_bin(dir))
+  expect_identical(analyze_with_binary(tree)$n_fns_r, 1L)
+  expect_identical(.analyzer_exit_text(.tally_snapshot()), "")
+
+  .stub_memory_bin(dir, exits = c("pkgA/1.0" = 101L))
+  expect_null(analyze_with_binary(tree))
+  expect_error(analyze_with_binary(tree, protect = TRUE), class = "analyzer_failed")
+  .stub_memory_bin(dir, exits = c("pkgA/1.0" = 134L))
+  expect_error(analyze_with_binary(tree), class = "analyzer_killed")
+  expect_identical(.analyzer_exit_text(.tally_snapshot()), "101 x2, 134 x1")
+})
+
+test_that("a package whose analyzer exited non-zero prints its line with the status", {
+  skip_on_os("windows")
+  out_dir <- withr::local_tempdir()
+  .local_global("WORK_DIR", withr::local_tempdir())
+  # One core, so the workers run in this process and their lines are captured.
+  .local_global("ANALYSIS_CORES", 1L)
+  # pkgA takes the R fallback on both versions, pkgB is aborted, pkgC and pkgD pass.
+  stub <- .stub_memory_bin(withr::local_tempdir(), exits = c(
+    "pkgA/1.0" = 101L, "pkgA/1.1" = 101L, "pkgB/1.0" = 134L))
+  withr::local_envvar(RPKG_ANALYZER_BIN = stub, RPA_CACHE = NA, RPKG_ANALYZER_STATS = NA)
+  pkg_df <- data.frame(package = c("pkgA", "pkgB", "pkgC", "pkgD"),
+                       latest_version = c("1.1", "1.0", "1.0", "1.0"), stringsAsFactors = FALSE)
+  log <- capture.output(run_update(
+    .fake_io(pkg_df, version_map = list(pkgA = c("1.0", "1.1"))), out_dir, shard_size = 10L))
+  expect_length(grep("^\\[1/4\\] ok pkgA: 2 versions in [0-9.]+s \\[analyzer exit 101 x2\\]$",
+                     log), 1L)
+  expect_length(grep(paste0("^\\[2/4\\] FAIL pkgB: crash after [0-9.]+s ",
+                            "\\[analyzer exit 134 x1\\]: analyzer exited with status 134$"),
+                     log), 1L)
+  # A package whose analyzer exited 0 is still thinned out of the log, and the
+  # last one still prints as it did.
+  expect_length(grep("pkgC", log), 0L)
+  expect_length(grep("^\\[4/4\\] ok pkgD: 1 versions in [0-9.]+s$", log), 1L)
+})

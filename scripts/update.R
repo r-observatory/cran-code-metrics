@@ -70,9 +70,11 @@
 #'   was; anything else is appended after a colon, clipped so the whole line
 #'   still fits in one pipe write.
 #' @param elapsed Seconds the worker took; NA for a fork that returned nothing.
+#' @param analyzer_exit The analyzer's non-zero exits, from .analyzer_exit_text;
+#'   "" leaves them off.
 #' @return A single string ending in one newline.
 .worker_line <- function(idx, n, ok, pkg, stage, nver, elapsed, reason = NULL,
-                         worker_timeout = WORKER_TIMEOUT) {
+                         worker_timeout = WORKER_TIMEOUT, analyzer_exit = "") {
   stem <- if (isTRUE(ok)) {
     sprintf("[%d/%d] ok %s: %d versions in %.1fs%s", idx, n, pkg, nver, elapsed,
             if (isTRUE(elapsed >= worker_timeout))
@@ -82,6 +84,7 @@
   } else {
     sprintf("[%d/%d] FAIL %s: %s after %.1fs", idx, n, pkg, stage, elapsed)
   }
+  if (nzchar(analyzer_exit)) stem <- sprintf("%s [analyzer exit %s]", stem, analyzer_exit)
   if (is.null(reason) || !nzchar(trimws(as.character(reason)))) {
     return(paste0(stem, "\n"))
   }
@@ -91,6 +94,16 @@
   room <- WORKER_LINE_MAX_BYTES - nchar(stem, type = "bytes") - 3L
   if (room <= 3L) return(paste0(stem, "\n"))
   paste0(stem, ": ", .clip_bytes(reason, room), "\n")
+}
+
+# The analyzer's non-zero exits in a worker's tally, as "101 x2, 134 x1": each
+# status and how many versions ended with it. "" when every exit was zero.
+.analyzer_exit_text <- function(tally) {
+  nm <- grep("^analyzer_exit_[0-9]+$", names(tally), value = TRUE)
+  if (!length(nm)) return("")
+  status <- as.integer(sub("^analyzer_exit_", "", nm))
+  o <- order(status)
+  paste(sprintf("%d x%d", status[o], as.integer(unlist(tally[nm[o]]))), collapse = ", ")
 }
 
 # The stage of an error analyze_package raised. An elapsed time at the cap also
@@ -1443,7 +1456,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # Thinned per-worker completion line, emitted FROM the fork so it streams live
     # during the otherwise-silent parallel phase. Prints only on every 25th queue
     # position, every failure, every slow (>=30s) package, every package past
-    # the cap, and the last position.
+    # the cap, every package whose analyzer exited non-zero, and the last position.
     # One fully-formed cat() to stdout: forks reorder whole lines but never
     # byte-interleave, and fd 1 is disjoint from mclapply's result pipe. Staying
     # under PIPE_BUF is what makes that true, and .worker_line is where it is
@@ -1451,12 +1464,14 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # wrapped in try() so a broken-stream write can never turn an ok package
     # into a recorded failure.
     .done <- function(ok, stage, nver, el, reason = NULL) {
+      exits <- .analyzer_exit_text(.tally_snapshot())
       if (isTRUE(ok) && .idx %% 25L != 0L && el < 30 && el < WORKER_TIMEOUT &&
-          !identical(.idx, .n)) {
+          !identical(.idx, .n) && !nzchar(exits)) {
         return(invisible())
       }
       try({
-        cat(.worker_line(.idx, .n, ok, pkg, stage, nver, el, reason),
+        cat(.worker_line(.idx, .n, ok, pkg, stage, nver, el, reason,
+                         analyzer_exit = exits),
             file = stdout())
         flush(stdout())
       }, silent = TRUE)

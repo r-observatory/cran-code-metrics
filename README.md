@@ -92,6 +92,8 @@ Each shard's log carries an `analyzer:` line (versions analysed, seconds, compil
 
 An `analyzer memory:` line follows the `analyzer:` line. From a build that writes the figures (0.5.2 and later) it gives the largest resident and virtual peak of any analyzer run in the shard, each with its package, the most bytes one data file kept, and the packages with a file over the analyzer's data budget. `analyzer_stats` holds the same figures (`peak_rss_kb`, `peak_vm_kb`, `data_kept_max`, `data_over_budget`) and the five largest peaks by package under `peaks`. The peaks are read from `/proc`, so a build run off Linux reports none, and an older build prints `no memory figures from this build`.
 
+A package's own line in the shard log names each non-zero exit status its analyzer runs ended with and how many versions ended that way, as in `[analyzer exit 134 x1]`. Such a package always prints its line, whether it then failed or its versions fell back to the R metrics.
+
 ## Retention
 
 The update workflow's prune step runs on the schedule only. It lists the published `metrics-` releases and passes their tags to `scripts/prune.R` with `KEEP: "all"`, which selects none of them, so the step deletes no published release. The legacy `code-` and `data-` releases are not in that list. After surrounding whitespace is trimmed, `KEEP` takes `all` in any case or a whole number written in digits alone, at most 2147483647, and the step fails on any other value.

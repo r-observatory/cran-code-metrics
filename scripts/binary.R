@@ -641,6 +641,8 @@ analyze_with_binary <- function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL,
   .tally_add("analyzer_s", .secs_since(t0))
   status <- attr(out, "status")
   if (!is.null(status)) {
+    # Counted for the worker's line, which names each non-zero exit.
+    .tally_add(sprintf("analyzer_exit_%d", as.integer(status)), 1)
     # 134 is an abort, 137 a kill, 143 a termination.
     if (status >= 128L) stop(.analyzer_killed(status))
     return(unusable(sprintf("analyzer exited with status %d", status), status))

@@ -111,16 +111,20 @@
                     FROM cran_metrics_failures ORDER BY package")
 }
 
-# How each stub ends on the version it fails, the build it reports, and whether
-# that build writes a statistics line. 0.4.0 writes none, as the pinned build.
+# How each stub ends on the version it fails, the build it reports, whether
+# that build writes a statistics line, and the exits the worker's line names.
+# 0.4.0 writes no statistics line, as the pinned build.
 .AF_CASES <- list(
   abort         = list(ending = "exit 134", build = "0.4.0-test", stats = FALSE,
+                       exits = " \\[analyzer exit 134 x1\\]",
                        reason = "analyzer exited with status 134"),
   killed        = list(ending = "exit 137", build = "0.4.0-test", stats = FALSE,
+                       exits = " \\[analyzer exit 137 x1\\]",
                        reason = "analyzer exited with status 137"),
   failed        = list(ending = "exit 101", build = "0.4.0-test", stats = FALSE,
+                       exits = " \\[analyzer exit 101 x1\\]",
                        reason = "analyzer exited with status 101 on a version with analyzer rows"),
-  no_statistics = list(ending = "exit 0", build = "0.5.1-test", stats = TRUE,
+  no_statistics = list(ending = "exit 0", build = "0.5.1-test", stats = TRUE, exits = "",
                        reason = "analyzer exited 0 without its statistics line"))
 
 # How a stub gives no usable result without being killed: the shell line it
@@ -400,8 +404,8 @@ test_that("a failed analyzer on a version with an analyzer row fails the package
                      data.frame(package = "pkgA", stage = "crash", analyze_failures = 0L,
                                 timeout_failures = 1L, reason = k$reason,
                                 stringsAsFactors = FALSE), info = case)
-    expect_true(any(grepl(paste0("FAIL pkgA: crash after [0-9.]+s: ", k$reason, "$"),
-                          m$logged)), info = case)
+    expect_true(any(grepl(paste0("FAIL pkgA: crash after [0-9.]+s", k$exits, ": ",
+                                 k$reason, "$"), m$logged)), info = case)
   }
 })
 

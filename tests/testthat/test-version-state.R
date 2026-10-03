@@ -11,9 +11,9 @@
             paste0("GIT_AUTHOR_DATE=", date), paste0("GIT_COMMITTER_DATE=", date))))
 }
 
-# What git itself says each spec names, one call per spec.
-.vst_rev_parse <- function(repo, specs) {
-  vapply(specs, function(s) .vst_git(repo, "rev-parse", shQuote(s))[[1L]],
+# What git itself resolves each revision to, one call per revision.
+.vst_rev_parse <- function(repo, revs) {
+  vapply(revs, function(s) .vst_git(repo, "rev-parse", shQuote(s))[[1L]],
          character(1L), USE.NAMES = FALSE)
 }
 

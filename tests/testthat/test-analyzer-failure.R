@@ -605,10 +605,11 @@ test_that("a package whose analyzer keeps failing parks after MAX_TIMEOUT_FAILUR
 
 # A stand-in for prlimit, first on the path until the calling test ends. It
 # appends its arguments to `log`, one line a call, and runs the command that
-# follows its first argument with no limit at all.
+# follows its options with no limit at all.
 .fake_prlimit <- function(log, frame = parent.frame()) {
   dir <- withr::local_tempdir(.local_envir = frame)
-  writeLines(c("#!/bin/sh", sprintf('echo "$*" >> "%s"', log), "shift", 'exec "$@"'),
+  writeLines(c("#!/bin/sh", sprintf('echo "$*" >> "%s"', log),
+               'while [ "${1#--}" != "$1" ]; do shift; done', 'exec "$@"'),
              file.path(dir, "prlimit"))
   Sys.chmod(file.path(dir, "prlimit"), mode = "0755")
   withr::local_path(dir, .local_envir = frame)
@@ -682,8 +683,10 @@ test_that("the analyzer command is prlimit with the limit in bytes, or the binar
   held <- function(mb) list(limit_mb = mb, prlimit = "/usr/bin/prlimit")
   expect_identical(.analyzer_command(bin, held(4096)),
                    list(command = "/usr/bin/prlimit",
-                        args = c("--as=4294967296", shQuote(bin)), limit_mb = 4096))
-  expect_identical(.analyzer_command(bin, held(1))$args, c("--as=1048576", shQuote(bin)))
+                        args = c("--as=4294967296", "--core=0", shQuote(bin)),
+                        limit_mb = 4096))
+  expect_identical(.analyzer_command(bin, held(1))$args,
+                   c("--as=1048576", "--core=0", shQuote(bin)))
   # With no limit the call is the one made before there was a limit.
   expect_identical(.analyzer_command(bin, list(limit_mb = 0, prlimit = "")),
                    list(command = bin, args = character(0L), limit_mb = 0))
@@ -718,7 +721,7 @@ test_that("the analyzer runs under prlimit with the limit in bytes, and bare whe
 
   .local_global("ANALYZER_MEMORY_LIMIT_MB", 4096)
   expect_identical(analyze_with_binary(tree)$n_fns_r, 1L)
-  expect_identical(readLines(log), sprintf("--as=4294967296 %s %s --input-kind %s",
+  expect_identical(readLines(log), sprintf("--as=4294967296 --core=0 %s %s --input-kind %s",
                                            stub, tree, ANALYZER_INPUT_KIND))
 
   .local_global("ANALYZER_MEMORY_LIMIT_MB", 0)
@@ -768,7 +771,7 @@ test_that("the self-check runs under the same limit", {
   .local_global("ANALYZER_MEMORY_LIMIT_MB", 2048)
   expect_true(rpkg_analyzer_selfcheck("release"))
   expect_length(readLines(log), 1L)
-  expect_match(readLines(log), "^--as=2147483648 .* --input-kind release$")
+  expect_match(readLines(log), "^--as=2147483648 --core=0 .* --input-kind release$")
 })
 
 test_that("the shard plan and run-status.json say which limit is in force", {
@@ -837,7 +840,16 @@ test_that("a run with a build before 0.5.2 sets no limit, says why, and never ca
                 m$logged)
   expect_equal(limit_of(out), 4096)
   expect_length(readLines(log), 2L)
-  expect_match(readLines(log), "^--as=4294967296 ")
+  expect_match(readLines(log), "^--as=4294967296 --core=0 ")
+})
+
+test_that("the real prlimit holds the analyzer to the limit with no core file", {
+  skip_on_os("windows")
+  skip_if(!nzchar(Sys.which("prlimit")), "prlimit is not on the path")
+  cmd <- .analyzer_command("/bin/sh", list(limit_mb = 1024, prlimit = .prlimit_bin()))
+  limits <- shQuote("ulimit -v; ulimit -Sc; ulimit -Hc")
+  expect_identical(system2(cmd$command, c(cmd$args, "-c", limits), stdout = TRUE),
+                   c("1048576", "0", "0"))
 })
 
 test_that("an analyzer aborted by the limit fails the package as a crash, writes nothing and changes no row", {

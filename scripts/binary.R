@@ -630,13 +630,14 @@ parse_analyzer_records <- function(lines, memo = NULL) {
 }
 
 # What system2 runs for one analyzer call under `limit`, an .analyzer_limit():
-# the binary alone, or its prlimit holding it to the limit. `args` come before
-# the analyzer's own arguments, and limit_mb is the limit the run gets, 0 for
-# none.
+# the binary alone, or its prlimit holding it to the limit with no core file,
+# so an analyzer aborted at the limit leaves no core file of up to the limit's
+# size on the runner. `args` come before the analyzer's own arguments, and
+# limit_mb is the limit the run gets, 0 for none.
 .analyzer_command <- function(bin, limit = .analyzer_limit()) {
   if (!isTRUE(limit$limit_mb > 0)) return(list(command = bin, args = character(0L), limit_mb = 0))
   list(command = limit$prlimit,
-       args = c(sprintf("--as=%.0f", limit$limit_mb * 1024^2), shQuote(bin)),
+       args = c(sprintf("--as=%.0f", limit$limit_mb * 1024^2), "--core=0", shQuote(bin)),
        limit_mb = limit$limit_mb)
 }
 

@@ -1392,6 +1392,33 @@ open_or_init_data_db <- function(path) {
   invisible(NULL)
 }
 
+# The commit and tree each stored version was read from, the version and commit
+# before it in that walk, and its deprecation signals. One row per summary row,
+# replaced with them; pipeline state that nothing downstream reads.
+.VERSION_STATE_COLS <- c("package", "version", "commit_sha", "tree_sha",
+                         "prev_version", "prev_commit", "deprecated",
+                         "uses_lifecycle", "read_at")
+
+.ensure_version_state_table <- function(con) {
+  DBI::dbExecute(con, sprintf('
+    CREATE TABLE IF NOT EXISTS "%s" (
+      package TEXT NOT NULL, version TEXT NOT NULL,
+      commit_sha TEXT, tree_sha TEXT, prev_version TEXT, prev_commit TEXT,
+      deprecated TEXT, uses_lifecycle INTEGER, read_at TEXT,
+      PRIMARY KEY (package, version)) WITHOUT ROWID', VERSION_STATE_TABLE))
+  invisible(NULL)
+}
+
+# The state rows of the summary rows a write keeps, one per (package, version),
+# with every column of the table.
+.version_state_write <- function(state_df, summary_df) {
+  key <- function(df) paste(df$package, df$version, sep = "\x1f")
+  out <- state_df[key(state_df) %in% key(summary_df), , drop = FALSE]
+  out <- out[!duplicated(key(out), fromLast = TRUE), , drop = FALSE]
+  for (col in setdiff(.VERSION_STATE_COLS, names(out))) out[[col]] <- rep(NA, nrow(out))
+  out[, .VERSION_STATE_COLS, drop = FALSE]
+}
+
 # The columns a failure verdict adds to cran_metrics_failures, with their types.
 .FAILURE_VERDICT_COLUMNS <- c(
   stage            = "TEXT",
@@ -1419,13 +1446,13 @@ open_or_init_data_db <- function(path) {
 
 #' Open (or create) the pipeline SQLite database.
 #'
-#' If the file does not yet exist it is created. The five non-summary tables
+#' If the file does not yet exist it is created. The six non-summary tables
 #' (cran_code_churn, cran_api_history, cran_metrics_failures,
-#' cran_analyzer_read_attempts, cran_over_cap) are created with fixed schemas
-#' and indexes on first open, so a database downloaded from an older release
-#' gains the ones it does not have yet, and its failures table gains the
-#' verdict columns. cran_code_summary is created lazily by upsert_shard the
-#' first time data is written (its schema is dynamic).
+#' cran_analyzer_read_attempts, cran_over_cap, cran_version_state) are created
+#' with fixed schemas and indexes on first open, so a database downloaded from
+#' an older release gains the ones it does not have yet, and its failures table
+#' gains the verdict columns. cran_code_summary is created lazily by
+#' upsert_shard the first time data is written (its schema is dynamic).
 #'
 #' @param path File path for the SQLite database.
 #' @return An open DBI connection. The caller is responsible for calling
@@ -1498,6 +1525,8 @@ open_or_init_db <- function(path) {
   } else {
     .migrate_read_attempts_by_version(con)
   }
+
+  .ensure_version_state_table(con)
 
   DBI::dbExecute(con,
     "CREATE INDEX IF NOT EXISTS idx_churn_pkg_ver ON cran_code_churn(package, version)")
@@ -1694,12 +1723,15 @@ db_analyzed_state <- function(con) {
 #'   stale rows survive a re-analysis.
 #' @param description_df,release_notes_df Latest-only text rows; NULL leaves both tables untouched.
 #' @param analyzer_version The running analyzer build; gates the 0.5.0 schema steps.
+#' @param state_df   Optional version state rows (see .version_state_rows), which
+#'   replace those of the same packages for the versions whose summary rows
+#'   are written. NULL (the default) leaves cran_version_state untouched.
 #' @return invisible(NULL)
 upsert_shard <- function(con, summary_df, churn_df, api_df,
                          functions_df = NULL, edges_df = NULL,
                          vignettes_df = NULL, description_df = NULL,
                          release_notes_df = NULL,
-                         analyzer_version = NA_character_) {
+                         analyzer_version = NA_character_, state_df = NULL) {
   pkgs <- unique(as.character(summary_df$package))
   if (length(pkgs) == 0L) return(invisible(NULL))
 
@@ -1777,6 +1809,14 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     # -- Replace the latest-only DESCRIPTION fields and release notes ---------
     if (!is.null(description_df) || !is.null(release_notes_df)) {
       .write_latest_text(con, pkgs, description_df, release_notes_df)
+    }
+
+    # -- Replace what each version was read from, beside the rows it gave -----
+    if (!is.null(state_df)) {
+      .ensure_version_state_table(con)
+      .delete_by_package(con, VERSION_STATE_TABLE, pkgs)
+      state_write <- .version_state_write(state_df, summary_df)
+      if (nrow(state_write) > 0L) DBI::dbAppendTable(con, VERSION_STATE_TABLE, state_write)
     }
   })
 

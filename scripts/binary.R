@@ -613,31 +613,39 @@ parse_analyzer_records <- function(lines, memo = NULL) {
 # The path of prlimit, or "" where it is not on the path, as anywhere but Linux.
 .prlimit_bin <- function() unname(Sys.which("prlimit"))
 
-# The address-space limit an analyzer run is held to, in MiB: limit_mb where
-# prlimit is there to hold it, and 0 where it is not or the limit is off.
-.memory_limit_in_force <- function(limit_mb = ANALYZER_MEMORY_LIMIT_MB,
-                                   prlimit = .prlimit_bin()) {
-  if (isTRUE(limit_mb > 0) && nzchar(prlimit)) limit_mb else 0
+# The address-space limit an analyzer of build `version` is held to, in MiB,
+# and the prlimit that holds it: limit_mb when it is above zero, the build is
+# 0.5.2 or later and prlimit is on the path, and 0 with no prlimit otherwise.
+# A build before 0.5.2 can write a wrong record and exit 0 when an allocation
+# fails, so it never runs under a limit. run_update works this out once a run,
+# from the build it has read.
+.analyzer_limit <- function(version = rpkg_analyzer_version(),
+                            limit_mb = ANALYZER_MEMORY_LIMIT_MB) {
+  prlimit <- if (isTRUE(limit_mb > 0) && analyzer_at_least(version, "0.5.2")) {
+    .prlimit_bin()
+  } else {
+    ""
+  }
+  list(limit_mb = if (nzchar(prlimit)) limit_mb else 0, prlimit = prlimit)
 }
 
-# What system2 runs for one analyzer call: the binary alone, or prlimit holding
-# it to the limit in force. `args` come before the analyzer's own arguments,
-# and limit_mb is the limit the run gets, 0 for none.
-.analyzer_command <- function(bin, limit_mb = ANALYZER_MEMORY_LIMIT_MB,
-                              prlimit = .prlimit_bin()) {
-  limit <- .memory_limit_in_force(limit_mb, prlimit)
-  if (limit <= 0) return(list(command = bin, args = character(0L), limit_mb = 0))
-  list(command = prlimit,
-       args = c(sprintf("--as=%.0f", limit * 1024^2), shQuote(bin)),
-       limit_mb = limit)
+# What system2 runs for one analyzer call under `limit`, an .analyzer_limit():
+# the binary alone, or its prlimit holding it to the limit. `args` come before
+# the analyzer's own arguments, and limit_mb is the limit the run gets, 0 for
+# none.
+.analyzer_command <- function(bin, limit = .analyzer_limit()) {
+  if (!isTRUE(limit$limit_mb > 0)) return(list(command = bin, args = character(0L), limit_mb = 0))
+  list(command = limit$prlimit,
+       args = c(sprintf("--as=%.0f", limit$limit_mb * 1024^2), shQuote(bin)),
+       limit_mb = limit$limit_mb)
 }
 
 #' Run the analyzer over an extracted package directory.
 #'
-#' The run is held to ANALYZER_MEMORY_LIMIT_MB of address space where prlimit
-#' is on the path. The analyzer aborts when an allocation fails, so a run that
-#' passes the limit ends with status 134 and no statistics line. A failure with
-#' a non-zero exit names the limit it ran under.
+#' The run is held to the address-space limit `limit` gives. The analyzer
+#' aborts when an allocation fails, so a run that passes the limit ends with
+#' status 134 and no statistics line. A failure with a non-zero exit names the
+#' limit it ran under.
 #'
 #' @param dir Path to the extracted package source (a DESCRIPTION at its root).
 #' @param kind The input kind passed as --input-kind.
@@ -646,7 +654,7 @@ parse_analyzer_records <- function(lines, memo = NULL) {
 #'   build, so nothing short of an analyzer result may replace it.
 #' @param stats The file this run appends its statistics line to, or "" when
 #'   the build writes none.
-#' @param prlimit The path of prlimit, or "" when there is none to run under.
+#' @param limit The address-space limit the run is held to, an .analyzer_limit().
 #' @return A flat named list of metrics for the version, with nested values
 #'   (maps and arrays) serialised to JSON strings to match how the R metric
 #'   groups store fields such as lang_breakdown. The per-function and
@@ -658,7 +666,7 @@ parse_analyzer_records <- function(lines, memo = NULL) {
 #'   protected version and returns NULL on any other.
 analyze_with_binary <- function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL,
                                 protect = FALSE, stats = .analyzer_stats_file(),
-                                prlimit = .prlimit_bin()) {
+                                limit = .analyzer_limit()) {
   # No usable result: the R fallback, unless the version has an analyzer row.
   unusable <- function(what, status = NA_integer_, limit_mb = 0) {
     if (isTRUE(protect)) stop(.analyzer_failed(what, status, limit_mb))
@@ -667,7 +675,7 @@ analyze_with_binary <- function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL,
   bin <- rpkg_analyzer_bin()
   if (!nzchar(bin)) return(unusable("analyzer binary not found"))
 
-  cmd <- .analyzer_command(bin, prlimit = prlimit)
+  cmd <- .analyzer_command(bin, limit)
 
   # A non-zero exit signals a warning and leaves a status, read below. Status
   # 127 and a failed popen are an R error instead, kept in not_run.
@@ -710,14 +718,15 @@ analyze_with_binary <- function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL,
 }
 
 #' Whether the analyzer honours the input kind this pipeline passes: a
-#' DESCRIPTION-only package must come back with a summary naming `kind`.
-rpkg_analyzer_selfcheck <- function(kind = ANALYZER_INPUT_KIND) {
+#' DESCRIPTION-only package must come back with a summary naming `kind`. It
+#' runs under `limit`, the address-space limit every package's analyzer gets.
+rpkg_analyzer_selfcheck <- function(kind = ANALYZER_INPUT_KIND, limit = .analyzer_limit()) {
   dir <- tempfile("selfcheck_")
   dir.create(dir)
   on.exit(unlink(dir, recursive = TRUE, force = TRUE), add = TRUE)
   writeLines(c("Package: selfcheck", "Version: 0.0.1"), file.path(dir, "DESCRIPTION"))
   # A killed analyzer fails the check.
-  metrics <- tryCatch(analyze_with_binary(dir, kind = kind),
+  metrics <- tryCatch(analyze_with_binary(dir, kind = kind, limit = limit),
                       analyzer_killed = function(e) NULL,
                       analyzer_failed = function(e) NULL)
   if (is.null(metrics)) return(FALSE)

@@ -177,7 +177,7 @@ test_that("under the 0.5.2 pin every package of a 0.4.0 database is re-read, and
     data.frame(package = "pkgB", stage = "crash", analyzer_version = "0.5.2",
                timeout_failures = 1L,
                reason = paste0("analyzer exited with status 1 on a version with analyzer rows",
-                               .limit_note(.memory_limit_in_force())),
+                               .limit_note(.analyzer_limit()$limit_mb)),
                stringsAsFactors = FALSE))
   expect_true(any(grepl("FAIL pkgB: crash after [0-9.]+s \\[analyzer exit 1 x1\\]: ",
                         first$logged)))

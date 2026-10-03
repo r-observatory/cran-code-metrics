@@ -1185,7 +1185,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   if (isTRUE(force_full)) {
     # Wipe all metric rows so everything is treated as unseen.
     tables <- DBI::dbListTables(con)
-    for (tbl in c("cran_code_summary", "cran_code_churn", "cran_api_history")) {
+    for (tbl in c("cran_code_summary", "cran_code_churn", "cran_api_history",
+                  VERSION_STATE_TABLE)) {
       if (tbl %in% tables) DBI::dbExecute(con, sprintf("DELETE FROM %s", tbl))
     }
     analyzed <- character(0L)
@@ -1330,6 +1331,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   shard_datasets_list  <- list()
   shard_vignettes_list <- list()
   shard_text_list      <- list()
+  shard_state_list     <- list()
   shard_failures       <- character(0L)
   shard_stages         <- character(0L)
   # Verdicts this shard wrote. Each is news the next run needs, so the shard
@@ -1412,7 +1414,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
          summary = res$summary, churn = res$churn, api = res$api,
          functions = res$functions, edges = res$edges, datasets = res$datasets,
          vignettes = res$vignettes, text = res$text,
-         binary_versions = res$binary_versions)
+         binary_versions = res$binary_versions,
+         state = .with_read_at(res$state))
   }
 
   results <- parallel::mclapply(shard_pkgs, .with_worker_telemetry(.pkg_worker),
@@ -1449,6 +1452,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       shard_datasets_list[[pkg]]  <- r$datasets
       shard_vignettes_list[[pkg]] <- r$vignettes
       shard_text_list[[pkg]]      <- r$text
+      shard_state_list[[pkg]]     <- r$state
       shard_binary_keys <- c(shard_binary_keys,
                              .analyzer_row_keys(pkg, r$binary_versions))
       .reset_failure(con, pkg)
@@ -1478,6 +1482,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   fresh_datasets  <- .rbind_union_all(shard_datasets_list)  %||% .empty_datasets_df()
   fresh_vignettes <- .rbind_union_all(shard_vignettes_list) %||% .empty_vignettes_rows()
   fresh_text      <- .bind_release_text(shard_text_list)
+  fresh_state     <- .rbind_union_all(shard_state_list)     %||% .empty_version_state()
 
   if (length(fresh_pkgs) > 0L) {
     # Write dataset rows before the code summary stamps datasets_scanned = TRUE,
@@ -1493,7 +1498,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                  fresh_functions, fresh_edges, fresh_vignettes,
                  description_df = fresh_text$description_latest,
                  release_notes_df = fresh_text$release_notes_latest,
-                 analyzer_version = analyzer_version)
+                 analyzer_version = analyzer_version,
+                 state_df = fresh_state)
   }
 
   # ---- 7b. Project archived-package metadata into the narrow lookup table ----

@@ -238,6 +238,10 @@ ANALYZER_INPUT_KIND <- "release"
 
 SUMMARY_TABLE <- "cran_code_summary"
 
+# The commit, tree and deprecation signals each stored version was read from.
+# Pipeline state: the merger does not copy it and no manifest counts it.
+VERSION_STATE_TABLE <- "cran_version_state"
+
 # DESCRIPTION and NEWS text for every analysed version, kept in a third database.
 RELEASE_TEXT_DB_FILENAME    <- "cran-release-text.db"
 DESCRIPTION_HISTORY_TABLE   <- "cran_description_history"

@@ -92,11 +92,17 @@ ANALYSIS_CORES <- {
 # Overridable via WORKER_TIMEOUT env var.
 WORKER_TIMEOUT <- as.integer(Sys.getenv("WORKER_TIMEOUT", unset = "2400"))
 
-# The limit an ANALYZER_MEMORY_LIMIT_MB value asks for, in MiB: 0 for no limit,
-# and the default for a value that is empty or not a whole number of 0 or more.
+# The limit an ANALYZER_MEMORY_LIMIT_MB value asks for, in MiB: after its
+# spaces are trimmed, a value of decimal digits alone, at most 2147483647,
+# names the limit, 0 for none, and any other value, an empty one included,
+# leaves the default.
 .memory_limit_mb <- function(value, default = 3072) {
   value <- trimws(value)
-  if (grepl("^[0-9]+$", value)) as.numeric(value) else default
+  if (grepl("^[0-9]+$", value) && as.numeric(value) <= .Machine$integer.max) {
+    as.numeric(value)
+  } else {
+    default
+  }
 }
 
 # The most address space one analyzer process may take, in MiB; 0 for no limit.

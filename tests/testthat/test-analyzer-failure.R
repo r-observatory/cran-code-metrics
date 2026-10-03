@@ -624,10 +624,14 @@ test_that("the limit is ANALYZER_MEMORY_LIMIT_MB, a whole number of MiB, and 307
   expect_identical(.memory_limit_mb(""), 3072)
   expect_identical(.memory_limit_mb("0"), 0)
   expect_identical(.memory_limit_mb("4096"), 4096)
-  expect_identical(.memory_limit_mb(" 2048 "), 2048)
-  # A value that is not a whole number of zero or more leaves the default.
-  for (bad in c("  ", "abc", "-1", "1.5", "64MiB", "4e3")) {
-    expect_identical(.memory_limit_mb(bad), .memory_limit_mb(""), info = bad)
+  expect_identical(.memory_limit_mb(" 4096 "), 4096)
+  expect_identical(.memory_limit_mb("2147483647"), 2147483647)
+  # Only digits, within the integer range, name a limit. A fraction, a sign, an
+  # exponent, hex and the words R reads as numbers all leave the default, never
+  # 0 or a truncated figure.
+  for (bad in c("", "  ", "-1", "0.5", "-0.5", "NaN", "3.5", "1e3", "0x800", "lots", "Inf",
+                "2147483648", "64MiB")) {
+    expect_identical(.memory_limit_mb(bad), 3072, info = bad)
   }
   # config.R reads the variable once, when it is sourced.
   expect_identical(ANALYZER_MEMORY_LIMIT_MB,

@@ -111,17 +111,31 @@
                     FROM cran_metrics_failures ORDER BY package")
 }
 
-# How each stub ends on the version it fails, the build it reports, and whether
-# that build writes a statistics line. 0.4.0 writes none, as the pinned build.
+# What a failure with a non-zero exit says of the address-space limit a run of
+# `build` gets: nothing for a build before 0.5.2, or where there is no prlimit,
+# as off Linux.
+.af_note <- function(build) .limit_note(.analyzer_limit(build)$limit_mb)
+
+# How each stub ends on the version it fails, the build it reports, whether
+# that build writes a statistics line, the exits the worker's line names, and
+# whether the reason goes on to name the limit in force. 0.4.0 writes no
+# statistics line, as the pinned build.
 .AF_CASES <- list(
   abort         = list(ending = "exit 134", build = "0.4.0-test", stats = FALSE,
+                       exits = " \\[analyzer exit 134 x1\\]", noted = TRUE,
                        reason = "analyzer exited with status 134"),
   killed        = list(ending = "exit 137", build = "0.4.0-test", stats = FALSE,
+                       exits = " \\[analyzer exit 137 x1\\]", noted = TRUE,
                        reason = "analyzer exited with status 137"),
   failed        = list(ending = "exit 101", build = "0.4.0-test", stats = FALSE,
+                       exits = " \\[analyzer exit 101 x1\\]", noted = TRUE,
                        reason = "analyzer exited with status 101 on a version with analyzer rows"),
-  no_statistics = list(ending = "exit 0", build = "0.5.1-test", stats = TRUE,
+  no_statistics = list(ending = "exit 0", build = "0.5.1-test", stats = TRUE, exits = "",
+                       noted = FALSE,
                        reason = "analyzer exited 0 without its statistics line"))
+
+# The reason a case stores and prints, under the limit its build gets.
+.af_reason <- function(k) paste0(k$reason, if (k$noted) .af_note(k$build) else "")
 
 # How a stub gives no usable result without being killed: the shell line it
 # runs before printing anything, and what the failure then says. Each line
@@ -161,7 +175,9 @@ test_that("an analyzer ended by a signal raises analyzer_killed, on a protected 
       expect_s3_class(err, c("analyzer_killed", "error", "condition"), exact = TRUE)
       expect_identical(err$status, endings[[ending]], info = info)
       expect_identical(conditionMessage(err),
-                       sprintf("analyzer exited with status %d", endings[[ending]]), info = info)
+                       sprintf("analyzer exited with status %d%s", endings[[ending]],
+                               .af_note("0.4.0-test")),
+                       info = info)
     }
   }
 })
@@ -178,7 +194,8 @@ test_that("any other non-zero exit raises analyzer_failed on a protected version
     expect_s3_class(err, c("analyzer_failed", "error", "condition"), exact = TRUE)
     expect_identical(err$status, status)
     expect_identical(conditionMessage(err), sprintf(
-      "analyzer exited with status %d on a version with analyzer rows", status))
+      "analyzer exited with status %d on a version with analyzer rows%s", status,
+      .af_note("0.4.0-test")))
   }
 })
 
@@ -362,7 +379,7 @@ test_that("the worker hands analyze_package the stamped versions of its own pack
   expect_identical(.af_summary(out)$analyzer_version, c("0.4.0-test", NA))
 
   seen <- new.env(parent = emptyenv())
-  .local_global("analyze_package", function(dest, pkg, stamped = "not passed") {
+  .local_global("analyze_package", function(dest, pkg, stamped = "not passed", limit = NULL) {
     assign(pkg, stamped, envir = seen)
     stop("seen")
   })
@@ -398,10 +415,10 @@ test_that("a failed analyzer on a version with an analyzer row fails the package
                                 stringsAsFactors = FALSE), info = case)
     expect_identical(.af_verdicts(out),
                      data.frame(package = "pkgA", stage = "crash", analyze_failures = 0L,
-                                timeout_failures = 1L, reason = k$reason,
+                                timeout_failures = 1L, reason = .af_reason(k),
                                 stringsAsFactors = FALSE), info = case)
-    expect_true(any(grepl(paste0("FAIL pkgA: crash after [0-9.]+s: ", k$reason, "$"),
-                          m$logged)), info = case)
+    expect_true(any(grepl(paste0("FAIL pkgA: crash after [0-9.]+s", k$exits, ": ",
+                                 .af_reason(k), "$"), m$logged)), info = case)
   }
 })
 
@@ -427,7 +444,7 @@ test_that("a killed analyzer on a version with no analyzer row fails the package
     expect_identical(.package_rows(out, "pkgA"), before, info = case)
     expect_identical(.af_verdicts(out),
                      data.frame(package = "pkgA", stage = "crash", analyze_failures = 0L,
-                                timeout_failures = 1L, reason = k$reason,
+                                timeout_failures = 1L, reason = .af_reason(k),
                                 stringsAsFactors = FALSE), info = case)
   }
 })
@@ -441,7 +458,8 @@ test_that("a killed analyzer on a package with no stored row stores none", {
   expect_identical(m$shard_failures$packages, "pkgA")
   expect_identical(.af_verdicts(out)[c("stage", "timeout_failures", "reason")],
                    data.frame(stage = "crash", timeout_failures = 1L,
-                              reason = "analyzer exited with status 137",
+                              reason = paste0("analyzer exited with status 137",
+                                              .af_note("0.4.0-test")),
                               stringsAsFactors = FALSE))
   expect_identical(nrow(.af_summary(out)), 0L)
 })
@@ -579,4 +597,343 @@ test_that("a package whose analyzer keeps failing parks after MAX_TIMEOUT_FAILUR
   expect_identical(m$n_fresh, 1L)
   expect_identical(.af_summary(out)$analyzer_version, c("0.4.1-test", "0.4.1-test"))
   expect_identical(nrow(.af_verdicts(out)), 0L)
+})
+
+# ---------------------------------------------------------------------------
+# A limit on the analyzer's address space
+# ---------------------------------------------------------------------------
+
+# A stand-in for prlimit, first on the path until the calling test ends. It
+# appends its arguments to `log`, one line a call, and runs the command that
+# follows its options with no limit at all.
+.fake_prlimit <- function(log, frame = parent.frame()) {
+  dir <- withr::local_tempdir(.local_envir = frame)
+  writeLines(c("#!/bin/sh", sprintf('echo "$*" >> "%s"', log),
+               'while [ "${1#--}" != "$1" ]; do shift; done', 'exec "$@"'),
+             file.path(dir, "prlimit"))
+  Sys.chmod(file.path(dir, "prlimit"), mode = "0755")
+  withr::local_path(dir, .local_envir = frame)
+  invisible(dir)
+}
+
+# A shell line for .af_stub: abort, as the analyzer does when an allocation
+# fails, unless the process may take at least 1 GiB of address space.
+.AF_NEEDS_1GIB <- paste0('lim=$(ulimit -v); if [ "$lim" != unlimited ] && ',
+                         '[ "$lim" -lt 1048576 ]; then kill -ABRT $$; fi')
+
+test_that("the limit is ANALYZER_MEMORY_LIMIT_MB, a whole number of MiB, and 3072 when it names none", {
+  expect_identical(.memory_limit_mb(""), 3072)
+  expect_identical(.memory_limit_mb("0"), 0)
+  expect_identical(.memory_limit_mb("4096"), 4096)
+  expect_identical(.memory_limit_mb(" 4096 "), 4096)
+  expect_identical(.memory_limit_mb("2147483647"), 2147483647)
+  # Only digits, within the integer range, name a limit. A fraction, a sign, an
+  # exponent, hex and the words R reads as numbers all leave the default, never
+  # 0 or a truncated figure.
+  for (bad in c("", "  ", "-1", "0.5", "-0.5", "NaN", "3.5", "1e3", "0x800", "lots", "Inf",
+                "2147483648", "64MiB")) {
+    expect_identical(.memory_limit_mb(bad), 3072, info = bad)
+  }
+  # config.R reads the variable once, when it is sourced.
+  expect_identical(ANALYZER_MEMORY_LIMIT_MB,
+                   .memory_limit_mb(Sys.getenv("ANALYZER_MEMORY_LIMIT_MB", unset = "")))
+})
+
+test_that("a failure with a non-zero exit names the limit it ran under, and no other failure does", {
+  expect_identical(.limit_note(512), "; its address-space limit was 512 MiB")
+  expect_identical(.limit_note(4096), "; its address-space limit was 4096 MiB")
+  expect_identical(.limit_note(0), "")
+  expect_identical(conditionMessage(.analyzer_killed(134L, 512)),
+                   "analyzer exited with status 134; its address-space limit was 512 MiB")
+  expect_identical(conditionMessage(.analyzer_killed(134L)), "analyzer exited with status 134")
+  expect_identical(conditionMessage(.analyzer_killed(0L, 512)),
+                   "analyzer exited 0 without its statistics line")
+  expect_identical(
+    conditionMessage(.analyzer_failed("analyzer exited with status 101", 101L, 512)),
+    paste0("analyzer exited with status 101 on a version with analyzer rows",
+           "; its address-space limit was 512 MiB"))
+  for (status in list(0L, NA_integer_)) {
+    expect_identical(conditionMessage(.analyzer_failed("analyzer gave nothing", status, 512)),
+                     "analyzer gave nothing on a version with analyzer rows")
+  }
+})
+
+test_that("a build of 0.5.2 or later gets the limit where prlimit is found, and any other run none", {
+  skip_on_os("windows")
+  none <- list(limit_mb = 0, prlimit = "")
+  log  <- file.path(withr::local_tempdir(), "prlimit.log")
+  fake <- file.path(.fake_prlimit(log), "prlimit")
+  limit <- .analyzer_limit("0.5.2", 4096)
+  expect_identical(normalizePath(limit$prlimit), normalizePath(fake))
+  expect_identical(limit$limit_mb, 4096)
+  expect_identical(.analyzer_limit("0.6.0-test", 4096)$limit_mb, 4096)
+  expect_identical(.analyzer_limit("0.5.2", 0), none)
+  # A build before 0.5.2 can write a wrong record and exit 0 when an allocation fails.
+  for (build in c("0.5.1", "0.5.1-test", "0.4.0-test", "dev", NA)) {
+    expect_identical(.analyzer_limit(build, 4096), none, info = build)
+  }
+  # With no prlimit on the path there is nothing to hold a limit.
+  withr::local_envvar(PATH = withr::local_tempdir())
+  expect_identical(.analyzer_limit("0.5.2", 4096), none)
+  expect_false(file.exists(log))
+})
+
+test_that("the analyzer command is prlimit with the limit in bytes, or the binary alone", {
+  bin  <- "/opt/an analyzer/rpkg-analyzer"
+  held <- function(mb) list(limit_mb = mb, prlimit = "/usr/bin/prlimit")
+  expect_identical(.analyzer_command(bin, held(4096)),
+                   list(command = "/usr/bin/prlimit",
+                        args = c("--as=4294967296", "--core=0", shQuote(bin)),
+                        limit_mb = 4096))
+  expect_identical(.analyzer_command(bin, held(1))$args,
+                   c("--as=1048576", "--core=0", shQuote(bin)))
+  # With no limit the call is the one made before there was a limit.
+  expect_identical(.analyzer_command(bin, list(limit_mb = 0, prlimit = "")),
+                   list(command = bin, args = character(0L), limit_mb = 0))
+})
+
+test_that("a build before 0.5.2 is called without prlimit, by a package and by the self-check", {
+  skip_on_os("windows")
+  tree <- .af_tree("1.0")
+  log  <- file.path(withr::local_tempdir(), "prlimit.log")
+  .fake_prlimit(log)
+  .local_global("ANALYZER_MEMORY_LIMIT_MB", 4096)
+  withr::local_envvar(RPKG_ANALYZER_STATS = NA,
+                      RPKG_ANALYZER_BIN = .af_stub(withr::local_tempdir(), "0.5.1"))
+  expect_identical(analyze_with_binary(tree, protect = TRUE)$n_fns_r, 1L)
+  expect_true(rpkg_analyzer_selfcheck("release"))
+  expect_false(file.exists(log))
+
+  # The same calls with a 0.5.2 build go through prlimit.
+  withr::local_envvar(RPKG_ANALYZER_BIN = .af_stub(withr::local_tempdir(), "0.5.2"))
+  expect_identical(analyze_with_binary(tree, protect = TRUE)$n_fns_r, 1L)
+  expect_true(rpkg_analyzer_selfcheck("release"))
+  expect_length(readLines(log), 2L)
+})
+
+test_that("the analyzer runs under prlimit with the limit in bytes, and bare when the limit is 0", {
+  skip_on_os("windows")
+  tree <- .af_tree("1.0")
+  log  <- file.path(withr::local_tempdir(), "prlimit.log")
+  .fake_prlimit(log)
+  stub <- .af_stub(withr::local_tempdir(), "0.5.2-test")
+  withr::local_envvar(RPKG_ANALYZER_BIN = stub, RPKG_ANALYZER_STATS = NA)
+
+  .local_global("ANALYZER_MEMORY_LIMIT_MB", 4096)
+  expect_identical(analyze_with_binary(tree)$n_fns_r, 1L)
+  expect_identical(readLines(log), sprintf("--as=4294967296 --core=0 %s %s --input-kind %s",
+                                           stub, tree, ANALYZER_INPUT_KIND))
+
+  .local_global("ANALYZER_MEMORY_LIMIT_MB", 0)
+  expect_identical(analyze_with_binary(tree)$n_fns_r, 1L)
+  expect_length(readLines(log), 1L)
+
+  # A run that fails under a limit says which, and one that fails with none does not.
+  .af_stub(dirname(stub), "0.5.2-test", endings = c("1.0" = "exit 134"))
+  expect_error(analyze_with_binary(tree), "^analyzer exited with status 134$",
+               class = "analyzer_killed")
+  .local_global("ANALYZER_MEMORY_LIMIT_MB", 4096)
+  expect_error(analyze_with_binary(tree),
+               "^analyzer exited with status 134; its address-space limit was 4096 MiB$",
+               class = "analyzer_killed")
+  .af_stub(dirname(stub), "0.5.2-test", endings = c("1.0" = "exit 101"))
+  expect_error(analyze_with_binary(tree, protect = TRUE), paste0(
+    "^analyzer exited with status 101 on a version with analyzer rows; ",
+    "its address-space limit was 4096 MiB$"), class = "analyzer_failed")
+})
+
+test_that("a run looks for prlimit once, not once an analyzer", {
+  skip_on_os("windows")
+  log <- file.path(withr::local_tempdir(), "prlimit.log")
+  fake <- file.path(.fake_prlimit(log), "prlimit")
+  withr::local_envvar(RPKG_ANALYZER_STATS = NA, RPKG_ANALYZER_BIN = .af_stub(
+    withr::local_tempdir(), "0.5.2-test", stats = TRUE))
+  .local_global("ANALYZER_MEMORY_LIMIT_MB", 2048)
+  asked <- new.env(parent = emptyenv())
+  asked$n <- 0L
+  .local_global(".prlimit_bin", function() {
+    asked$n <- asked$n + 1L
+    fake
+  })
+  # .af_run uses one core, so each package's analyzer runs in this process.
+  m <- .af_run(withr::local_tempdir(), c("1.0", "2.0", "3.0"), pkgs = c("pkgA", "pkgB"))
+  expect_identical(m$n_fresh, 2L)
+  expect_length(readLines(log), 7L)
+  expect_identical(asked$n, 1L)
+})
+
+test_that("the self-check runs under the same limit", {
+  skip_on_os("windows")
+  log <- file.path(withr::local_tempdir(), "prlimit.log")
+  .fake_prlimit(log)
+  withr::local_envvar(RPKG_ANALYZER_STATS = NA, RPKG_ANALYZER_BIN = .af_stub(
+    withr::local_tempdir(), "0.5.2-test", stats = TRUE))
+  .local_global("ANALYZER_MEMORY_LIMIT_MB", 2048)
+  expect_true(rpkg_analyzer_selfcheck("release"))
+  expect_length(readLines(log), 1L)
+  expect_match(readLines(log), "^--as=2147483648 --core=0 .* --input-kind release$")
+})
+
+test_that("the shard plan and run-status.json say which limit is in force", {
+  skip_on_os("windows")
+  out <- withr::local_tempdir()
+  withr::local_envvar(RPKG_ANALYZER_BIN = .af_stub(withr::local_tempdir(), "0.5.2-test",
+                                                   stats = TRUE))
+  limit_of <- function() {
+    jsonlite::fromJSON(file.path(out, "run-status.json"))$analyzer_memory_limit_mb
+  }
+
+  .fake_prlimit(file.path(withr::local_tempdir(), "prlimit.log"))
+  .local_global("ANALYZER_MEMORY_LIMIT_MB", 4096)
+  expect_identical(.analyzer_limit()$limit_mb, 4096)
+  m <- .af_run(out, "1.0")
+  expect_true("analyzer memory limit: 4096 MiB of address space for each analyzer" %in%
+                m$logged)
+  expect_equal(limit_of(), 4096)
+
+  .local_global("ANALYZER_MEMORY_LIMIT_MB", 0)
+  m <- .af_run(out, c("1.0", "2.0"))
+  expect_true("analyzer memory limit: none (ANALYZER_MEMORY_LIMIT_MB is 0)" %in% m$logged)
+  expect_equal(limit_of(), 0)
+
+  # No prlimit to be found: the limit asked for is not in force, and the run says so.
+  .local_global("ANALYZER_MEMORY_LIMIT_MB", 4096)
+  .local_global(".prlimit_bin", function() "")
+  expect_identical(.analyzer_limit()$limit_mb, 0)
+  m <- .af_run(out, c("1.0", "2.0", "3.0"))
+  expect_true(paste("analyzer memory limit: none, prlimit was not found",
+                    "(ANALYZER_MEMORY_LIMIT_MB is 4096)") %in% m$logged)
+  expect_equal(limit_of(), 0)
+  expect_identical(m$n_fresh, 1L)
+
+  # A build that reports no version gets none either.
+  expect_identical(.memory_limit_line(0, NA, 4096), paste(
+    "analyzer memory limit: none, no rpkg-analyzer version was read",
+    "(ANALYZER_MEMORY_LIMIT_MB is 4096)"))
+})
+
+test_that("a run with a build before 0.5.2 sets no limit, says why, and never calls prlimit", {
+  skip_on_os("windows")
+  log <- file.path(withr::local_tempdir(), "prlimit.log")
+  .fake_prlimit(log)
+  .local_global("ANALYZER_MEMORY_LIMIT_MB", 4096)
+  limit_of <- function(out) {
+    jsonlite::fromJSON(file.path(out, "run-status.json"))$analyzer_memory_limit_mb
+  }
+
+  out <- withr::local_tempdir()
+  withr::local_envvar(RPKG_ANALYZER_BIN = .af_stub(withr::local_tempdir(), "0.5.1", stats = TRUE))
+  m <- .af_run(out, "1.0")
+  expect_identical(m$n_fresh, 1L)
+  expect_true(paste("analyzer memory limit: none, rpkg-analyzer 0.5.1 is older than 0.5.2",
+                    "(ANALYZER_MEMORY_LIMIT_MB is 4096)") %in% m$logged)
+  expect_equal(limit_of(out), 0)
+  # Neither the self-check nor the package's analyzer went through prlimit.
+  expect_false(file.exists(log))
+
+  # The same run with a 0.5.2 build: both do, under the limit.
+  out <- withr::local_tempdir()
+  withr::local_envvar(RPKG_ANALYZER_BIN = .af_stub(withr::local_tempdir(), "0.5.2", stats = TRUE))
+  m <- .af_run(out, "1.0")
+  expect_identical(m$n_fresh, 1L)
+  expect_true("analyzer memory limit: 4096 MiB of address space for each analyzer" %in%
+                m$logged)
+  expect_equal(limit_of(out), 4096)
+  expect_length(readLines(log), 2L)
+  expect_match(readLines(log), "^--as=4294967296 --core=0 ")
+})
+
+test_that("the real prlimit holds the analyzer to the limit with no core file", {
+  skip_on_os("windows")
+  skip_if(!nzchar(Sys.which("prlimit")), "prlimit is not on the path")
+  cmd <- .analyzer_command("/bin/sh", list(limit_mb = 1024, prlimit = .prlimit_bin()))
+  limits <- shQuote("ulimit -v; ulimit -Sc; ulimit -Hc")
+  expect_identical(system2(cmd$command, c(cmd$args, "-c", limits), stdout = TRUE),
+                   c("1048576", "0", "0"))
+})
+
+test_that("an analyzer aborted by the limit fails the package as a crash, writes nothing and changes no row", {
+  skip_on_os("windows")
+  skip_if(!nzchar(Sys.which("prlimit")), "prlimit is not on the path")
+  stub_dir <- withr::local_tempdir()
+  out      <- withr::local_tempdir()
+  # 1.0 needs 1 GiB; every other version, the self-check's included, needs little.
+  withr::local_envvar(RPKG_ANALYZER_BIN = .af_stub(
+    stub_dir, "0.5.2-test", first = c("1.0" = .AF_NEEDS_1GIB), stats = TRUE))
+
+  .local_global("ANALYZER_MEMORY_LIMIT_MB", 2048)
+  expect_identical(.af_run(out, "1.0")$n_fresh, 1L)
+  expect_identical(.af_summary(out)$analyzer_version, "0.5.2-test")
+  before <- .package_rows(out, "pkgA")
+
+  # A new release puts the package back in the queue, under a limit 1.0 no longer fits.
+  .local_global("ANALYZER_MEMORY_LIMIT_MB", 512)
+  m <- .af_run(out, c("1.0", "2.0"))
+  expect_identical(m$shard_failures$packages, "pkgA")
+  expect_identical(m$n_fresh, 0L)
+  expect_identical(m$n_versions, 0L)
+  expect_identical(.package_rows(out, "pkgA"), before)
+  expect_identical(.af_verdicts(out),
+                   data.frame(package = "pkgA", stage = "crash", analyze_failures = 0L,
+                              timeout_failures = 1L,
+                              reason = paste0("analyzer exited with status 134; ",
+                                              "its address-space limit was 512 MiB"),
+                              stringsAsFactors = FALSE))
+  expect_true(any(grepl(paste0(
+    "FAIL pkgA: crash after [0-9.]+s \\[analyzer exit 134 x1\\]: analyzer exited with ",
+    "status 134; its address-space limit was 512 MiB$"), m$logged)))
+
+  # With no limit the same analyzer reads both versions.
+  .local_global("ANALYZER_MEMORY_LIMIT_MB", 0)
+  m <- .af_run(out, c("1.0", "2.0"))
+  expect_identical(m$n_fresh, 1L)
+  expect_identical(.af_summary(out)$analyzer_version, c("0.5.2-test", "0.5.2-test"))
+})
+
+test_that("an analyzer aborted by the limit on a package with no stored row stores none", {
+  skip_on_os("windows")
+  skip_if(!nzchar(Sys.which("prlimit")), "prlimit is not on the path")
+  out <- withr::local_tempdir()
+  withr::local_envvar(RPKG_ANALYZER_BIN = .af_stub(
+    withr::local_tempdir(), "0.5.2-test", first = c("1.0" = .AF_NEEDS_1GIB), stats = TRUE))
+  .local_global("ANALYZER_MEMORY_LIMIT_MB", 512)
+  m <- .af_run(out, "1.0")
+  expect_identical(m$shard_failures$packages, "pkgA")
+  expect_identical(.af_verdicts(out)[c("stage", "timeout_failures", "reason")],
+                   data.frame(stage = "crash", timeout_failures = 1L,
+                              reason = paste0("analyzer exited with status 134; ",
+                                              "its address-space limit was 512 MiB"),
+                              stringsAsFactors = FALSE))
+  expect_identical(nrow(.af_summary(out)), 0L)
+})
+
+test_that("a build before 0.5.2 is not held to the limit, so it reads a version the limit would abort", {
+  skip_on_os("windows")
+  skip_if(!nzchar(Sys.which("prlimit")), "prlimit is not on the path")
+  out <- withr::local_tempdir()
+  withr::local_envvar(RPKG_ANALYZER_BIN = .af_stub(
+    withr::local_tempdir(), "0.5.1-test", first = c("1.0" = .AF_NEEDS_1GIB), stats = TRUE))
+  .local_global("ANALYZER_MEMORY_LIMIT_MB", 512)
+  m <- .af_run(out, "1.0")
+  expect_identical(m$n_fresh, 1L)
+  expect_identical(.af_summary(out)$analyzer_version, "0.5.1-test")
+  expect_true(paste("analyzer memory limit: none, rpkg-analyzer 0.5.1-test is older than 0.5.2",
+                    "(ANALYZER_MEMORY_LIMIT_MB is 512)") %in% m$logged)
+})
+
+test_that("a self-check aborted by the limit stops the run before any shard", {
+  skip_on_os("windows")
+  skip_if(!nzchar(Sys.which("prlimit")), "prlimit is not on the path")
+  withr::local_envvar(RPKG_ANALYZER_STATS = NA, PREV_CODE_TAG = "", PREV_DATA_TAG = "",
+                      PREV_TEXT_TAG = "", RPKG_ANALYZER_BIN = .af_stub(
+    withr::local_tempdir(), "0.5.2-test", first = c("0.0.1" = .AF_NEEDS_1GIB), stats = TRUE))
+  .local_global("ANALYZER_MEMORY_LIMIT_MB", 2048)
+  expect_true(rpkg_analyzer_selfcheck("release"))
+  .local_global("ANALYZER_MEMORY_LIMIT_MB", 512)
+  expect_false(rpkg_analyzer_selfcheck("release"))
+  out <- withr::local_tempdir()
+  expect_error(run_update(.af_io("1.0"), out, shard_size = 10L), paste(
+    "--input-kind release with a summary naming it under its 512 MiB address-space limit;",
+    "stopping before any shard"), fixed = TRUE)
+  expect_false(file.exists(file.path(out, DB_FILENAME)))
 })

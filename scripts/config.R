@@ -35,7 +35,7 @@ MAX_ANALYZER_READ_ATTEMPTS <- 2L
 # Builds whose output the pinned build reproduces record for record, as the
 # analyzer gate report quoted in the pin PR shows. A build not listed stands
 # alone, so leaving one out costs a rescan and never skips one.
-ANALYZER_SAME_OUTPUT <- c("0.4.0")
+ANALYZER_SAME_OUTPUT <- c("0.5.0", "0.5.1", "0.5.2")
 
 # Timeouts, crashes and git timeouts a package may take under one analyzer
 # build and one WORKER_TIMEOUT before it is parked. A timeout costs a worker
@@ -91,6 +91,26 @@ ANALYSIS_CORES <- {
 # file in a metric group (e.g. a catastrophic regex) cannot stall a shard.
 # Overridable via WORKER_TIMEOUT env var.
 WORKER_TIMEOUT <- as.integer(Sys.getenv("WORKER_TIMEOUT", unset = "2400"))
+
+# The limit an ANALYZER_MEMORY_LIMIT_MB value asks for, in MiB: after its
+# spaces are trimmed, a value of decimal digits alone, at most 2147483647,
+# names the limit, 0 for none, and any other value, an empty one included,
+# leaves the default.
+.memory_limit_mb <- function(value, default = 3072) {
+  value <- trimws(value)
+  if (grepl("^[0-9]+$", value) && as.numeric(value) <= .Machine$integer.max) {
+    as.numeric(value)
+  } else {
+    default
+  }
+}
+
+# The most address space one analyzer process may take, in MiB; 0 for no limit.
+# An analyzer that asks for more aborts, which fails its package as a crash and
+# leaves its stored rows alone. Held with prlimit, so it is in force only where
+# prlimit is on the path. Overridable via ANALYZER_MEMORY_LIMIT_MB env var.
+ANALYZER_MEMORY_LIMIT_MB <- .memory_limit_mb(
+  Sys.getenv("ANALYZER_MEMORY_LIMIT_MB", unset = ""))
 
 # The most one worker's progress line may be, in bytes.
 #

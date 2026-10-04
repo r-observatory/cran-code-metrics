@@ -9,7 +9,8 @@
   fn   = c("analyze_package", ".xv_json_token", ".done", ".pkg_worker", ".pkg_worker"),
   call = c("try", "tryCatch", "try", "tryCatch", "tryCatch"),
   expr = c(NA, NA, NA, "io$clone(pkg, dest)",
-           "analyze_package(dest, pkg, stamped = stamped_of[[pkg]] %||% character(0L))"),
+           paste0("analyze_package(dest, pkg, stamped = stamped_of[[pkg]] %||% character(0L),\n",
+                  "                      limit = analyzer_limit)")),
   reason = c(
     "the per-version heartbeat only prints a progress line",
     "reached only from the parent's author span projection in export.R, where no cap is armed",

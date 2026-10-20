@@ -259,7 +259,8 @@ ANALYZER_INPUT_KIND <- "release"
 SUMMARY_TABLE <- "cran_code_summary"
 
 # The commit, tree and deprecation signals each stored version was read from.
-# Pipeline state: the merger does not copy it and no manifest counts it.
+# Pipeline state: the merger does not copy it, and the code manifest counts the
+# summary rows it lacks.
 VERSION_STATE_TABLE <- "cran_version_state"
 
 # A pull request that changes the rows R writes for one version bumps this and

@@ -420,3 +420,46 @@ test_that("every other table is the same whether or not the state rows are writt
   expect_identical(names(got), names(want))
   for (t in names(want)) expect_identical(got[[t]], want[[t]], info = t)
 })
+
+test_that("a requeue deletes the requeued package's state rows and no other's", {
+  .vst_local_run_env()
+  root <- withr::local_tempdir()
+  .vst_source(root, "vstpkg", c("1.0", "1.9"))
+  .vst_source(root, "okpkg", c("1.0", "1.9"))
+  out <- withr::local_tempdir()
+  .vst_run(out, root, c(vstpkg = "1.9", okpkg = "1.9"))
+  con <- open_or_init_db(file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(.requeue(con, "vstpkg"), "vstpkg")
+  n <- function(p) DBI::dbGetQuery(con, "SELECT COUNT(*) n FROM cran_version_state WHERE package = ?",
+                                   params = list(p))$n
+  expect_identical(c(n("vstpkg"), n("okpkg")), c(0L, 2L))
+})
+
+test_that("the stored versions with no recorded commit are counted", {
+  .vst_local_run_env()
+  root <- withr::local_tempdir()
+  .vst_source(root, "vstpkg", c("1.0", "1.9"))
+  .vst_source(root, "okpkg", c("1.0", "1.9"))
+  out <- withr::local_tempdir()
+  .vst_run(out, root, c(vstpkg = "1.9", okpkg = "1.9"))
+  con <- open_or_init_db(file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(.n_versions_unrecorded(con), 0L)
+  DBI::dbExecute(con, "UPDATE cran_version_state SET commit_sha = NULL
+                        WHERE package = 'vstpkg' AND version = '1.0'")
+  DBI::dbExecute(con, "DELETE FROM cran_version_state
+                        WHERE package = 'okpkg' AND version = '1.9'")
+  expect_identical(.n_versions_unrecorded(con), 2L)
+})
+
+test_that("the code manifest and run status carry n_versions_unrecorded, the data manifest does not", {
+  .vst_local_run_env()
+  root <- withr::local_tempdir()
+  .vst_source(root, "vstpkg", c("1.0", "1.9"))
+  out <- withr::local_tempdir()
+  .vst_run(out, root, c(vstpkg = "1.9"))
+  expect_identical(jsonlite::fromJSON(file.path(out, "code-manifest.json"))$bootstrap$n_versions_unrecorded, 0L)
+  expect_identical(jsonlite::fromJSON(file.path(out, "run-status.json"))$n_versions_unrecorded, 0L)
+  expect_null(jsonlite::fromJSON(file.path(out, "data-manifest.json"))$bootstrap$n_versions_unrecorded)
+})

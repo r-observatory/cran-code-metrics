@@ -1993,10 +1993,12 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
   )
 
   # The code series also carries the failure verdicts: parked by class, the
-  # packages failed this run, and the over-cap list.
+  # packages failed this run, the over-cap list and the stored versions with no
+  # recorded commit.
   if (identical(series, "code")) {
     extra <- bootstrap[intersect(c("parked", "failed_this_run", "over_cap_ok",
-                                   "over_cap_this_run"), names(bootstrap))]
+                                   "over_cap_this_run",
+                                   "n_versions_unrecorded"), names(bootstrap))]
     out$bootstrap <- c(out$bootstrap, Filter(Negate(is.null), extra))
   }
 

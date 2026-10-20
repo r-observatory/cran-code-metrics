@@ -30,9 +30,9 @@ are kept; see Retention):
 - `cran_release_notes` - the NEWS section for the latest analysed version, when
   the analyzer found one, capped at 16,384 bytes.
 - `cran_version_state` - for each stored version, the tag commit and tree its
-  rows were read from, the version and commit before it in that walk, and its
-  deprecation signals. Pipeline state: the data merger does not copy it and no
-  manifest counts it.
+  rows were read from, the version and commit before it in that walk, its
+  deprecation signals and its `rows_generation`. Pipeline state: the data merger
+  does not copy it, and the code manifest counts the summary rows it lacks.
 
 `cran-data-metrics.db` is published in the same release and holds the
 dataset-focused tables.

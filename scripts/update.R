@@ -328,7 +328,9 @@
 #'
 #' Releases their verdicts, forgets their read attempts and clears
 #' datasets_scanned on their latest row, so this run's dataset backfill takes
-#' them and keeps them until they pass. Their stored rows stay as they are.
+#' them and keeps them until they pass. Their stored rows stay as they are, but
+#' their version state rows go, so their next walk reads every version wherever
+#' it lands.
 #'
 #' @param spec Package names separated by commas; over_cap names the standing
 #'   over-cap list.
@@ -346,6 +348,11 @@
       "DELETE FROM cran_analyzer_read_attempts WHERE package IN (%s)", ph),
       params = as.list(pkgs))
   }
+  if (VERSION_STATE_TABLE %in% tables) {
+    DBI::dbExecute(con, sprintf(
+      'DELETE FROM "%s" WHERE package IN (%s)', VERSION_STATE_TABLE, ph),
+      params = as.list(pkgs))
+  }
   if ("cran_code_summary" %in% tables &&
       all(c("datasets_scanned", "latest_release_date") %in%
           DBI::dbListFields(con, "cran_code_summary"))) {
@@ -355,6 +362,21 @@
       params = as.list(pkgs))
   }
   pkgs
+}
+
+# Summary rows with no state row or no recorded commit: versions a skip cannot
+# trust.
+.n_versions_unrecorded <- function(con) {
+  tables <- DBI::dbListTables(con)
+  if (!SUMMARY_TABLE %in% tables) return(0L)
+  if (!VERSION_STATE_TABLE %in% tables) {
+    return(as.integer(DBI::dbGetQuery(con, sprintf(
+      'SELECT COUNT(*) n FROM "%s"', SUMMARY_TABLE))$n))
+  }
+  as.integer(DBI::dbGetQuery(con, sprintf(
+    'SELECT COUNT(*) n FROM "%s" s LEFT JOIN "%s" v
+        ON v.package = s.package AND v.version = s.version
+      WHERE v.commit_sha IS NULL', SUMMARY_TABLE, VERSION_STATE_TABLE))$n)
 }
 
 # Parked verdicts by class, and the rows from before stages were kept.
@@ -1832,6 +1854,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                     analyzer_version = analyzer_version,
                     output_class = I(output_class),
                     n_latest_on_build = .n_latest_on_class(con, analyzer_version)[["on_class"]],
+                    n_versions_unrecorded = .n_versions_unrecorded(con),
                     parked = verdict_counts$parked,
                     failed_this_run = verdict_counts$failed_this_run,
                     over_cap_ok = verdict_counts$over_cap_ok,
@@ -1912,6 +1935,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       analyzer_version = bootstrap$analyzer_version,
                       output_class = bootstrap$output_class,
                       n_latest_on_build = bootstrap$n_latest_on_build,
+                      n_versions_unrecorded = bootstrap$n_versions_unrecorded,
                       failed_by_stage = .stage_counts(shard_stages),
                       parked = verdict_counts$parked,
                       failed_this_run = verdict_counts$failed_this_run,

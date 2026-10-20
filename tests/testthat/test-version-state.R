@@ -342,9 +342,9 @@ test_that("a package that fails keeps its state rows, and the one beside it gets
   .vst_release(src, "vstpkg", "1.10")
   .vst_release(file.path(root, "okpkg.git"), "okpkg", "1.9")
   real_extract <- extract_version
-  .local_global("extract_version", function(repo, ref, dest) {
+  .local_global("extract_version", function(repo, ref, dest, ...) {
     if (identical(ref, "1.10")) stop(.extract_failure("archive", ref, 128L, "fatal: bad object"))
-    real_extract(repo, ref, dest)
+    real_extract(repo, ref, dest, ...)
   })
   m <- .vst_run(out, root, c(vstpkg = "1.10", okpkg = "1.9"))
 

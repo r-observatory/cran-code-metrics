@@ -552,8 +552,8 @@
 }
 
 # One table's rows for `pkgs`, typed as `types` says. A column the table lacks
-# reads as NULL; `exprs` names the expression a column is computed from, and the
-# table column it needs.
+# reads as NULL; `exprs` names the expression a column is computed from, the
+# table column it needs, and what it reads as without it.
 .prior_table <- function(con, table, types, pkgs, exprs = list()) {
   empty <- as.data.frame(c(list(package = character(0L)),
                            lapply(types, function(t) vector(t, 0L))),
@@ -561,8 +561,8 @@
   if (!table %in% DBI::dbListTables(con)) return(empty)
   have <- DBI::dbListFields(con, table)
   sel <- vapply(names(types), function(n) {
-    e <- exprs[[n]] %||% list(n, n)
-    if (e[[2L]] %in% have) sprintf("%s AS %s", e[[1L]], n) else sprintf("NULL AS %s", n)
+    e <- exprs[[n]] %||% list(n, n, "NULL")
+    if (e[[2L]] %in% have) sprintf("%s AS %s", e[[1L]], n) else sprintf("%s AS %s", e[[3L]], n)
   }, character(1L))
   df <- DBI::dbGetQuery(con, sprintf(
     'SELECT package, %s FROM "%s" WHERE package IN (%s) ORDER BY package, version',
@@ -588,8 +588,8 @@
                      n_fns_r_null = "logical", detail_scanned = "integer",
                      datasets_scanned = "integer", latest = "logical",
                      released = "character", dep_list = "character", authors = "character")
-  summary_exprs <- list(n_fns_r_null = list("n_fns_r IS NULL", "n_fns_r"),
-                        latest = list("latest_release_date IS NOT NULL", "latest_release_date"))
+  summary_exprs <- list(n_fns_r_null = list("n_fns_r IS NULL", "n_fns_r", "1"),
+                        latest = list("latest_release_date IS NOT NULL", "latest_release_date", "0"))
   api_types <- c(version = "character", exports_added = "character",
                  exports_removed = "character", n_exports = "integer")
   state_types <- c(version = "character", commit_sha = "character", tree_sha = "character",

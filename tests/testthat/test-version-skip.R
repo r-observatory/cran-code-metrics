@@ -209,7 +209,15 @@ test_that("a summary column the database lacks reads as NULL", {
   expect_identical(p$stored$released, c("2026-01-01", "2026-01-01"))
   expect_true(all(is.na(p$stored$detail_scanned)))
   expect_true(all(is.na(p$stored$datasets_scanned)))
-  expect_true(all(is.na(p$stored$latest)))
+  expect_false(any(p$stored$latest))
+  expect_true(all(as.logical(p$stored$n_fns_r_null)))
+  # With state rows matching the listing, the metrics rule is the first one they fail.
+  DBI::dbWriteTable(d$con, VERSION_STATE_TABLE, data.frame(
+    package = "p", version = c("1.0", "1.1"), commit_sha = c("c1", "c2"),
+    tree_sha = c("t1", "t2"), rows_generation = 1L, stringsAsFactors = FALSE), append = TRUE)
+  p <- .prior_state(d$con, d$text_con, "p", "0.5.2")[["p"]]
+  lv <- .vs_versions(c("1.0", "1.1"))
+  expect_identical(.read_plan(lv, .vs_trees(lv$version), p)$reason, c("metrics", "metrics"))
 })
 test_that("only text readings by 0.5.0 or later count", {
   d <- .vs_dbs()

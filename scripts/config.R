@@ -262,6 +262,10 @@ SUMMARY_TABLE <- "cran_code_summary"
 # Pipeline state: the merger does not copy it and no manifest counts it.
 VERSION_STATE_TABLE <- "cran_version_state"
 
+# A pull request that changes the rows R writes for one version bumps this and
+# regenerates tests/testthat/fixtures/rows-golden.json.
+ROWS_GENERATION <- 1L
+
 # DESCRIPTION and NEWS text for every analysed version, kept in a third database.
 RELEASE_TEXT_DB_FILENAME    <- "cran-release-text.db"
 DESCRIPTION_HISTORY_TABLE   <- "cran_description_history"

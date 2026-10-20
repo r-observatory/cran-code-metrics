@@ -1397,26 +1397,43 @@ open_or_init_data_db <- function(path) {
 # replaced with them; pipeline state that nothing downstream reads.
 .VERSION_STATE_COLS <- c("package", "version", "commit_sha", "tree_sha",
                          "prev_version", "prev_commit", "deprecated",
-                         "uses_lifecycle", "read_at")
+                         "uses_lifecycle", "read_at", "rows_generation")
 
 .ensure_version_state_table <- function(con) {
   DBI::dbExecute(con, sprintf('
     CREATE TABLE IF NOT EXISTS "%s" (
       package TEXT NOT NULL, version TEXT NOT NULL,
       commit_sha TEXT, tree_sha TEXT, prev_version TEXT, prev_commit TEXT,
-      deprecated TEXT, uses_lifecycle INTEGER, read_at TEXT,
+      deprecated TEXT, uses_lifecycle INTEGER, read_at TEXT, rows_generation INTEGER,
       PRIMARY KEY (package, version)) WITHOUT ROWID', VERSION_STATE_TABLE))
+  # A table from before rows_generation gains it, its rows keeping NULL.
+  if (!"rows_generation" %in% DBI::dbListFields(con, VERSION_STATE_TABLE)) {
+    DBI::dbExecute(con, sprintf('ALTER TABLE "%s" ADD COLUMN rows_generation INTEGER',
+                                VERSION_STATE_TABLE))
+  }
   invisible(NULL)
 }
 
-# The state rows of the summary rows a write keeps, one per (package, version),
-# with every column of the table.
-.version_state_write <- function(state_df, summary_df) {
+# The state rows of the keys a write keeps (any frame with package and version),
+# one per (package, version), with every column of the table.
+.version_state_write <- function(state_df, keys) {
   key <- function(df) paste(df$package, df$version, sep = "\x1f")
-  out <- state_df[key(state_df) %in% key(summary_df), , drop = FALSE]
+  out <- state_df[key(state_df) %in% key(keys), , drop = FALSE]
   out <- out[!duplicated(key(out), fromLast = TRUE), , drop = FALSE]
   for (col in setdiff(.VERSION_STATE_COLS, names(out))) out[[col]] <- rep(NA, nrow(out))
   out[, .VERSION_STATE_COLS, drop = FALSE]
+}
+
+# Replace the state rows of `pkgs` with those of the versions in summary_df.
+# A write with no state rows leaves the packages with none, so nothing claims a
+# commit for rows it did not see read. Runs inside the caller's transaction.
+.write_version_state <- function(con, pkgs, summary_df, state_df) {
+  .ensure_version_state_table(con)
+  .delete_by_package(con, VERSION_STATE_TABLE, pkgs)
+  if (is.null(state_df) || nrow(state_df) == 0L) return(invisible(NULL))
+  state_write <- .version_state_write(state_df, summary_df)
+  if (nrow(state_write) > 0L) DBI::dbAppendTable(con, VERSION_STATE_TABLE, state_write)
+  invisible(NULL)
 }
 
 # The columns a failure verdict adds to cran_metrics_failures, with their types.
@@ -1723,9 +1740,10 @@ db_analyzed_state <- function(con) {
 #'   stale rows survive a re-analysis.
 #' @param description_df,release_notes_df Latest-only text rows; NULL leaves both tables untouched.
 #' @param analyzer_version The running analyzer build; gates the 0.5.0 schema steps.
-#' @param state_df   Optional version state rows (see .version_state_rows), which
-#'   replace those of the same packages for the versions whose summary rows
-#'   are written. NULL (the default) leaves cran_version_state untouched.
+#' @param state_df   Version state rows (.version_state_rows). The packages'
+#'   state rows are replaced with those of the versions whose summary rows are
+#'   written; NULL leaves the packages with none, so nothing claims a commit
+#'   for rows it did not see read.
 #' @return invisible(NULL)
 upsert_shard <- function(con, summary_df, churn_df, api_df,
                          functions_df = NULL, edges_df = NULL,
@@ -1812,12 +1830,7 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     }
 
     # -- Replace what each version was read from, beside the rows it gave -----
-    if (!is.null(state_df)) {
-      .ensure_version_state_table(con)
-      .delete_by_package(con, VERSION_STATE_TABLE, pkgs)
-      state_write <- .version_state_write(state_df, summary_df)
-      if (nrow(state_write) > 0L) DBI::dbAppendTable(con, VERSION_STATE_TABLE, state_write)
-    }
+    .write_version_state(con, pkgs, summary_df, state_df)
   })
 
   invisible(NULL)

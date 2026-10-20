@@ -76,6 +76,7 @@
     if (is.data.frame(d)) d$read_at <- NULL
     d
   })
+  res$state$read_at <- NULL
   res
 }
 

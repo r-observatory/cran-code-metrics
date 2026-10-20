@@ -584,6 +584,8 @@ test_that("a cap during extraction extracts again into an emptied directory", {
   })
   got <- suppressWarnings(analyze_package(repo, "pkgX"))
   expect_true(fired)
+  got$state$read_at <- NULL
+  want$state$read_at <- NULL
   expect_identical(got, want)
 })
 
@@ -701,6 +703,7 @@ test_that("a cap in a per-version step of analyze_package changes nothing it ret
   analyse <- function() {
     res <- analyze_package(repo, "pkgCap")
     res$text$versions$read_at <- NULL
+    res$state$read_at <- NULL
     res
   }
   want <- analyse()

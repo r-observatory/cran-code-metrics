@@ -91,7 +91,8 @@
 
 .VST_COLUMNS <- c(package = "TEXT", version = "TEXT", commit_sha = "TEXT",
                   tree_sha = "TEXT", prev_version = "TEXT", prev_commit = "TEXT",
-                  deprecated = "TEXT", uses_lifecycle = "INTEGER", read_at = "TEXT")
+                  deprecated = "TEXT", uses_lifecycle = "INTEGER", read_at = "TEXT",
+                  rows_generation = "INTEGER")
 
 .vst_expect_schema <- function(con) {
   expect_true(VERSION_STATE_TABLE %in% DBI::dbListTables(con))
@@ -180,7 +181,94 @@ test_that("a package with no version tags records no versions", {
   .vst_git(repo, "commit", "-q", "-m", "init")
   res <- suppressWarnings(analyze_package(repo, "vstpkg"))
   expect_identical(nrow(res$state), 0L)
-  expect_identical(names(res$state), setdiff(names(.VST_COLUMNS), "read_at"))
+  expect_identical(names(res$state), names(.VST_COLUMNS))
+})
+
+test_that("a code database from before rows_generation gains it on open and keeps its rows", {
+  path <- withr::local_tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  DBI::dbExecute(con, 'CREATE TABLE cran_version_state (package TEXT NOT NULL,
+    version TEXT NOT NULL, commit_sha TEXT, tree_sha TEXT, prev_version TEXT,
+    prev_commit TEXT, deprecated TEXT, uses_lifecycle INTEGER, read_at TEXT,
+    PRIMARY KEY (package, version)) WITHOUT ROWID')
+  DBI::dbExecute(con, "INSERT INTO cran_version_state (package, version, commit_sha)
+                       VALUES ('p', '1.0', 'c1')")
+  DBI::dbDisconnect(con)
+  con <- open_or_init_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  .vst_expect_schema(con)
+  got <- DBI::dbGetQuery(con, "SELECT commit_sha, rows_generation FROM cran_version_state")
+  expect_identical(got$commit_sha, "c1")
+  expect_true(is.na(got$rows_generation))
+})
+
+test_that("every state row a walk writes carries the running ROWS_GENERATION", {
+  .vst_local_run_env()
+  root <- withr::local_tempdir()
+  .vst_source(root, "vstpkg", c("1.0", "1.9"))
+  out <- withr::local_tempdir()
+  .vst_run(out, root, c(vstpkg = "1.9"))
+  expect_identical(.vst_state(out, "vstpkg")$rows_generation, rep(ROWS_GENERATION, 2L))
+})
+
+test_that("read_at is taken when the walk lists the versions, before any version is extracted", {
+  clock <- new.env()
+  clock$t <- as.POSIXct("2026-10-01 00:00:00", tz = "UTC")
+  .local_global("Sys.time", function() { clock$t <- clock$t + 60; clock$t })
+  real <- extract_version
+  .local_global("extract_version", function(repo, ref, dest, ...) {
+    if (is.null(clock$extracted)) clock$extracted <- format(clock$t, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+    real(repo, ref, dest, ...)
+  })
+  root <- withr::local_tempdir()
+  src <- .vst_source(root, "vstpkg", c("1.0", "1.9"))
+  res <- suppressWarnings(analyze_package(src, "vstpkg"))
+  expect_length(unique(res$state$read_at), 1L)
+  expect_true(res$state$read_at[[1L]] < clock$extracted)
+})
+
+.vst_summary <- function(pkg, vers) {
+  data.frame(package = rep(pkg, length(vers)), version = vers, loc_r = seq_along(vers),
+             stringsAsFactors = FALSE)
+}
+
+.vst_state_df <- function(pkg, vers, commit = paste0("c", vers)) {
+  n <- length(vers)
+  data.frame(package = rep(pkg, n), version = vers, commit_sha = commit,
+             tree_sha = paste0("t", vers), prev_version = c(NA, vers[-n]),
+             prev_commit = c(NA, commit[-n]), deprecated = rep("[]", n),
+             uses_lifecycle = rep(0L, n), read_at = rep("2026-10-03T00:00:00Z", n),
+             rows_generation = rep(1L, n), stringsAsFactors = FALSE)
+}
+
+.vst_empty_churn <- function() data.frame(package = character(0L), version = character(0L),
+                                          file = character(0L), added = integer(0L),
+                                          deleted = integer(0L))
+.vst_empty_api <- function() data.frame(package = character(0L), version = character(0L),
+                                        exports_added = character(0L),
+                                        exports_removed = character(0L),
+                                        n_exports = integer(0L))
+
+test_that("a write with no state rows leaves the package with none", {
+  path <- withr::local_tempfile(fileext = ".db")
+  con <- open_or_init_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  upsert_shard(con, .vst_summary("pkgA", "1.0"), .vst_empty_churn(), .vst_empty_api(),
+               state_df = .vst_state_df("pkgA", "1.0"))
+  upsert_shard(con, .vst_summary("pkgA", "1.0"), .vst_empty_churn(), .vst_empty_api())
+  expect_identical(DBI::dbGetQuery(con, sprintf('SELECT COUNT(*) n FROM "%s"',
+                                                VERSION_STATE_TABLE))$n, 0L)
+})
+
+test_that("a deprecation series shorter than the listing pads the state rows", {
+  v <- data.frame(version = c("1.0", "1.1"), ref = c("1.0", "1.1"), date = "2026-01-01",
+                  commit = c("c1", "c2"), stringsAsFactors = FALSE)
+  st <- .version_state_rows("p", v, c("t1", "t2"), list(list(symbols = "a", uses_lifecycle = TRUE)),
+                            "2026-10-01T00:00:00Z")
+  expect_identical(st$deprecated, c('["a"]', "[]"))
+  expect_identical(st$uses_lifecycle, c(1L, 0L))
+  expect_identical(st$rows_generation, c(ROWS_GENERATION, ROWS_GENERATION))
+  expect_identical(names(st), .VERSION_STATE_COLS)
 })
 
 # ---- What a run writes -------------------------------------------------------

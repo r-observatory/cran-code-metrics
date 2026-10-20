@@ -1588,7 +1588,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
          functions = res$functions, edges = res$edges, datasets = res$datasets,
          vignettes = res$vignettes, text = res$text,
          binary_versions = res$binary_versions,
-         state = .with_read_at(res$state))
+         state = res$state)
   }
 
   results <- parallel::mclapply(shard_pkgs, .with_worker_telemetry(.pkg_worker),

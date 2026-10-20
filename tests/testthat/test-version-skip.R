@@ -100,7 +100,7 @@ test_that("the newest is read when it is not the stored newest or has lost its d
   v2 <- c("1.0", "1.1")
   pr <- .vs_prior(v2); pr$stored$datasets_scanned[[2L]] <- NA
   expect_identical(.vs_plan(v2, pr)$reason, c(NA, "newest"))
-  pr <- .vs_prior(v3); pr$stored$detail_scanned <- 1L   # 1.2 is gone, so 1.1 is the newest again
+  pr <- .vs_prior(v3); pr$stored$detail_scanned <- 1L; pr$stored$datasets_scanned <- 1L   # 1.2 is gone, so 1.1 is the newest again
   expect_identical(.vs_plan(v2, pr)$reason, c(NA, "newest"))
 })
 test_that("a tag inserted before a stored one redoes the stored one's diff", {

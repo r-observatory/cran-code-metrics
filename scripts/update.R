@@ -235,12 +235,16 @@
 }
 
 # Keep the standing over-cap list. A pass past the cap ran uncapped after the cap
-# fired somewhere, so it goes on the list; a pass under the cap rewrote every
-# stored row without crossing, so it comes off. TRUE when the package is on it.
+# fired somewhere, so it goes on the list; a pass under the cap that read and
+# rewrote every stored row (`whole`) without crossing takes it off. A pass that
+# skipped versions says nothing about how long the whole package takes, so it
+# leaves the list as it is. TRUE when this pass went past the cap.
 .note_over_cap <- function(con, pkg, elapsed, build, run_id,
-                           worker_timeout = WORKER_TIMEOUT) {
+                           worker_timeout = WORKER_TIMEOUT, whole = TRUE) {
   if (!isTRUE(elapsed >= worker_timeout)) {
-    DBI::dbExecute(con, "DELETE FROM cran_over_cap WHERE package = ?", params = list(pkg))
+    if (isTRUE(whole)) {
+      DBI::dbExecute(con, "DELETE FROM cran_over_cap WHERE package = ?", params = list(pkg))
+    }
     return(FALSE)
   }
   DBI::dbExecute(con, "
@@ -1611,8 +1615,10 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   n_nothing_read       <- 0L
   shard_failures       <- character(0L)
   shard_stages         <- character(0L)
-  # Verdicts this shard wrote. Each is news the next run needs, so the shard
-  # publishes; a weekly recheck that failed where it failed before is not.
+  # Verdicts this shard wrote or cleared. Each is news the next run needs, so
+  # the shard publishes; a weekly recheck that failed where it failed before is
+  # not. A cleared one counts because a package that read nothing writes no
+  # rows, and its shard would not publish otherwise.
   n_verdicts_written   <- 0L
   shard_over_cap       <- character(0L)
   # Which of the rows about to be written the analyzer binary produced, keyed
@@ -1730,8 +1736,11 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     } else {
       shard_binary_keys <- c(shard_binary_keys,
                              .analyzer_row_keys(pkg, r$binary_versions))
+      # Read and written whole, as every package is with the skip off.
+      whole <- !isTRUE(r$skip$unchanged) && !isTRUE(r$skip$partial)
+      if (pkg %in% verdicts$package) n_verdicts_written <- n_verdicts_written + 1L
       .reset_failure(con, pkg)
-      if (.note_over_cap(con, pkg, v$elapsed, analyzer_version, run_id)) {
+      if (.note_over_cap(con, pkg, v$elapsed, analyzer_version, run_id, whole = whole)) {
         shard_over_cap <- c(shard_over_cap, pkg)
       }
       # Analysed, but which versions were read? A version the analyzer did not
@@ -1749,7 +1758,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       if (!is.null(r$skip)) shard_plans[[pkg]] <- r$skip$plan
       if (isTRUE(r$skip$unchanged)) {
         n_nothing_read <- n_nothing_read + 1L
-      } else if (isTRUE(r$skip$partial)) {
+      } else if (!whole) {
         shard_partial[[pkg]] <- r
       } else {
         shard_summary_list[[pkg]]   <- r$summary
@@ -1932,7 +1941,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   cat(sprintf(
     "shard done in %.0fs: %d/%d ok, %d failed; %d versions, %d functions, %d edges written; DB %d/%d; %d queued; complete=%s\n",
     as.numeric(difftime(Sys.time(), t_shard0, units = "secs")),
-    length(fresh_pkgs), length(shard_pkgs), length(shard_failures),
+    length(fresh_pkgs) + n_nothing_read, length(shard_pkgs), length(shard_failures),
     nrow(fresh_summary), nrow(fresh_functions), nrow(fresh_edges),
     n_analyzed_pkgs, n_universe, length(remaining_after),
     tolower(as.character(bootstrap_complete))),

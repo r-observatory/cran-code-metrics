@@ -445,11 +445,33 @@ test_that("a package queued with nothing to read is ok, not fresh, and does not 
   .vs_run(out, root, c(vstpkg = "1.10"))
   before <- .package_rows(out, "vstpkg")
   # Stored up to 1.10; the universe names 2.0, which the mirror does not have yet.
-  .vs_run(out, root, c(vstpkg = "2.0"))
+  log <- attr(.vs_run(out, root, c(vstpkg = "2.0")), "log")
   rs <- jsonlite::fromJSON(file.path(out, "run-status.json"))
   expect_identical(c(rs$n_shard, rs$n_fresh, rs$shard_failures), c(1L, 0L, 0L))
   expect_false(rs$changed)
   expect_identical(.package_rows(out, "vstpkg"), before)
+  expect_true(any(grepl("^shard done in [0-9]+s: 1/1 ok, 0 failed; 0 versions", log)))
+})
+test_that("a failure verdict cleared on a package with nothing to read is published once", {
+  .vst_local_run_env(); .vs_stub()
+  root <- withr::local_tempdir()
+  .vst_source(root, "vstpkg", c("1.0", "1.9", "1.10"))
+  out <- withr::local_tempdir()
+  .vs_run(out, root, c(vstpkg = "1.10"))
+  # A clone that failed once, at the release the mirror does not have yet.
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  .record_failure(con, "vstpkg", "clone", "0.4.0-test", WORKER_TIMEOUT, NA_character_,
+                  1, "clone failed", "2.0")
+  DBI::dbDisconnect(con)
+  failures <- function() .vst_query(out, "SELECT package FROM cran_metrics_failures")$package
+  expect_identical(failures(), "vstpkg")
+  .vs_run(out, root, c(vstpkg = "2.0"))
+  rs <- jsonlite::fromJSON(file.path(out, "run-status.json"))
+  expect_identical(c(rs$n_shard, rs$n_fresh), c(1L, 0L))
+  expect_true(rs$changed)
+  expect_identical(failures(), character(0L))
+  .vs_run(out, root, c(vstpkg = "2.0"))
+  expect_false(jsonlite::fromJSON(file.path(out, "run-status.json"))$changed)
 })
 test_that("a requeued package that lands in a later shard still reads every version", {
   .vst_local_run_env(); .vs_stub()
@@ -536,6 +558,27 @@ test_that("a package whose one read version fails keeps every stored row and rea
   expect_identical(as.integer(rs$shard_failures), 0L)
   expect_identical(as.integer(rs$worker_phases$versions_read), 1L)
   expect_identical(.vst_summary_keys(out, "vstpkg")$version, sort(c("1.0", "1.9", "1.10", "2.0")))
+})
+test_that("a pass that skips versions under the cap leaves the over-cap note, and a whole walk under it clears it", {
+  .vst_local_run_env(); .vs_stub()
+  root <- withr::local_tempdir()
+  src <- .vst_source(root, "vstpkg", c("1.0", "1.9", "1.10"))
+  out <- withr::local_tempdir()
+  .vs_run(out, root, c(vstpkg = "1.10"))
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  DBI::dbExecute(con, "INSERT INTO cran_over_cap (package, elapsed_s) VALUES ('vstpkg', 3000)")
+  DBI::dbDisconnect(con)
+  noted <- function() .vst_query(out, "SELECT package FROM cran_over_cap")$package
+  .vst_release(src, "vstpkg", "2.0")
+  .vs_run(out, root, c(vstpkg = "2.0"))
+  rs <- jsonlite::fromJSON(file.path(out, "run-status.json"))
+  expect_identical(as.integer(rs$worker_phases$versions_read), 1L)
+  expect_identical(noted(), "vstpkg")
+  # --requeue=over_cap still names it, and that walk reads every version.
+  .vs_run(out, root, c(vstpkg = "2.0"), requeue = "over_cap")
+  rs <- jsonlite::fromJSON(file.path(out, "run-status.json"))
+  expect_identical(as.integer(rs$worker_phases$versions_read), 4L)
+  expect_identical(noted(), character(0L))
 })
 test_that("a skipped row keeps its assessed_at and assessed_with", {
   .vst_local_run_env(); .vs_stub()

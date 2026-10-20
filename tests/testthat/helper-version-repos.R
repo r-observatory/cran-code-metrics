@@ -52,6 +52,7 @@
 }
 
 # One run_update over `latest` (package -> latest version), cloning from `root`.
+# Its manifest, with what it printed as the "log" attribute.
 .vst_run <- function(out_dir, root, latest, shard_size = 10L, ...) {
   io <- list(
     package_list = function() data.frame(package = names(latest),
@@ -59,9 +60,9 @@
                                          stringsAsFactors = FALSE),
     clone = function(pkg, dest) clone_package(pkg, dest, base = root))
   m <- NULL
-  utils::capture.output(m <- suppressMessages(suppressWarnings(
+  log <- utils::capture.output(m <- suppressMessages(suppressWarnings(
     run_update(io, out_dir, shard_size = shard_size, ...))))
-  m
+  structure(m, log = log)
 }
 
 # One worker, run in this process, in a work directory of its own.

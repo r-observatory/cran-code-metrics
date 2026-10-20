@@ -274,6 +274,8 @@ jobs:
           UNPARK: ${{ inputs.unpark }}
           REQUEUE: ${{ inputs.requeue }}
           CORES_INPUT: ${{ inputs.analysis_cores || vars.ANALYSIS_CORES }}
+          # Empty runs the version skip, 0 turns it off.
+          VERSION_SKIP: ${{ vars.VERSION_SKIP }}
         run: |
           set -euo pipefail
           # shellcheck source=scripts/publish.sh

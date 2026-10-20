@@ -416,3 +416,149 @@ test_that("functions and edges come only from a read newest", {
   expect_identical(res$summary$version, "1.9"); expect_false(res$skip$newest_read)
   expect_identical(nrow(res$functions), 0L); expect_identical(nrow(res$edges), 0L)
 })
+
+# ---- run_update with the version skip ------------------------------------------
+
+test_that("the version skip is on unless VERSION_SKIP is 0", {
+  expect_true(.version_skip_on("")); expect_true(.version_skip_on("1"))
+  expect_false(.version_skip_on("0")); expect_false(.version_skip_on(" 0 "))
+})
+test_that("a skip run after a new tag writes the rows a full walk writes", {
+  .vst_local_run_env(); .vs_stub()
+  root <- withr::local_tempdir()
+  src <- .vst_source(root, "vstpkg", c("1.0", "1.9", "1.10"))
+  skip <- withr::local_tempdir(); full <- withr::local_tempdir()
+  .vs_run(skip, root, c(vstpkg = "1.10"))
+  .vst_release(src, "vstpkg", "2.0")
+  .vs_run(skip, root, c(vstpkg = "2.0"))
+  .vs_run(full, root, c(vstpkg = "2.0"), skip = FALSE)
+  expect_identical(.vs_rows(skip, "vstpkg"), .vs_rows(full, "vstpkg"))
+  rs <- jsonlite::fromJSON(file.path(skip, "run-status.json"))
+  expect_identical(as.integer(rs$worker_phases$versions_read), 1L)
+  expect_identical(as.integer(rs$n_versions), 1L)
+})
+test_that("a package queued with nothing to read is ok, not fresh, and does not publish", {
+  .vst_local_run_env(); .vs_stub()
+  root <- withr::local_tempdir()
+  .vst_source(root, "vstpkg", c("1.0", "1.9", "1.10"))
+  out <- withr::local_tempdir()
+  .vs_run(out, root, c(vstpkg = "1.10"))
+  before <- .package_rows(out, "vstpkg")
+  # Stored up to 1.10; the universe names 2.0, which the mirror does not have yet.
+  .vs_run(out, root, c(vstpkg = "2.0"))
+  rs <- jsonlite::fromJSON(file.path(out, "run-status.json"))
+  expect_identical(c(rs$n_shard, rs$n_fresh, rs$shard_failures), c(1L, 0L, 0L))
+  expect_false(rs$changed)
+  expect_identical(.package_rows(out, "vstpkg"), before)
+})
+test_that("a requeued package that lands in a later shard still reads every version", {
+  .vst_local_run_env(); .vs_stub()
+  root <- withr::local_tempdir()
+  apkg <- .vst_source(root, "apkg", c("1.0", "1.9", "1.10"))
+  .vst_source(root, "vstpkg", c("1.0", "1.9", "1.10"))
+  out <- withr::local_tempdir()
+  .vs_run(out, root, c(apkg = "1.10", vstpkg = "1.10"))
+  # apkg and vstpkg stored; apkg gains a tag so both are queued, apkg sorting first.
+  .vst_release(apkg, "apkg", "2.0")
+  latest <- c(apkg = "2.0", vstpkg = "1.10")
+  .vs_run(out, root, latest, requeue = "vstpkg", shard_size = 1L)   # walks apkg
+  rs <- jsonlite::fromJSON(file.path(out, "run-status.json"))
+  expect_identical(as.integer(rs$worker_phases$versions_read), 1L)
+  .vs_run(out, root, latest, shard_size = 1L)                        # walks vstpkg, no flag
+  rs <- jsonlite::fromJSON(file.path(out, "run-status.json"))
+  expect_identical(as.integer(rs$worker_phases$versions_read), 3L)
+})
+test_that("--bootstrap and VERSION_SKIP off read every version and give a full walk's rows", {
+  .vst_local_run_env(); .vs_stub()
+  root <- withr::local_tempdir()
+  src <- .vst_source(root, "vstpkg", c("1.0", "1.9", "1.10"))
+  boot <- withr::local_tempdir(); off <- withr::local_tempdir(); full <- withr::local_tempdir()
+  .vs_run(boot, root, c(vstpkg = "1.10")); .vs_run(off, root, c(vstpkg = "1.10"))
+  .vst_release(src, "vstpkg", "2.0")
+  .vs_run(boot, root, c(vstpkg = "2.0"), force_full = TRUE)
+  .vs_run(off, root, c(vstpkg = "2.0"), skip = FALSE)
+  .vs_run(full, root, c(vstpkg = "2.0"), skip = FALSE)
+  rs_boot <- jsonlite::fromJSON(file.path(boot, "run-status.json"))
+  rs_off  <- jsonlite::fromJSON(file.path(off, "run-status.json"))
+  expect_identical(as.integer(rs_boot$worker_phases$versions_read), 4L)
+  expect_identical(as.integer(rs_off$worker_phases$versions_read), 4L)
+  expect_identical(.vs_rows(boot, "vstpkg"), .vs_rows(full, "vstpkg"))
+  expect_identical(.vs_rows(off, "vstpkg"), .vs_rows(full, "vstpkg"))
+  expect_identical(unique(.vst_state(off, "vstpkg")$rows_generation), ROWS_GENERATION)
+})
+test_that("a shard that walks one package whole and skips versions of another writes both as full walks would", {
+  .vst_local_run_env()
+  # Detail records too, so both packages have latest text.
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_analyzer_bin(
+    withr::local_tempdir(), "0.4.0-test", reads = names(.VST_RELEASES), detail = TRUE))
+  root <- withr::local_tempdir()
+  src <- .vst_source(root, "vstpkg", c("1.0", "1.9", "1.10"))
+  skip <- withr::local_tempdir(); full <- withr::local_tempdir()
+  .vs_run(skip, root, c(vstpkg = "1.10"))
+  # newpkg is new and read whole; vstpkg gains 2.0 and reads it alone.
+  .vst_source(root, "newpkg", c("1.0", "1.9"))
+  .vst_release(src, "vstpkg", "2.0")
+  latest <- c(newpkg = "1.9", vstpkg = "2.0")
+  .vs_run(skip, root, latest)
+  .vs_run(full, root, latest, skip = FALSE)
+  rs <- jsonlite::fromJSON(file.path(skip, "run-status.json"))
+  expect_identical(as.integer(rs$worker_phases$versions_read), 3L)
+  for (p in c("newpkg", "vstpkg")) {
+    rows <- .vs_rows(skip, p)
+    expect_gt(nrow(rows[[paste(DB_FILENAME, DESCRIPTION_FIELDS_TABLE)]]), 0L)
+    expect_identical(rows, .vs_rows(full, p), info = p)
+  }
+})
+test_that("a package whose one read version fails keeps every stored row and reads it again next run", {
+  .vst_local_run_env(); .vs_stub()
+  root <- withr::local_tempdir()
+  src <- .vst_source(root, "vstpkg", c("1.0", "1.9", "1.10"))
+  out <- withr::local_tempdir()
+  .vs_run(out, root, c(vstpkg = "1.10"))
+  before <- .package_rows(out, "vstpkg")
+  .vst_release(src, "vstpkg", "2.0")
+  # extract_version fails on ref 2.0 for one run
+  real <- extract_version
+  local({
+    .local_global("extract_version", function(repo, ref, dest, ...) {
+      if (identical(ref, "2.0")) stop(.extract_failure("archive", ref, 128L, "fatal: bad object"))
+      real(repo, ref, dest, ...)
+    })
+    .vs_run(out, root, c(vstpkg = "2.0"))
+  })
+  rs <- jsonlite::fromJSON(file.path(out, "run-status.json"))
+  expect_identical(as.integer(rs$shard_failures), 1L)
+  expect_identical(as.integer(rs$worker_phases$versions_read), 1L)
+  expect_identical(.package_rows(out, "vstpkg"), before)
+  # the mock removed, the next run reads 2.0 alone
+  .vs_run(out, root, c(vstpkg = "2.0"))
+  rs <- jsonlite::fromJSON(file.path(out, "run-status.json"))
+  expect_identical(as.integer(rs$shard_failures), 0L)
+  expect_identical(as.integer(rs$worker_phases$versions_read), 1L)
+  expect_identical(.vst_summary_keys(out, "vstpkg")$version, sort(c("1.0", "1.9", "1.10", "2.0")))
+})
+test_that("a skipped row keeps its assessed_at and assessed_with", {
+  .vst_local_run_env(); .vs_stub()
+  root <- withr::local_tempdir()
+  src <- .vst_source(root, "vstpkg", c("1.0", "1.9", "1.10"))
+  out <- withr::local_tempdir()
+  # Sys.Date() is 2026-10-01 for the first run and 2026-10-20 for the second,
+  # and the first runs under another R.
+  local({
+    .local_global("Sys.Date", function() as.Date("2026-10-01"))
+    .local_global("getRversion", function() numeric_version("4.5.0"))
+    .vs_run(out, root, c(vstpkg = "1.10"))
+  })
+  .vst_release(src, "vstpkg", "2.0")
+  local({
+    .local_global("Sys.Date", function() as.Date("2026-10-20"))
+    .vs_run(out, root, c(vstpkg = "2.0"))
+  })
+  got <- .vst_query(out, paste("SELECT version, assessed_at, assessed_with FROM cran_code_summary",
+                               "WHERE package = 'vstpkg'"))
+  k <- match(c("1.0", "1.9", "1.10", "2.0"), got$version)
+  expect_identical(got$assessed_at[k], c(rep("2026-10-01", 3L), "2026-10-20"))
+  expect_identical(got$assessed_with[k],
+                   c(rep("cran-code-metrics; R 4.5.0", 3L),
+                     paste0("cran-code-metrics; R ", getRversion())))
+})

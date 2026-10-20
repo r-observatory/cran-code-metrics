@@ -379,7 +379,8 @@ test_that("the worker hands analyze_package the stamped versions of its own pack
   expect_identical(.af_summary(out)$analyzer_version, c("0.4.0-test", NA))
 
   seen <- new.env(parent = emptyenv())
-  .local_global("analyze_package", function(dest, pkg, stamped = "not passed", limit = NULL) {
+  .local_global("analyze_package", function(dest, pkg, stamped = "not passed", limit = NULL,
+                                            prior = NULL) {
     assign(pkg, stamped, envir = seen)
     stop("seen")
   })

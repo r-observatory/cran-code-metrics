@@ -10,7 +10,7 @@
   call = c("try", "tryCatch", "try", "tryCatch", "tryCatch"),
   expr = c(NA, NA, NA, "io$clone(pkg, dest)",
            paste0("analyze_package(dest, pkg, stamped = stamped_of[[pkg]] %||% character(0L),\n",
-                  "                      limit = analyzer_limit)")),
+                  "                      limit = analyzer_limit, prior = prior_of[[pkg]])")),
   reason = c(
     "the per-version heartbeat only prints a progress line",
     "reached only from the parent's author span projection in export.R, where no cap is armed",

@@ -267,6 +267,12 @@ VERSION_STATE_TABLE <- "cran_version_state"
 # regenerates tests/testthat/fixtures/rows-golden.json.
 ROWS_GENERATION <- 1L
 
+# Read only the stored versions whose rows are not current, unless VERSION_SKIP is "0".
+.version_skip_on <- function(value = Sys.getenv("VERSION_SKIP", unset = "")) {
+  !identical(trimws(value), "0")
+}
+VERSION_SKIP <- .version_skip_on()
+
 # DESCRIPTION and NEWS text for every analysed version, kept in a third database.
 RELEASE_TEXT_DB_FILENAME    <- "cran-release-text.db"
 DESCRIPTION_HISTORY_TABLE   <- "cran_description_history"

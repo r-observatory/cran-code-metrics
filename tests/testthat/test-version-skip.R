@@ -243,3 +243,176 @@ test_that("the prior is the same whatever the chunk size", {
   expect_identical(.prior_state(d$con, d$text_con, c("a", "b", "c", "d"), "0.5.2", chunk = 1L),
                    .prior_state(d$con, d$text_con, c("a", "b", "c", "d"), "0.5.2"))
 })
+
+# ---- A walk with a prior ------------------------------------------------------
+
+# One run over `versions` under the stub, and the prior it leaves.
+.vs_walked <- function(versions = c("1.0", "1.9", "1.10"), frame = parent.frame()) {
+  .vst_local_run_env(frame); .vs_stub(frame = frame)
+  root <- withr::local_tempdir(.local_envir = frame)
+  src  <- .vst_source(root, "vstpkg", versions)
+  out  <- withr::local_tempdir(.local_envir = frame)
+  .vst_run(out, root, c(vstpkg = versions[[length(versions)]]))
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  text_con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, RELEASE_TEXT_DB_FILENAME))
+  on.exit({ DBI::dbDisconnect(con); DBI::dbDisconnect(text_con) })
+  list(root = root, src = src, prior = .prior_state(con, text_con, "vstpkg", "0.4.0-test")[["vstpkg"]])
+}
+
+# A fresh clone of the fixture's source, as the next run makes it.
+.vs_clone <- function(w, frame = parent.frame()) {
+  dest <- file.path(withr::local_tempdir(.local_envir = frame), "vstpkg")
+  stopifnot(isTRUE(clone_package("vstpkg", dest, base = w$root)))
+  dest
+}
+
+# Re-point tag 1.9 at a commit dated 2026-02-02 whose NAMESPACE adds export(b).
+.vs_move_1_9 <- function(src) {
+  .vst_git(src, "checkout", "-q", "-b", "moved", "1.9")
+  writeLines(c("export(a)", "export(b)"), file.path(src, "NAMESPACE"))
+  .vst_git(src, "commit", "-q", "-am", shQuote("move 1.9"), date = "2026-02-02T00:00:00Z")
+  .vst_git(src, "tag", "-f", "1.9", date = "2026-02-02T00:00:00Z")
+  .vst_git(src, "checkout", "-q", "-")
+  invisible(src)
+}
+
+.vs_no_rownames <- function(df) {
+  rownames(df) <- NULL
+  df
+}
+
+test_that("a new tag is read alone, and the rest come back as a full walk's derived columns", {
+  w <- .vs_walked(); p <- w$prior
+  .vst_release(w$src, "vstpkg", "2.0")
+  clone <- .vs_clone(w)
+  res  <- analyze_package(clone, "vstpkg", prior = p)
+  full <- analyze_package(clone, "vstpkg")
+  expect_true(res$skip$partial); expect_false(res$skip$unchanged)
+  expect_identical(res$summary$version, "2.0")
+  expect_identical(res$skip$row_keys, "2.0"); expect_identical(res$skip$api_keys, "2.0")
+  expect_identical(names(res$skip$derived), c("package", "version", .CROSS_VERSION_COLS))
+  expect_identical(res$skip$derived$version, c("1.0", "1.9", "1.10"))
+  k <- match(res$skip$derived$version, full$summary$version)
+  expect_identical(.vs_no_rownames(res$skip$derived[, .CROSS_VERSION_COLS]),
+                   .vs_no_rownames(full$summary[k, .CROSS_VERSION_COLS]))
+  expect_identical(.vs_no_rownames(res$summary),
+                   .vs_no_rownames(full$summary[full$summary$version == "2.0", ]))
+  expect_identical(res$state$version, "2.0")
+  expect_identical(res$state$rows_generation, ROWS_GENERATION)
+})
+test_that("a moved tag is read, and its successor's diff is redone from the two NAMESPACE files", {
+  w <- .vs_walked(); p <- w$prior; src <- w$src
+  .vs_move_1_9(src)
+  clone <- .vs_clone(w)
+  seen <- new.env(); seen$v <- character(0L)
+  real <- .exports_at
+  .local_global(".exports_at", function(repo, ref, package, version) {
+    seen$v <- c(seen$v, version)
+    real(repo, ref, package, version)
+  })
+  res  <- analyze_package(clone, "vstpkg", prior = p)
+  full <- analyze_package(clone, "vstpkg")
+  expect_identical(res$skip$plan$reason, c(NA, "moved", NA))
+  expect_identical(res$summary$version, "1.9")
+  # 1.0's exports for the diff of 1.9 read after it, then 1.10's for its own.
+  expect_identical(seen$v, c("1.0", "1.10"))
+  expect_setequal(res$skip$api_keys, c("1.9", "1.10"))
+  expect_identical(res$skip$row_keys, "1.9")
+  expect_identical(.vs_no_rownames(res$api[res$api$version == "1.10", ]),
+                   .vs_no_rownames(full$api[full$api$version == "1.10", ]))
+  expect_identical(.vs_no_rownames(res$api),
+                   .vs_no_rownames(full$api[full$api$version %in% c("1.9", "1.10"), ]))
+  expect_identical(res$api$exports_removed[res$api$version == "1.10"], '["b"]')
+  st <- res$state[res$state$version == "1.10", ]
+  expect_identical(st$prev_commit, .vst_rev_parse(src, "1.9"))
+  expect_identical(st$read_at, p$state$read_at[p$state$version == "1.10"])
+  expect_identical(st$commit_sha, p$state$commit_sha[p$state$version == "1.10"])
+})
+test_that("a package with nothing to read comes back unchanged", {
+  w <- .vs_walked()
+  res <- analyze_package(.vs_clone(w), "vstpkg", prior = w$prior)
+  expect_true(res$skip$unchanged); expect_false(res$skip$partial)
+  expect_false(any(res$skip$plan$read))
+  expect_identical(nrow(res$summary), 0L)
+  expect_identical(vapply(res[c("churn", "api", "state", "datasets", "vignettes")], nrow, integer(1L)),
+                   c(churn = 0L, api = 0L, state = 0L, datasets = 0L, vignettes = 0L))
+  expect_identical(res$skip$row_keys, character(0L)); expect_identical(res$skip$api_keys, character(0L))
+})
+test_that("an empty listing deletes nothing", {
+  repo <- withr::local_tempdir()
+  .vst_git(repo, "init", "-q")
+  writeLines("x", file.path(repo, "README"))
+  .vst_git(repo, "add", "-A")
+  .vst_git(repo, "commit", "-q", "-m", "init")
+  res <- analyze_package(repo, "vstpkg", prior = .vs_prior(c("1.0", "1.1")))
+  expect_identical(res$skip$row_keys, character(0L)); expect_true(res$skip$unchanged)
+  expect_identical(res$skip$api_keys, character(0L))
+  expect_identical(res$skip$newest, NA_character_)
+  expect_identical(names(res$skip$derived), c("package", "version", .CROSS_VERSION_COLS))
+})
+test_that("a tag gone from the listing is deleted with its rows", {
+  w <- .vs_walked()
+  .vst_git(w$src, "tag", "-d", "1.0")
+  res <- analyze_package(.vs_clone(w), "vstpkg", prior = w$prior)
+  expect_true("1.0" %in% res$skip$row_keys); expect_true("1.0" %in% res$skip$api_keys)
+  expect_false(res$skip$unchanged)
+  expect_identical(res$skip$plan$version, c("1.9", "1.10"))
+})
+test_that("a redone diff after a version skipped with its stored diff reads that version's exports first", {
+  w <- .vs_walked()
+  .vst_git(w$src, "tag", "-d", "1.9")
+  clone <- .vs_clone(w)
+  seen <- new.env(); seen$v <- character(0L)
+  real <- .exports_at
+  .local_global(".exports_at", function(repo, ref, package, version) {
+    seen$v <- c(seen$v, version)
+    real(repo, ref, package, version)
+  })
+  res  <- analyze_package(clone, "vstpkg", prior = w$prior)
+  full <- analyze_package(clone, "vstpkg")
+  expect_identical(res$skip$plan$pred_changed, c(FALSE, TRUE))
+  expect_identical(nrow(res$summary), 0L)
+  expect_identical(seen$v, c("1.0", "1.10"))
+  expect_identical(.vs_no_rownames(res$api), .vs_no_rownames(full$api[full$api$version == "1.10", ]))
+  expect_identical(res$state$prev_version, "1.0")
+  expect_identical(res$skip$row_keys, "1.9"); expect_setequal(res$skip$api_keys, c("1.9", "1.10"))
+})
+test_that("without a prior the result has no skip part and every version is read", {
+  .vs_stub()
+  src <- .vst_source(withr::local_tempdir(), "vstpkg", c("1.0", "1.9", "1.10"))
+  res <- analyze_package(src, "vstpkg")
+  expect_null(res$skip); expect_false("skip" %in% names(res))
+  expect_identical(nrow(res$summary), 3L)
+  expect_identical(res$binary_versions, c("1.0", "1.9", "1.10"))
+})
+test_that("the read marker is the stored newest's dataset marker when the newest is skipped", {
+  w <- .vs_walked()
+  .vs_move_1_9(w$src)
+  clone <- .vs_clone(w)
+  # The stub no longer reads 1.10, so a read of it would leave no dataset marker.
+  .vs_stub(c("1.0", "1.9"))
+  full <- suppressWarnings(analyze_package(clone, "vstpkg"))
+  expect_false(isTRUE(full$summary$datasets_scanned[[3L]]))
+  res <- analyze_package(clone, "vstpkg", prior = w$prior)
+  expect_identical(res$skip$newest, "1.10")
+  expect_false(res$skip$newest_read); expect_true(res$skip$read_marker)
+})
+test_that("assessed_at and assessed_with are not among the columns written back", {
+  w <- .vs_walked()
+  .vst_release(w$src, "vstpkg", "2.0")
+  res <- analyze_package(.vs_clone(w), "vstpkg", prior = w$prior)
+  expect_identical(nrow(res$skip$derived), 3L)
+  expect_false(any(c("assessed_at", "assessed_with") %in% names(res$skip$derived)))
+})
+test_that("functions and edges come only from a read newest", {
+  w <- .vs_walked()
+  .vs_move_1_9(w$src)
+  clone <- .vs_clone(w)
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_analyzer_bin(
+    withr::local_tempdir(), "0.4.0-test", reads = names(.VST_RELEASES), detail = TRUE))
+  full <- analyze_package(clone, "vstpkg")
+  expect_identical(full$functions$version, "1.10"); expect_identical(full$edges$version, "1.10")
+  res <- analyze_package(clone, "vstpkg", prior = w$prior)
+  expect_identical(res$summary$version, "1.9"); expect_false(res$skip$newest_read)
+  expect_identical(nrow(res$functions), 0L); expect_identical(nrow(res$edges), 0L)
+})

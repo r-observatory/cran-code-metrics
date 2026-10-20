@@ -25,8 +25,10 @@
 #' @param input_kind When set, each summary names it, as a 0.5.0 build does.
 #' @param stats When TRUE, each read appends a statistics line to the file
 #'   RPKG_ANALYZER_STATS names, as a 0.5.1 build does.
+#' @param detail When TRUE, each read also emits one function record, one call
+#'   edge and a DESCRIPTION record carrying RoxygenNote.
 .stub_analyzer_bin <- function(dir, version, reads = character(0L),
-                              input_kind = NULL, stats = FALSE) {
+                              input_kind = NULL, stats = FALSE, detail = FALSE) {
   stub <- file.path(dir, "stub-analyzer.sh")
   kind <- if (is.null(input_kind)) "" else
     sprintf(',\\"input_kind\\":\\"%s\\"', input_kind)
@@ -34,6 +36,13 @@
     sprintf(paste0("  if [ -n \"${RPKG_ANALYZER_STATS:-}\" ]; then ",
                    "echo '{\"build\":\"%s\",\"ms\":1}' >> \"$RPKG_ANALYZER_STATS\"; fi"),
             version)
+  }
+  detail_lines <- if (isTRUE(detail)) {
+    c(paste0('  echo "{\\"rec\\":\\"function\\",\\"lang\\":\\"R\\",\\"name\\":\\"f\\",',
+             '\\"exported\\":true,\\"file\\":\\"R/code.R\\",\\"line\\":1,\\"loc\\":1,',
+             '\\"n_params\\":0,\\"cyclocomp\\":1}"'),
+      '  echo "{\\"rec\\":\\"call_edge\\",\\"graph\\":\\"R\\",\\"from\\":\\"f\\",\\"to\\":\\"g\\"}"',
+      '  echo "{\\"rec\\":\\"dcf\\",\\"RoxygenNote\\":\\"7.3.2\\"}"')
   }
   read_branch <- if (length(reads) > 0L) {
     c(
@@ -45,6 +54,7 @@
              '\\"file\\":\\"data/d.rda\\",\\"class\\":\\"data.frame\\",',
              '\\"kind\\":\\"table\\",\\"confidence\\":\\"exact\\",',
              '\\"content_fp\\":\\"cf\\",\\"schema_fp\\":\\"sf\\"}"'),
+      detail_lines,
       stats_line,
       "  exit 0",
       "  ;;",

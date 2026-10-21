@@ -419,9 +419,13 @@ test_that("functions and edges come only from a read newest", {
 
 # ---- run_update with the version skip ------------------------------------------
 
-test_that("the version skip is on unless VERSION_SKIP is 0", {
-  expect_true(.version_skip_on("")); expect_true(.version_skip_on("1"))
-  expect_false(.version_skip_on("0")); expect_false(.version_skip_on(" 0 "))
+test_that("the version skip is off for VERSION_SKIP 0, false, off or no in any case, and on otherwise", {
+  for (v in c("0", " 0 ", "false", "FALSE", "Off", " no\n", "NO")) {
+    expect_false(.version_skip_on(v), info = v)
+  }
+  for (v in c("", " ", "1", "true", "on", "yes", "nope", "00")) {
+    expect_true(.version_skip_on(v), info = v)
+  }
 })
 test_that("a skip run after a new tag writes the rows a full walk writes", {
   .vst_local_run_env(); .vs_stub()
@@ -902,13 +906,14 @@ test_that("a package queued with nothing read is counted on the skip line and ha
   expect_true(any(grepl("^version skip: read 0 of 3 listed versions \\(none\\); diffs redone: 0; queued with nothing read: 1$", log)))
   expect_true(any(grepl("^version skip invariants: 0 of 0 written packages", log)))
 })
-test_that("a run with the skip off prints no version skip lines", {
+test_that("a run with the skip off says so where the version skip line goes", {
   .vst_local_run_env(); .vs_stub()
   root <- withr::local_tempdir()
   .vst_source(root, "vstpkg", c("1.0", "1.9"))
   out <- withr::local_tempdir()
   log <- attr(.vs_run(out, root, c(vstpkg = "1.9"), skip = FALSE), "log")
-  expect_false(any(grepl("^version skip", log)))
+  expect_identical(grep("^version skip", log, value = TRUE), "version skip: off")
+  expect_identical(grep("^version skip: off$", log), grep("^worker time:", log) + 1L)
 })
 test_that("the code manifest and run status carry both invariants, the data manifest does not", {
   .vst_local_run_env(); .vs_stub()

@@ -1355,8 +1355,9 @@ test_that("the shard prints its worker memory line and writes it to run-status.j
   } else {
     expect_match(line, "^worker memory: no peak figure on this platform, ")
   }
-  # After the worker time, which it follows in the log.
-  expect_identical(grep("^worker memory: ", log), grep("^worker time: ", log) + 1L)
+  # After the worker time and the version skip line, which it follows in the log.
+  expect_identical(grep("^version skip: off$", log), grep("^worker time: ", log) + 1L)
+  expect_identical(grep("^worker memory: ", log), grep("^version skip: off$", log) + 1L)
 
   st <- .run_status(out_dir)$worker_memory
   expect_setequal(names(st),

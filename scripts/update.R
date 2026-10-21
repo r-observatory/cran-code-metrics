@@ -1989,6 +1989,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
         sprintf("version skip invariants: %d of %d written packages with other than one latest row, %d with current rows off the newest",
                 skip_invariants[["latest_off"]], length(fresh_pkgs), skip_invariants[["current_off"]]),
         "\n", sep = "", file = stdout())
+  } else if (!isTRUE(VERSION_SKIP)) {
+    cat("version skip: off\n", file = stdout())
   }
   cat(.worker_memory_line(telemetry$workers), "\n", sep = "", file = stdout())
 

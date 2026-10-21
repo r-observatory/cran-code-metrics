@@ -326,7 +326,7 @@ test_that("PIPELINE_RUN_ID is set in the shard step's env and in no other step",
 })
 
 test_that("VERSION_SKIP comes from the repository variable in the shard step and in no other step", {
-  # Empty runs the version skip and 0 turns it off; the unit tests pin it off.
+  # Empty runs the version skip and 0, false, off or no turns it off; the unit tests pin it off.
   steps_of <- function(name) {
     yml <- readLines(file.path("..", "..", ".github", "workflows", name))
     split(yml, findInterval(seq_along(yml), grep("^      - ", yml)))

@@ -267,9 +267,10 @@ VERSION_STATE_TABLE <- "cran_version_state"
 # regenerates tests/testthat/fixtures/rows-golden.json.
 ROWS_GENERATION <- 1L
 
-# Read only the stored versions whose rows are not current, unless VERSION_SKIP is "0".
+# Read only the stored versions whose rows are not current, unless VERSION_SKIP is
+# 0, false, off or no, in any case. Any other value, empty included, leaves it on.
 .version_skip_on <- function(value = Sys.getenv("VERSION_SKIP", unset = "")) {
-  !identical(trimws(value), "0")
+  !tolower(trimws(value)) %in% c("0", "false", "off", "no")
 }
 VERSION_SKIP <- .version_skip_on()
 

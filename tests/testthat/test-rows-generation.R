@@ -8,11 +8,46 @@
 }
 
 # The fix a digest that moved asks for: a bump, unless the golden is a generation behind.
-.rg_fix <- function(g) {
-  if (identical(as.integer(g$rows_generation), ROWS_GENERATION)) {
-    "rows changed: bump ROWS_GENERATION in scripts/config.R and regenerate the golden"
-  } else {
-    "ROWS_GENERATION changed: regenerate tests/testthat/fixtures/rows-golden.json in the same pull request"
+.rg_fix <- function(g, path) {
+  if (!identical(as.integer(g$rows_generation), ROWS_GENERATION)) {
+    return("ROWS_GENERATION changed: regenerate tests/testthat/fixtures/rows-golden.json in the same pull request")
+  }
+  fix <- "rows changed: bump ROWS_GENERATION in scripts/config.R and regenerate the golden"
+  if (identical(path, "analyzer")) return(fix)
+  paste0(fix, ". A change confined to scripts/metrics/ that leaves the analyzer digest as it ",
+         "was needs a new golden but no ROWS_GENERATION bump: those columns are written only ",
+         "by the R fallback, whose rows are always read again as the fallback is outside ",
+         "every analyzer class")
+}
+
+# The update run's unit tests set ROWS_GOLDEN_ADVISORY=1, so there a golden that
+# no longer holds skips with its note; the Test workflow is where it fails.
+.rg_advise <- function(holds, note) {
+  if (!isTRUE(holds) && identical(Sys.getenv("ROWS_GOLDEN_ADVISORY"), "1")) {
+    skip(paste("rows golden advisory here (ROWS_GOLDEN_ADVISORY=1), enforced on pull requests:",
+               note))
+  }
+}
+
+.rg_check_fallback <- function(g, got) {
+  .rg_advise(identical(got, g$fallback),
+             paste("fallback digest", got, "is not the golden's.", .rg_fix(g, "fallback")))
+  expect_identical(got, g$fallback, info = .rg_fix(g, "fallback"))
+}
+
+.rg_check_analyzer <- function(g, got, cls) {
+  class_fix <- "the output class changed: regenerate the golden, with no ROWS_GENERATION bump"
+  none_fix  <- paste("no analyzer digest recorded: set \"analyzer\" in",
+                     "tests/testthat/fixtures/rows-golden.json to", got)
+  in_class  <- identical(cls, as.character(g$output_class))
+  .rg_advise(in_class, class_fix)
+  .rg_advise(!is.null(g$analyzer), none_fix)
+  .rg_advise(identical(got, g$analyzer),
+             paste("analyzer digest", got, "is not the golden's.", .rg_fix(g, "analyzer")))
+  expect_identical(cls, as.character(g$output_class), info = class_fix)
+  expect_false(is.null(g$analyzer), info = none_fix)
+  if (in_class && !is.null(g$analyzer)) {
+    expect_identical(got, g$analyzer, info = .rg_fix(g, "analyzer"))
   }
 }
 
@@ -211,23 +246,39 @@ test_that("the rows R writes for a version match the golden on the fallback path
   got <- .rg_digest(.rg_analyze())
   g <- .rg_golden()
   if (!identical(got, g$fallback)) cat("fallback digest:", got, "\n")
-  expect_identical(got, g$fallback, info = .rg_fix(g))
+  .rg_check_fallback(g, got)
 })
 
 test_that("the rows R writes for a version match the golden under the pinned analyzer", {
   skip_if_not(nzchar(rpkg_analyzer_bin()), "needs rpkg-analyzer")
   got <- .rg_digest(.rg_analyze())
   cat("analyzer digest:", got, "\n")
+  .rg_check_analyzer(.rg_golden(), got, .analyzer_output_class(rpkg_analyzer_version()))
+})
+
+test_that("with ROWS_GOLDEN_ADVISORY=1 a golden that no longer holds skips with its note", {
+  .local_global("rpkg_analyzer_bin", function() "")
   g <- .rg_golden()
-  cls <- .analyzer_output_class(rpkg_analyzer_version())
-  expect_identical(cls, as.character(g$output_class),
-    info = "the output class changed: regenerate the golden, with no ROWS_GENERATION bump")
-  expect_false(is.null(g$analyzer),
-    info = paste("no analyzer digest recorded: set \"analyzer\" in",
-                 "tests/testthat/fixtures/rows-golden.json to", got))
-  if (identical(cls, as.character(g$output_class)) && !is.null(g$analyzer)) {
-    expect_identical(got, g$analyzer, info = .rg_fix(g))
-  }
+  got <- .rg_digest(.rg_analyze())
+  cls <- as.character(g$output_class)
+  stale <- g
+  stale$fallback <- strrep("0", 64)
+  with_analyzer <- g
+  with_analyzer$analyzer <- strrep("0", 64)
+  withr::local_envvar(ROWS_GOLDEN_ADVISORY = "1")
+  expect_condition(.rg_check_fallback(stale, got),
+                   "enforced on pull requests.*no ROWS_GENERATION bump", class = "skip")
+  expect_success(.rg_check_fallback(g, got))
+  expect_condition(.rg_check_analyzer(g, got, "9.9.9"), "output class changed", class = "skip")
+  g$analyzer <- NULL
+  expect_condition(.rg_check_analyzer(g, got, cls), "no analyzer digest recorded", class = "skip")
+  expect_condition(.rg_check_analyzer(with_analyzer, got, cls), "analyzer digest .* is not",
+                   class = "skip")
+  withr::local_envvar(ROWS_GOLDEN_ADVISORY = NA)
+  expect_failure(.rg_check_fallback(stale, got), "bump ROWS_GENERATION")
+  # A moved analyzer digest always needs the bump.
+  expect_identical(.rg_fix(g, "analyzer"),
+                   "rows changed: bump ROWS_GENERATION in scripts/config.R and regenerate the golden")
 })
 
 # The prior .prior_state() gives after `walk`, its rows in a stand-in output class.

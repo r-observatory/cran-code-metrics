@@ -14,10 +14,10 @@
   }
   fix <- "rows changed: bump ROWS_GENERATION in scripts/config.R and regenerate the golden"
   if (identical(path, "analyzer")) return(fix)
-  paste0(fix, ". A change confined to scripts/metrics/ that leaves the analyzer digest as it ",
-         "was needs a new golden but no ROWS_GENERATION bump: those columns are written only ",
-         "by the R fallback, whose rows are always read again as the fallback is outside ",
-         "every analyzer class")
+  paste0(fix, ". A change confined to scripts/metrics/ needs a new golden but no ",
+         "ROWS_GENERATION bump: scripts/metrics/ runs only on the R fallback, and the rows ",
+         "the fallback writes name no analyzer build, so they are outside every output ",
+         "class and are read again whenever their package is next queued")
 }
 
 # The update run's unit tests set ROWS_GOLDEN_ADVISORY=1, so there a golden that

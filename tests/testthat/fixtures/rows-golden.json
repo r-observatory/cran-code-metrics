@@ -1,6 +1,6 @@
 {
   "rows_generation": 1,
   "output_class": ["0.5.0", "0.5.1", "0.5.2"],
-  "analyzer": null,
+  "analyzer": "8232937b6bcb6ec4c2f23fe491adea6858310c17bde739cf0a28092632512fa6",
   "fallback": "760ceb2345ba4bc6a4e3a622413668acba584c87165848651ab03b4a3d647cb0"
 }

@@ -50,10 +50,13 @@
 .RETENTION_CHECKS <- list(
   code = list(
     # No tolerance. The only paths that remove summary rows are force_full's
-    # DELETE (exempted below, and reachable only by workflow_dispatch) and
-    # upsert_shard's per-package delete, and the latter cannot remove a
-    # package: it takes its package list from the frame it is about to insert,
-    # so a package that yields zero rows is skipped rather than emptied.
+    # DELETE (exempted below, and reachable only by workflow_dispatch),
+    # upsert_shard's per-package delete and upsert_versions' per-version one,
+    # and neither upsert can remove a package. upsert_shard takes its package
+    # list from the frame it is about to insert, so a package that yields zero
+    # rows is skipped rather than emptied. upsert_versions writes only a
+    # package that skipped versions, and a skipped row is kept, so a partly
+    # read package always keeps at least one row.
     # Archival does not delete either. A lost download drops this by 98.8%.
     list(path = "n_packages",                min_ratio = 1,     max_loss = 0),
     # A package whose tag set on the cran mirror shrank while staying non-empty

@@ -915,7 +915,7 @@ test_that("the code manifest and run status carry both invariants, the data mani
   root <- withr::local_tempdir()
   .vst_source(root, "vstpkg", c("1.0", "1.9"))
   out <- withr::local_tempdir()
-  .local_global(".version_skip_invariants", function(con, data_con, pkgs) c(latest_off = 3L, current_off = 2L))
+  .local_global(".version_skip_invariants", function(con, data_con, pkgs = NULL) c(latest_off = 3L, current_off = 2L))
   .vs_run(out, root, c(vstpkg = "1.9"))
   b <- jsonlite::fromJSON(file.path(out, "code-manifest.json"))$bootstrap
   expect_identical(c(b$latest_off, b$current_off), c(3L, 2L))
@@ -926,4 +926,21 @@ test_that("the code manifest and run status carry both invariants, the data mani
     expect_null(b$latest_off)
     expect_null(b$current_off)
   }
+})
+test_that("the published invariants cover the whole database, not the last shard", {
+  .vst_local_run_env(); .vs_stub()
+  root <- withr::local_tempdir()
+  .vst_source(root, "apkg", c("1.0", "1.9"))
+  .vst_source(root, "bpkg", c("1.0", "1.9"))
+  out <- withr::local_tempdir()
+  latest <- c(apkg = "1.9", bpkg = "1.9")
+  .vs_run(out, root, latest, shard_size = 1L)
+  .vs_exec(out, "UPDATE cran_code_summary SET latest_release_date = '2026-01-01'
+                  WHERE package = 'apkg' AND version = '1.0'")
+  log <- attr(.vs_run(out, root, latest, shard_size = 1L), "log")
+  expect_true(any(grepl("^version skip invariants: 0 of 0 written packages", log)))
+  b <- jsonlite::fromJSON(file.path(out, "code-manifest.json"))$bootstrap
+  expect_identical(c(b$latest_off, b$current_off), c(1L, 0L))
+  rs <- jsonlite::fromJSON(file.path(out, "run-status.json"))
+  expect_identical(c(rs$latest_off, rs$current_off), c(1L, 0L))
 })

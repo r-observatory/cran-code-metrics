@@ -1376,24 +1376,29 @@ ANALYZER_PEAKS_KEPT <- 5L
           sum(all_plans$pred_changed), as.integer(n_nothing_read))
 }
 
-# Packages among `pkgs` whose summary rows carry other than one latest row, and
-# those with a current dataset link or vignette off the version that carries it.
-.version_skip_invariants <- function(con, data_con, pkgs) {
+# Packages among `pkgs` (every package when NULL) whose summary rows carry other
+# than one latest row, and those with a current dataset link or vignette off the
+# version that carries it.
+.version_skip_invariants <- function(con, data_con, pkgs = NULL) {
   out <- c(latest_off = 0L, current_off = 0L)
-  pkgs <- as.character(pkgs)
-  if (length(pkgs) == 0L || !SUMMARY_TABLE %in% DBI::dbListTables(con) ||
+  if (!is.null(pkgs) && length(pkgs) == 0L) return(out)
+  if (!SUMMARY_TABLE %in% DBI::dbListTables(con) ||
       !"latest_release_date" %in% DBI::dbListFields(con, SUMMARY_TABLE)) return(out)
-  ph <- paste(rep("?", length(pkgs)), collapse = ",")
+  where <- if (is.null(pkgs)) "" else
+    sprintf(" AND package IN (%s)", paste(rep("?", length(pkgs)), collapse = ","))
+  params <- if (is.null(pkgs)) NULL else as.list(as.character(pkgs))
   latest <- DBI::dbGetQuery(con, sprintf(
-    'SELECT package, version FROM "%s" WHERE latest_release_date IS NOT NULL AND package IN (%s)',
-    SUMMARY_TABLE, ph), params = as.list(pkgs))
-  out[["latest_off"]] <- sum(table(factor(latest$package, levels = pkgs)) != 1L)
+    'SELECT package, version FROM "%s" WHERE latest_release_date IS NOT NULL%s',
+    SUMMARY_TABLE, where), params = params)
+  all_pkgs <- if (is.null(pkgs)) DBI::dbGetQuery(con, sprintf(
+    'SELECT DISTINCT package FROM "%s"', SUMMARY_TABLE))$package else as.character(pkgs)
+  out[["latest_off"]] <- sum(table(factor(latest$package, levels = all_pkgs)) != 1L)
   off <- character(0L)
   for (spec in list(list(con, "cran_vignettes"), list(data_con, "cran_dataset_versions"))) {
     if (!spec[[2L]] %in% DBI::dbListTables(spec[[1L]])) next
     cur <- DBI::dbGetQuery(spec[[1L]], sprintf(
-      'SELECT DISTINCT package, version FROM "%s" WHERE is_current = 1 AND package IN (%s)',
-      spec[[2L]], ph), params = as.list(pkgs))
+      'SELECT DISTINCT package, version FROM "%s" WHERE is_current = 1%s',
+      spec[[2L]], where), params = params)
     keys <- paste(cur$package, cur$version, sep = "\r")
     off <- c(off, cur$package[!keys %in% paste(latest$package, latest$version, sep = "\r")])
   }
@@ -1978,7 +1983,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   cat(.analyzer_stats_line(telemetry$analyzer), "\n",
       .analyzer_memory_line(telemetry$analyzer), "\n",
       .worker_phase_line(telemetry$phases), "\n", sep = "", file = stdout())
-  skip_invariants <- .version_skip_invariants(con, data_con, fresh_pkgs)
+  skip_invariants <- .version_skip_invariants(con, data_con, as.character(fresh_pkgs))
   if (skip_on) {
     cat(.version_skip_line(shard_plans, n_nothing_read), "\n",
         sprintf("version skip invariants: %d of %d written packages with other than one latest row, %d with current rows off the newest",
@@ -2045,6 +2050,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     }
   }
 
+  db_invariants <- .version_skip_invariants(con, data_con)
   bootstrap <- list(n_analyzed = n_analyzed_pkgs, n_universe = n_universe,
                     n_remaining = length(remaining_after),
                     bootstrap_complete = bootstrap_complete,
@@ -2058,8 +2064,10 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                     output_class = I(output_class),
                     n_latest_on_build = .n_latest_on_class(con, analyzer_version)[["on_class"]],
                     n_versions_unrecorded = .n_versions_unrecorded(con),
-                    latest_off = skip_invariants[["latest_off"]],
-                    current_off = skip_invariants[["current_off"]],
+                    # Whole database, like the line above: a shard's own figures
+                    # are in its log, and the last shard may have written nothing.
+                    latest_off = db_invariants[["latest_off"]],
+                    current_off = db_invariants[["current_off"]],
                     parked = verdict_counts$parked,
                     failed_this_run = verdict_counts$failed_this_run,
                     over_cap_ok = verdict_counts$over_cap_ok,

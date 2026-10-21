@@ -278,6 +278,15 @@ test_that("a skip on the fallback path carries the skipped versions' inputs into
   expect_identical(.rg_xv(res$skip$derived, later, cols), .rg_xv(full$summary, later, cols))
 })
 
+test_that(".CROSS_VERSION_COLS names every column the cross-version pass adds but its stamps", {
+  base <- data.frame(package = "p", version = c("1.0", "1.1"), released = "2026-01-01",
+                     dep_list = "[]", authors = "[]", stringsAsFactors = FALSE)
+  for (df in list(base, base[0L, ])) {
+    added <- setdiff(names(add_cross_version_metrics(df, NULL, list())), names(df))
+    expect_setequal(setdiff(added, c("assessed_at", "assessed_with")), .CROSS_VERSION_COLS)
+  }
+})
+
 test_that("the cross-version columns need only the inputs a skipped version carries", {
   .local_global("rpkg_analyzer_bin", function() "")
   res <- .rg_analyze()

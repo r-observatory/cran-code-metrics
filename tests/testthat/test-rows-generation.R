@@ -16,12 +16,23 @@
   }
 }
 
+# Git with no global or system config, so a developer's config cannot change the fixture.
 .rg_git <- function(dir, date, ...) {
-  suppressWarnings(system2(
-    "git", c("-C", shQuote(dir), ...), stdout = TRUE, stderr = FALSE,
-    env = c("GIT_AUTHOR_NAME=T", "GIT_AUTHOR_EMAIL=t@t.test",
+  err <- tempfile("rg_git_")
+  on.exit(unlink(err), add = TRUE)
+  out <- suppressWarnings(system2(
+    "git", c("-C", shQuote(dir), ...), stdout = TRUE, stderr = err,
+    env = c("GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1",
+            "GIT_AUTHOR_NAME=T", "GIT_AUTHOR_EMAIL=t@t.test",
             "GIT_COMMITTER_NAME=T", "GIT_COMMITTER_EMAIL=t@t.test",
             paste0("GIT_AUTHOR_DATE=", date), paste0("GIT_COMMITTER_DATE=", date))))
+  status <- attr(out, "status") %||% 0L
+  if (status != 0L) {
+    stop(sprintf("rows golden fixture: git %s exited with status %d: %s",
+                 ..1, status, paste(readLines(err, warn = FALSE), collapse = " ")),
+         call. = FALSE)
+  }
+  out
 }
 
 .RG_ADA   <- 'person("Ada", "Lovelace", email = "ada@example.org", role = c("aut", "cre"))'
@@ -173,6 +184,19 @@
   json <- jsonlite::toJSON(frames, digits = NA, na = "null")
   digest::digest(as.character(json), algo = "sha256", serialize = FALSE)
 }
+
+test_that("the fixture is built the same whatever git config is around, and stops on a git failure", {
+  head_of <- function(src) .rg_git(src, "2026-01-01T00:00:00Z", "rev-parse", "2.0^{commit}")
+  plain <- head_of(.rg_source(withr::local_tempdir()))
+  # A commit encoding changes every commit id; a failing signer fails every commit.
+  cfg <- withr::local_tempfile(lines = c("[i18n]", "  commitEncoding = ISO-8859-1"))
+  withr::local_envvar(GIT_CONFIG_GLOBAL = cfg)
+  expect_identical(head_of(.rg_source(withr::local_tempdir())), plain)
+  writeLines(c("[commit]", "  gpgsign = true", "[gpg]", "  program = false"), cfg)
+  expect_identical(head_of(.rg_source(withr::local_tempdir())), plain)
+  expect_error(.rg_git(file.path(withr::local_tempdir(), "none"), "2026-01-01T00:00:00Z", "status"),
+               "rows golden fixture: git status exited with status")
+})
 
 test_that("the golden names this generation and two digests", {
   g <- .rg_golden()

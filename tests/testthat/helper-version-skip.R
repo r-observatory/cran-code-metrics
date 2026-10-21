@@ -9,13 +9,12 @@
   .vst_run(out_dir, root, latest, ...)
 }
 
-# .package_rows() without the read attempts and the columns a run stamps with
-# its own time or numbering, each frame ordered by the columns it keeps.
+# .package_rows() without the columns a run stamps with its own time or
+# numbering, each frame ordered by the columns it keeps.
 .vs_rows <- function(out_dir, pkg) {
   rows <- .package_rows(out_dir, pkg)
-  rows <- rows[!grepl(" cran_analyzer_read_attempts$", names(rows))]
   lapply(rows, function(df) {
-    df <- df[, setdiff(names(df), c("read_at", "assessed_at", "content_id",
+    df <- df[, setdiff(names(df), c("read_at", "assessed_at", "last_attempt", "content_id",
                                     "current_content_id")), drop = FALSE]
     df <- df[do.call(order, unname(as.list(df))), , drop = FALSE]
     rownames(df) <- NULL

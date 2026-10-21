@@ -605,3 +605,196 @@ test_that("a skipped row keeps its assessed_at and assessed_with", {
                    c(rep("cran-code-metrics; R 4.5.0", 3L),
                      paste0("cran-code-metrics; R ", getRversion())))
 })
+
+# ---- The skip against upstream changes ------------------------------------------
+
+# A copy of out_dir, for the full walk a skip run is compared with.
+.vs_copy <- function(out_dir, frame = parent.frame()) {
+  dest <- withr::local_tempdir(.local_envir = frame)
+  file.copy(list.files(out_dir, full.names = TRUE, all.files = TRUE, no.. = TRUE),
+            dest, recursive = TRUE)
+  dest
+}
+
+.vs_exec <- function(out_dir, sql) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out_dir, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con))
+  for (s in sql) DBI::dbExecute(con, s)
+  invisible(NULL)
+}
+
+.vs_versions_read <- function(out_dir) {
+  as.integer(jsonlite::fromJSON(file.path(out_dir, "run-status.json"))$worker_phases$versions_read)
+}
+
+# Every read plan the calling test's walks make, in order; workers run in this process.
+.vs_plans <- function(frame = parent.frame()) {
+  seen <- new.env()
+  seen$plans <- list()
+  real <- .read_plan
+  .local_global(".read_plan", function(...) {
+    p <- real(...)
+    seen$plans[[length(seen$plans) + 1L]] <- p
+    p
+  }, frame = frame)
+  seen
+}
+
+# Tag 1.5 on a commit dated 2026-02-15, after 1.0, whose NAMESPACE adds export(b).
+.vs_insert_1_5 <- function(src, pkg) {
+  .vst_git(src, "checkout", "-q", "-b", "inserted", "1.0")
+  writeLines(c(paste("Package:", pkg), "Version: 1.5", "Title: T", "Description: T.",
+               "Author: T", "Maintainer: T <t@t.test>", "License: MIT"),
+             file.path(src, "DESCRIPTION"))
+  writeLines(c("export(a)", "export(b)"), file.path(src, "NAMESPACE"))
+  .vst_git(src, "commit", "-q", "-am", shQuote("version 1.5"), date = "2026-02-15T00:00:00Z")
+  .vst_git(src, "tag", "1.5", date = "2026-02-15T00:00:00Z")
+  .vst_git(src, "checkout", "-q", "-")
+  invisible(src)
+}
+
+test_that("moved, deleted, out-of-class and requeued versions give a full walk's rows", {
+  .vst_local_run_env(); .vs_stub()
+  root <- withr::local_tempdir()
+  pkgs <- c("apkg", "bpkg", "cpkg")
+  src  <- vapply(pkgs, function(p) .vst_source(root, p, c("1.0", "1.9", "1.10")), character(1L))
+  skip <- withr::local_tempdir()
+  .vs_run(skip, root, stats::setNames(rep("1.10", 3L), pkgs))
+  full <- .vs_copy(skip)
+  for (p in pkgs) .vst_release(src[[p]], p, "2.0")
+  .vs_move_1_9(src[["apkg"]])
+  .vst_git(src[["bpkg"]], "tag", "-d", "1.9")
+  for (out in c(skip, full)) {
+    .vs_exec(out, paste("UPDATE cran_code_summary SET analyzer_version = '0.3.0-test'",
+                        "WHERE package = 'bpkg' AND version = '1.0'"))
+  }
+  latest <- stats::setNames(rep("2.0", 3L), pkgs)
+  .vs_run(skip, root, latest, requeue = "cpkg")
+  .vs_run(full, root, latest, requeue = "cpkg", skip = FALSE)
+  # apkg reads 1.9 and 2.0, bpkg 1.0 and 2.0, cpkg all four; the full walk reads 11.
+  expect_identical(.vs_versions_read(skip), 8L)
+  expect_identical(.vs_versions_read(full), 11L)
+  for (p in pkgs) expect_identical(.vs_rows(skip, p), .vs_rows(full, p), info = p)
+})
+test_that("a new newest replaces the previous newest's functions and edges, its vignettes' is_current and the package's churn", {
+  .vst_local_run_env()
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_analyzer_bin(
+    withr::local_tempdir(), "0.4.0-test", reads = names(.VST_RELEASES), detail = TRUE))
+  root <- withr::local_tempdir()
+  src <- .vst_source(root, "vstpkg", character(0L))
+  dir.create(file.path(src, "vignettes"))
+  writeLines(c("---", "title: Intro", "vignette: >", "  %\\VignetteIndexEntry{Intro}", "---", "",
+               "Text."), file.path(src, "vignettes", "intro.Rmd"))
+  for (v in c("1.0", "1.9", "1.10")) .vst_release(src, "vstpkg", v)
+  skip <- withr::local_tempdir()
+  .vs_run(skip, root, c(vstpkg = "1.10"))
+  current <- function(out) {
+    c(fns = .vst_query(out, "SELECT DISTINCT version FROM cran_functions")$version,
+      edges = .vst_query(out, "SELECT DISTINCT version FROM cran_call_edges")$version,
+      vignettes = .vst_query(out, "SELECT version FROM cran_vignettes WHERE is_current = 1")$version)
+  }
+  expect_identical(current(skip), c(fns = "1.10", edges = "1.10", vignettes = "1.10"))
+  expect_identical(.vst_query(skip, "SELECT COUNT(*) n FROM cran_vignettes")$n, 3L)
+  full <- .vs_copy(skip)
+  .vst_release(src, "vstpkg", "2.0")
+  .vs_run(skip, root, c(vstpkg = "2.0"))
+  .vs_run(full, root, c(vstpkg = "2.0"), skip = FALSE)
+  expect_identical(.vs_versions_read(skip), 1L)
+  expect_identical(.vst_query(skip, "SELECT DISTINCT version FROM cran_functions")$version, "2.0")
+  expect_identical(.vst_query(skip, "SELECT DISTINCT version FROM cran_vignettes WHERE is_current = 1")$version, "2.0")
+  expect_identical(current(skip), c(fns = "2.0", edges = "2.0", vignettes = "2.0"))
+  expect_true("2.0" %in% .vst_query(skip, "SELECT DISTINCT version FROM cran_code_churn")$version)
+  expect_identical(.vs_rows(skip, "vstpkg"), .vs_rows(full, "vstpkg"))
+})
+test_that("a tag dated between two stored versions redoes its successor's diff", {
+  .vst_local_run_env(); .vs_stub(c("1.0", "1.5", "2.0"))
+  root <- withr::local_tempdir()
+  src <- .vst_source(root, "vstpkg", c("1.0", "2.0"))
+  skip <- withr::local_tempdir()
+  .vs_run(skip, root, c(vstpkg = "2.0"))
+  full <- .vs_copy(skip)
+  .vs_insert_1_5(src, "vstpkg")
+  # Queued because the universe names 2.1, which the mirror does not have yet:
+  # the stored newest stays the newest, so the inserted tag is the one read.
+  seen <- .vs_plans()
+  .vs_run(skip, root, c(vstpkg = "2.1"))
+  .vs_run(full, root, c(vstpkg = "2.1"), skip = FALSE)
+  expect_identical(.vs_versions_read(skip), 1L)
+  plan <- seen$plans[[1L]]
+  expect_identical(plan$version, c("1.0", "1.5", "2.0"))
+  expect_identical(plan$reason, c(NA, "new", NA))
+  expect_identical(plan$pred_changed, c(FALSE, FALSE, TRUE))
+  diff_of_2_0 <- .vst_query(skip, paste(
+    "SELECT a.exports_removed, s.exports_removed_n FROM cran_api_history a",
+    "JOIN cran_code_summary s USING (package, version) WHERE version = '2.0'"))
+  expect_identical(diff_of_2_0$exports_removed, '["b"]')
+  expect_equal(diff_of_2_0$exports_removed_n, 1)
+  expect_identical(.vs_rows(skip, "vstpkg"), .vs_rows(full, "vstpkg"))
+})
+test_that("read attempts count only the versions read", {
+  .vst_local_run_env(); .vs_stub(c("1.0", "1.9", "1.10"))
+  root <- withr::local_tempdir()
+  src <- .vst_source(root, "vstpkg", c("1.0", "1.9", "1.10"))
+  out <- withr::local_tempdir()
+  .vs_run(out, root, c(vstpkg = "1.10"))
+  expect_identical(.vst_query(out, "SELECT COUNT(*) n FROM cran_analyzer_read_attempts")$n, 0L)
+  full <- .vs_copy(out)
+  .vst_release(src, "vstpkg", "2.0")
+  .vs_run(out, root, c(vstpkg = "2.0"))
+  .vs_run(full, root, c(vstpkg = "2.0"), skip = FALSE)
+  expect_identical(.vs_versions_read(out), 1L)
+  expect_identical(.vst_query(out, "SELECT version FROM cran_analyzer_read_attempts")$version, "2.0")
+  expect_identical(.vst_query(out, "SELECT attempts FROM cran_analyzer_read_attempts")$attempts, 1L)
+  expect_identical(.vs_rows(out, "vstpkg"), .vs_rows(full, "vstpkg"))
+})
+test_that("the first skip run on a database from before rows_generation skips its recorded versions", {
+  .vst_local_run_env(); .vs_stub()
+  root <- withr::local_tempdir()
+  src <- .vst_source(root, "vstpkg", c("1.0", "1.9", "1.10"))
+  skip <- withr::local_tempdir()
+  .vs_run(skip, root, c(vstpkg = "1.10"))
+  # The table as it was before rows_generation, with the rows it held.
+  kept <- paste(setdiff(.VERSION_STATE_COLS, "rows_generation"), collapse = ", ")
+  .vs_exec(skip, c(
+    sprintf('ALTER TABLE "%s" RENAME TO old_state', VERSION_STATE_TABLE),
+    sprintf('CREATE TABLE "%s" (
+      package TEXT NOT NULL, version TEXT NOT NULL,
+      commit_sha TEXT, tree_sha TEXT, prev_version TEXT, prev_commit TEXT,
+      deprecated TEXT, uses_lifecycle INTEGER, read_at TEXT,
+      PRIMARY KEY (package, version)) WITHOUT ROWID', VERSION_STATE_TABLE),
+    sprintf('INSERT INTO "%s" (%s) SELECT %s FROM old_state', VERSION_STATE_TABLE, kept, kept),
+    "DROP TABLE old_state"))
+  expect_false("rows_generation" %in% names(.vst_state(skip, "vstpkg")))
+  expect_identical(nrow(.vst_state(skip, "vstpkg")), 3L)
+  full <- .vs_copy(skip)
+  .vst_release(src, "vstpkg", "2.0")
+  .vs_run(skip, root, c(vstpkg = "2.0"))
+  .vs_run(full, root, c(vstpkg = "2.0"), skip = FALSE)
+  rs <- jsonlite::fromJSON(file.path(skip, "run-status.json"))
+  expect_identical(as.integer(rs$worker_phases$versions_read), 1L)
+  # The skipped rows keep their NULL generation, which counts as 1; a full walk writes 1.
+  st <- .vst_state(skip, "vstpkg")
+  expect_identical(st$rows_generation[st$version != "2.0"], rep(NA_integer_, 3L))
+  expect_identical(st$rows_generation[st$version == "2.0"], ROWS_GENERATION)
+  rows <- .vs_rows(skip, "vstpkg")
+  k <- paste(DB_FILENAME, VERSION_STATE_TABLE)
+  rows[[k]]$rows_generation[is.na(rows[[k]]$rows_generation)] <- 1L
+  expect_identical(rows, .vs_rows(full, "vstpkg"))
+})
+test_that("a package read for a backfill marker leaves the queue", {
+  .vst_local_run_env(); .vs_stub()
+  root <- withr::local_tempdir()
+  .vst_source(root, "vstpkg", c("1.0", "1.9", "1.10"))
+  out <- withr::local_tempdir()
+  .vs_run(out, root, c(vstpkg = "1.10"))
+  .vs_exec(out, "UPDATE cran_code_summary SET n_fns_r = NULL WHERE package = 'vstpkg' AND version = '1.0'")
+  seen <- .vs_plans()
+  .vs_run(out, root, c(vstpkg = "1.10"))
+  rs <- jsonlite::fromJSON(file.path(out, "run-status.json"))
+  expect_identical(c(rs$n_shard, rs$n_fresh), c(1L, 1L))
+  expect_identical(as.integer(rs$worker_phases$versions_read), 1L)
+  expect_identical(seen$plans[[1L]]$reason, c("metrics", NA, NA))
+  expect_false(anyNA(.vst_query(out, "SELECT n_fns_r FROM cran_code_summary")$n_fns_r))
+  .vs_run(out, root, c(vstpkg = "1.10"))
+  expect_identical(jsonlite::fromJSON(file.path(out, "run-status.json"))$n_shard, 0L)
+})

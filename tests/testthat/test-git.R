@@ -420,3 +420,17 @@ test_that("a clone killed at GIT_TIMEOUT returns FALSE with status 124", {
   expect_false(ok)
   expect_identical(attr(ok, "status"), 124L)
 })
+
+test_that("extract_version with paths extracts only those paths", {
+  repo <- withr::local_tempdir()
+  system2("git", c("init", "-q", repo), stdout = FALSE, stderr = FALSE)
+  dir.create(file.path(repo, "R"))
+  writeLines("a <- 1", file.path(repo, "R", "a.R"))
+  writeLines("export(a)", file.path(repo, "NAMESPACE"))
+  .git(repo, "add", ".")
+  .gitc(repo, "commit", "-q", "-m", "v1")
+  .git(repo, "tag", "1.0")
+  tmp <- withr::local_tempdir()
+  expect_identical(extract_version(repo, "1.0", tmp, paths = "NAMESPACE"), "NAMESPACE")
+  expect_false(file.exists(file.path(tmp, "R", "a.R")))
+})

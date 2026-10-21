@@ -325,6 +325,34 @@ test_that("PIPELINE_RUN_ID is set in the shard step's env and in no other step",
                    "          PIPELINE_RUN_ID: ${{ github.run_id }}")
 })
 
+test_that("VERSION_SKIP comes from the repository variable in the shard step and in no other step", {
+  # Empty runs the version skip and 0, false, off or no turns it off; the unit tests pin it off.
+  steps_of <- function(name) {
+    yml <- readLines(file.path("..", "..", ".github", "workflows", name))
+    split(yml, findInterval(seq_along(yml), grep("^      - ", yml)))
+  }
+  hits <- Filter(function(s) any(grepl("VERSION_SKIP", s, fixed = TRUE)),
+                 c(steps_of("update.yml"), steps_of("test.yml")))
+  expect_length(hits, 1L)
+  step <- unname(unlist(hits))
+  expect_true(any(grepl("name: Analyze shards and publish after each", step, fixed = TRUE)))
+  expect_identical(grep("VERSION_SKIP", step, value = TRUE, fixed = TRUE),
+                   "          VERSION_SKIP: ${{ vars.VERSION_SKIP }}")
+})
+
+test_that("ROWS_GOLDEN_ADVISORY is set on the update run's unit tests alone, so the Test workflow enforces the rows golden", {
+  wf <- function(name) readLines(file.path("..", "..", ".github", "workflows", name))
+  yml <- wf("update.yml")
+  steps <- split(yml, findInterval(seq_along(yml), grep("^      - ", yml)))
+  hits <- Filter(function(s) any(grepl("ROWS_GOLDEN_ADVISORY", s, fixed = TRUE)), steps)
+  expect_length(hits, 1L)
+  step <- unname(unlist(hits))
+  expect_identical(step[[1L]], "      - name: Run unit tests")
+  expect_identical(grep("ROWS_GOLDEN_ADVISORY", step, value = TRUE, fixed = TRUE),
+                   "          ROWS_GOLDEN_ADVISORY: \"1\"")
+  expect_false(any(grepl("ROWS_GOLDEN_ADVISORY", wf("test.yml"), fixed = TRUE)))
+})
+
 test_that("the shard loop stops where shard_loop_done says, and nowhere else", {
   yml <- .update_yml()
   expect_true(any(grepl("if shard_loop_done out/run-status.json; then", yml, fixed = TRUE)))

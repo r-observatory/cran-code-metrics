@@ -235,12 +235,16 @@
 }
 
 # Keep the standing over-cap list. A pass past the cap ran uncapped after the cap
-# fired somewhere, so it goes on the list; a pass under the cap rewrote every
-# stored row without crossing, so it comes off. TRUE when the package is on it.
+# fired somewhere, so it goes on the list; a pass under the cap that read and
+# rewrote every stored row (`whole`) without crossing takes it off. A pass that
+# skipped versions says nothing about how long the whole package takes, so it
+# leaves the list as it is. TRUE when this pass went past the cap.
 .note_over_cap <- function(con, pkg, elapsed, build, run_id,
-                           worker_timeout = WORKER_TIMEOUT) {
+                           worker_timeout = WORKER_TIMEOUT, whole = TRUE) {
   if (!isTRUE(elapsed >= worker_timeout)) {
-    DBI::dbExecute(con, "DELETE FROM cran_over_cap WHERE package = ?", params = list(pkg))
+    if (isTRUE(whole)) {
+      DBI::dbExecute(con, "DELETE FROM cran_over_cap WHERE package = ?", params = list(pkg))
+    }
     return(FALSE)
   }
   DBI::dbExecute(con, "
@@ -328,7 +332,9 @@
 #'
 #' Releases their verdicts, forgets their read attempts and clears
 #' datasets_scanned on their latest row, so this run's dataset backfill takes
-#' them and keeps them until they pass. Their stored rows stay as they are.
+#' them and keeps them until they pass. Their stored rows stay as they are, but
+#' their version state rows go, so their next walk reads every version wherever
+#' it lands.
 #'
 #' @param spec Package names separated by commas; over_cap names the standing
 #'   over-cap list.
@@ -346,6 +352,11 @@
       "DELETE FROM cran_analyzer_read_attempts WHERE package IN (%s)", ph),
       params = as.list(pkgs))
   }
+  if (VERSION_STATE_TABLE %in% tables) {
+    DBI::dbExecute(con, sprintf(
+      'DELETE FROM "%s" WHERE package IN (%s)', VERSION_STATE_TABLE, ph),
+      params = as.list(pkgs))
+  }
   if ("cran_code_summary" %in% tables &&
       all(c("datasets_scanned", "latest_release_date") %in%
           DBI::dbListFields(con, "cran_code_summary"))) {
@@ -355,6 +366,21 @@
       params = as.list(pkgs))
   }
   pkgs
+}
+
+# Summary rows with no state row or no recorded commit: versions a skip cannot
+# trust.
+.n_versions_unrecorded <- function(con) {
+  tables <- DBI::dbListTables(con)
+  if (!SUMMARY_TABLE %in% tables) return(0L)
+  if (!VERSION_STATE_TABLE %in% tables) {
+    return(as.integer(DBI::dbGetQuery(con, sprintf(
+      'SELECT COUNT(*) n FROM "%s"', SUMMARY_TABLE))$n))
+  }
+  as.integer(DBI::dbGetQuery(con, sprintf(
+    'SELECT COUNT(*) n FROM "%s" s LEFT JOIN "%s" v
+        ON v.package = s.package AND v.version = s.version
+      WHERE v.commit_sha IS NULL', SUMMARY_TABLE, VERSION_STATE_TABLE))$n)
 }
 
 # Parked verdicts by class, and the rows from before stages were kept.
@@ -527,6 +553,83 @@
   df <- do.call(rbind, unname(rows))
   if (!nrow(df)) return(list())
   split(as.character(df$version), as.character(df$package))
+}
+
+# One table's rows for `pkgs`, typed as `types` says. A column the table lacks
+# reads as NULL; `exprs` names the expression a column is computed from, the
+# table column it needs, and what it reads as without it.
+.prior_table <- function(con, table, types, pkgs, exprs = list()) {
+  empty <- as.data.frame(c(list(package = character(0L)),
+                           lapply(types, function(t) vector(t, 0L))),
+                         stringsAsFactors = FALSE)
+  if (!table %in% DBI::dbListTables(con)) return(empty)
+  have <- DBI::dbListFields(con, table)
+  sel <- vapply(names(types), function(n) {
+    e <- exprs[[n]] %||% list(n, n, "NULL")
+    if (e[[2L]] %in% have) sprintf("%s AS %s", e[[1L]], n) else sprintf("%s AS %s", e[[3L]], n)
+  }, character(1L))
+  df <- DBI::dbGetQuery(con, sprintf(
+    'SELECT package, %s FROM "%s" WHERE package IN (%s) ORDER BY package, version',
+    paste(sel, collapse = ", "), table, paste(rep("?", length(pkgs)), collapse = ", ")),
+    params = as.list(pkgs))
+  for (n in names(types)) df[[n]] <- match.fun(paste0("as.", types[[n]]))(df[[n]])
+  df
+}
+
+# One package's rows of a .prior_table() frame, without the package column.
+.prior_rows <- function(df, pkg) {
+  out <- df[df$package == pkg, setdiff(names(df), "package"), drop = FALSE]
+  rownames(out) <- NULL
+  out
+}
+
+# The stored rows a plan reads, per package, taken before the fork because a
+# worker has no database. A list named by `pkgs`; a package with nothing stored
+# gets zero-row frames. `text_ok` is the versions a 0.5.0 or later build read.
+.prior_state <- function(con, text_con, pkgs, output_class, chunk = 500L) {
+  pkgs <- as.character(pkgs)
+  summary_types <- c(version = "character", analyzer_version = "character",
+                     n_fns_r_null = "logical", detail_scanned = "integer",
+                     datasets_scanned = "integer", latest = "logical",
+                     released = "character", dep_list = "character", authors = "character")
+  summary_exprs <- list(n_fns_r_null = list("n_fns_r IS NULL", "n_fns_r", "1"),
+                        latest = list("latest_release_date IS NOT NULL", "latest_release_date", "0"))
+  api_types <- c(version = "character", exports_added = "character",
+                 exports_removed = "character", n_exports = "integer")
+  state_types <- c(version = "character", commit_sha = "character", tree_sha = "character",
+                   prev_version = "character", prev_commit = "character",
+                   deprecated = "character", uses_lifecycle = "integer",
+                   read_at = "character", rows_generation = "integer")
+  text_builds <- character(0L)
+  if (RELEASE_TEXT_VERSIONS_TABLE %in% DBI::dbListTables(text_con)) {
+    read_by <- DBI::dbGetQuery(text_con, sprintf(
+      'SELECT DISTINCT analyzer_version FROM "%s" WHERE analyzer_version IS NOT NULL',
+      RELEASE_TEXT_VERSIONS_TABLE))$analyzer_version
+    text_builds <- read_by[vapply(read_by, analyzer_at_least, logical(1L), min = "0.5.0")]
+  }
+  out <- list()
+  for (p in split(pkgs, ceiling(seq_along(pkgs) / chunk))) {
+    stored <- .prior_table(con, SUMMARY_TABLE, summary_types, p, summary_exprs)
+    api    <- .prior_table(con, "cran_api_history", api_types, p)
+    state  <- .prior_table(con, VERSION_STATE_TABLE, state_types, p)
+    text <- if (length(text_builds)) {
+      DBI::dbGetQuery(text_con, sprintf(
+        'SELECT package, version FROM "%s" WHERE analyzer_version IN (%s) AND package IN (%s)',
+        RELEASE_TEXT_VERSIONS_TABLE, paste(rep("?", length(text_builds)), collapse = ", "),
+        paste(rep("?", length(p)), collapse = ", ")),
+        params = c(as.list(text_builds), as.list(p)))
+    } else {
+      data.frame(package = character(0L), version = character(0L))
+    }
+    for (k in p) {
+      out[[k]] <- list(
+        stored = .prior_rows(stored, k), api = .prior_rows(api, k),
+        state = .prior_rows(state, k),
+        text_ok = as.character(text$version[text$package == k]),
+        class = as.character(output_class))
+    }
+  }
+  out[pkgs]
 }
 
 # ---------------------------------------------------------------------------
@@ -1177,7 +1280,10 @@ ANALYZER_PEAKS_KEPT <- 5L
     metrics_s  = max(0, versions - tally("extract_s") - tally("analyzer_s") - tally("parse_s")),
     other_s    = max(0, tally("package_s") - tally("clone_s") - versions),
     dataset_memo_hits   = as.integer(tally("memo_hits")),
-    dataset_memo_misses = as.integer(tally("memo_misses")))
+    dataset_memo_misses = as.integer(tally("memo_misses")),
+    # Planning and skipped versions, within other_s; the trees are taken with the skip off too.
+    skip_s        = tally("skip_s"),
+    versions_read = as.integer(tally("versions_read")))
   list(analyzer = analyzer, phases = phases, workers = .worker_memory(rs))
 }
 
@@ -1248,6 +1354,56 @@ ANALYZER_PEAKS_KEPT <- 5L
   sprintf(paste0("worker time: clone %.1f s, extract %.1f s, analyzer %.1f s, ",
                  "record parse %.1f s, metrics %.1f s, other %.1f s"),
           p$clone_s, p$extract_s, p$analyzer_s, p$parse_s, p$metrics_s, p$other_s)
+}
+
+# The reasons a version is read, in the order the rules ask them.
+.SKIP_REASONS <- c("all", "new", "unrecorded", "moved", "tree", "class",
+                   "generation", "metrics", "detail", "newest", "text")
+
+# The shard's skip for the run log: versions read by reason, diffs redone, and
+# the packages queued with nothing read (counted by the caller, as a plan that
+# reads nothing can still write a gone version or a redone diff).
+.version_skip_line <- function(plans, n_nothing_read) {
+  all_plans <- do.call(rbind, c(list(data.frame(
+    version = character(0L), read = logical(0L), reason = character(0L),
+    pred_changed = logical(0L))), unname(plans)))
+  reasons <- all_plans$reason[all_plans$read]
+  counts <- vapply(.SKIP_REASONS, function(r) sum(reasons %in% r), integer(1L))
+  counts <- counts[counts > 0L]
+  sprintf("version skip: read %d of %d listed versions (%s); diffs redone: %d; queued with nothing read: %d",
+          sum(all_plans$read), nrow(all_plans),
+          if (length(counts)) paste(names(counts), counts, collapse = ", ") else "none",
+          sum(all_plans$pred_changed), as.integer(n_nothing_read))
+}
+
+# Packages among `pkgs` (every package when NULL) whose summary rows carry other
+# than one latest row, and those with a current dataset link or vignette off the
+# version that carries it.
+.version_skip_invariants <- function(con, data_con, pkgs = NULL) {
+  out <- c(latest_off = 0L, current_off = 0L)
+  if (!is.null(pkgs) && length(pkgs) == 0L) return(out)
+  if (!SUMMARY_TABLE %in% DBI::dbListTables(con) ||
+      !"latest_release_date" %in% DBI::dbListFields(con, SUMMARY_TABLE)) return(out)
+  where <- if (is.null(pkgs)) "" else
+    sprintf(" AND package IN (%s)", paste(rep("?", length(pkgs)), collapse = ","))
+  params <- if (is.null(pkgs)) NULL else as.list(as.character(pkgs))
+  latest <- DBI::dbGetQuery(con, sprintf(
+    'SELECT package, version FROM "%s" WHERE latest_release_date IS NOT NULL%s',
+    SUMMARY_TABLE, where), params = params)
+  all_pkgs <- if (is.null(pkgs)) DBI::dbGetQuery(con, sprintf(
+    'SELECT DISTINCT package FROM "%s"', SUMMARY_TABLE))$package else as.character(pkgs)
+  out[["latest_off"]] <- sum(table(factor(latest$package, levels = all_pkgs)) != 1L)
+  off <- character(0L)
+  for (spec in list(list(con, "cran_vignettes"), list(data_con, "cran_dataset_versions"))) {
+    if (!spec[[2L]] %in% DBI::dbListTables(spec[[1L]])) next
+    cur <- DBI::dbGetQuery(spec[[1L]], sprintf(
+      'SELECT DISTINCT package, version FROM "%s" WHERE is_current = 1%s',
+      spec[[2L]], where), params = params)
+    keys <- paste(cur$package, cur$version, sep = "\r")
+    off <- c(off, cur$package[!keys %in% paste(latest$package, latest$version, sep = "\r")])
+  }
+  out[["current_off"]] <- length(unique(off))
+  out
 }
 
 # ---------------------------------------------------------------------------
@@ -1502,10 +1658,17 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   shard_vignettes_list <- list()
   shard_text_list      <- list()
   shard_state_list     <- list()
+  # Results of the packages that skipped some versions, written version by
+  # version; each package's read plan; and the packages that read nothing.
+  shard_partial        <- list()
+  shard_plans          <- list()
+  n_nothing_read       <- 0L
   shard_failures       <- character(0L)
   shard_stages         <- character(0L)
-  # Verdicts this shard wrote. Each is news the next run needs, so the shard
-  # publishes; a weekly recheck that failed where it failed before is not.
+  # Verdicts this shard wrote or cleared. Each is news the next run needs, so
+  # the shard publishes; a weekly recheck that failed where it failed before is
+  # not. A cleared one counts because a package that read nothing writes no
+  # rows, and its shard would not publish otherwise.
   n_verdicts_written   <- 0L
   shard_over_cap       <- character(0L)
   # Which of the rows about to be written the analyzer binary produced, keyed
@@ -1519,6 +1682,10 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
 
   # Read before the fork: a worker cannot ask which versions have analyzer rows.
   stamped_of <- .stamped_versions(con, shard_pkgs)
+  # The stored rows each package's read plan needs; with the skip off, or on
+  # --bootstrap, there is no prior and every version is read.
+  skip_on  <- isTRUE(VERSION_SKIP) && !isTRUE(force_full)
+  prior_of <- if (skip_on) .prior_state(con, text_con, shard_pkgs, output_class) else list()
 
   # Worker: clone + analyze one package. No database access.
   # Returns list(package, ok = TRUE, elapsed, summary, churn, ...) or, when the
@@ -1570,7 +1737,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     err <- NULL
     res <- tryCatch(
       analyze_package(dest, pkg, stamped = stamped_of[[pkg]] %||% character(0L),
-                      limit = analyzer_limit),
+                      limit = analyzer_limit, prior = prior_of[[pkg]]),
       error = function(e) {
         err <<- e
         NULL
@@ -1588,7 +1755,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
          functions = res$functions, edges = res$edges, datasets = res$datasets,
          vignettes = res$vignettes, text = res$text,
          binary_versions = res$binary_versions,
-         state = .with_read_at(res$state))
+         state = res$state, skip = res$skip)
   }
 
   results <- parallel::mclapply(shard_pkgs, .with_worker_telemetry(.pkg_worker),
@@ -1617,19 +1784,13 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       .record_failure(con, pkg, v$stage, analyzer_version, WORKER_TIMEOUT, run_id,
                       v$elapsed, v$reason, unname(lv_of[pkg]))
     } else {
-      shard_summary_list[[pkg]]   <- r$summary
-      shard_churn_list[[pkg]]     <- r$churn
-      shard_api_list[[pkg]]       <- r$api
-      shard_functions_list[[pkg]] <- r$functions
-      shard_edges_list[[pkg]]     <- r$edges
-      shard_datasets_list[[pkg]]  <- r$datasets
-      shard_vignettes_list[[pkg]] <- r$vignettes
-      shard_text_list[[pkg]]      <- r$text
-      shard_state_list[[pkg]]     <- r$state
       shard_binary_keys <- c(shard_binary_keys,
                              .analyzer_row_keys(pkg, r$binary_versions))
+      # Read and written whole, as every package is with the skip off.
+      whole <- !isTRUE(r$skip$unchanged) && !isTRUE(r$skip$partial)
+      if (pkg %in% verdicts$package) n_verdicts_written <- n_verdicts_written + 1L
       .reset_failure(con, pkg)
-      if (.note_over_cap(con, pkg, v$elapsed, analyzer_version, run_id)) {
+      if (.note_over_cap(con, pkg, v$elapsed, analyzer_version, run_id, whole = whole)) {
         shard_over_cap <- c(shard_over_cap, pkg)
       }
       # Analysed, but which versions were read? A version the analyzer did not
@@ -1637,42 +1798,104 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       # attempt is what eventually takes its package out of them. Every version
       # this run did read starts over from nothing, so one bad run does not
       # count against the next, and so does one this package no longer has.
+      # r$summary holds only the versions read; a skipped one is in the output
+      # class, so it was read too and its attempts go.
       unread <- .analyzer_unread_versions(r$summary, r$binary_versions)
       .clear_analyzer_read_attempts(con, pkg, keep = unread)
       for (v in unread) .record_analyzer_read_attempt(con, pkg, v, analyzer_version)
+      # A package that read nothing writes nothing, and one that skipped some
+      # versions is written version by version; the rest are written whole.
+      if (!is.null(r$skip)) shard_plans[[pkg]] <- r$skip$plan
+      if (isTRUE(r$skip$unchanged)) {
+        n_nothing_read <- n_nothing_read + 1L
+      } else if (!whole) {
+        shard_partial[[pkg]] <- r
+      } else {
+        shard_summary_list[[pkg]]   <- r$summary
+        shard_churn_list[[pkg]]     <- r$churn
+        shard_api_list[[pkg]]       <- r$api
+        shard_functions_list[[pkg]] <- r$functions
+        shard_edges_list[[pkg]]     <- r$edges
+        shard_datasets_list[[pkg]]  <- r$datasets
+        shard_vignettes_list[[pkg]] <- r$vignettes
+        shard_text_list[[pkg]]      <- r$text
+        shard_state_list[[pkg]]     <- r$state
+      }
     }
   }
 
   # ---- 7. Upsert shard into DB in-place (O(shard) memory) ------------------
-  fresh_pkgs      <- names(shard_summary_list)
+  # The packages that read every version are written whole, those that skipped
+  # some version by version. Each frame holds both, and each write takes its own.
+  walked     <- names(shard_summary_list)
+  partial    <- names(shard_partial)
+  fresh_pkgs <- c(walked, partial)
+  part       <- function(f) lapply(shard_partial, `[[`, f)
+  both       <- function(walked_list, f) .rbind_union_all(c(walked_list, part(f)))
+  of_walked  <- function(df) df[!df$package %in% partial, , drop = FALSE]
+  of_partial <- function(df) df[df$package %in% partial, , drop = FALSE]
   fresh_summary   <- .stamp_analyzer_version(
-    .rbind_union_all(shard_summary_list) %||% .empty_summary(),
+    both(shard_summary_list, "summary") %||% .empty_summary(),
     analyzer_version, shard_binary_keys)
-  fresh_churn     <- .rbind_union_all(shard_churn_list)     %||% .empty_churn()
-  fresh_api       <- .rbind_union_all(shard_api_list)       %||% .empty_api()
-  fresh_functions <- .rbind_union_all(shard_functions_list) %||% .empty_functions_df()
-  fresh_edges     <- .rbind_union_all(shard_edges_list)     %||% .empty_edges_df()
-  fresh_datasets  <- .rbind_union_all(shard_datasets_list)  %||% .empty_datasets_df()
-  fresh_vignettes <- .rbind_union_all(shard_vignettes_list) %||% .empty_vignettes_rows()
-  fresh_text      <- .bind_release_text(shard_text_list)
-  fresh_state     <- .rbind_union_all(shard_state_list)     %||% .empty_version_state()
+  fresh_churn     <- both(shard_churn_list, "churn")         %||% .empty_churn()
+  fresh_api       <- both(shard_api_list, "api")             %||% .empty_api()
+  fresh_functions <- both(shard_functions_list, "functions") %||% .empty_functions_df()
+  fresh_edges     <- both(shard_edges_list, "edges")         %||% .empty_edges_df()
+  fresh_datasets  <- both(shard_datasets_list, "datasets")   %||% .empty_datasets_df()
+  fresh_vignettes <- both(shard_vignettes_list, "vignettes") %||% .empty_vignettes_rows()
+  fresh_text      <- .bind_release_text(c(shard_text_list, part("text")))
+  fresh_state     <- both(shard_state_list, "state")         %||% .empty_version_state()
 
+  if (length(partial) > 0L) {
+    # Which versions of each package the per-version write replaces, as
+    # data.frame(package, version), empty rather than NULL when there are none.
+    skip_keys <- function(f) {
+      k <- lapply(shard_partial, function(r) as.character(r$skip[[f]]))
+      data.frame(package = rep(partial, lengths(k)),
+                 version = as.character(unlist(k, use.names = FALSE)),
+                 stringsAsFactors = FALSE)
+    }
+    row_keys    <- skip_keys("row_keys")
+    api_keys    <- skip_keys("api_keys")
+    derived     <- .rbind_union_all(lapply(shard_partial, function(r) r$skip$derived))
+    newest      <- vapply(shard_partial, function(r) as.character(r$skip$newest), character(1L))
+    latest_pkgs <- partial[vapply(shard_partial, function(r) isTRUE(r$skip$newest_read),
+                                  logical(1L))]
+  }
+
+  # Write dataset rows before the code summary stamps datasets_scanned = TRUE,
+  # so a scanned code row always implies its dataset rows were written. The
+  # dataset write is delete-then-insert (idempotent), so if the code write
+  # fails afterwards the package stays on the to-do list and the next run
+  # redoes both cleanly, rather than being marked done with datasets missing.
+  if (length(walked) > 0L) {
+    upsert_datasets(data_con, of_walked(fresh_datasets), walked)
+  }
+  if (length(partial) > 0L) {
+    upsert_dataset_versions(data_con, of_partial(fresh_datasets), row_keys, newest, latest_pkgs)
+  }
+  # Before the code rows, so a failed text write leaves these packages unmarked.
   if (length(fresh_pkgs) > 0L) {
-    # Write dataset rows before the code summary stamps datasets_scanned = TRUE,
-    # so a scanned code row always implies its dataset rows were written. The
-    # dataset write is delete-then-insert (idempotent), so if the code write
-    # fails afterwards the package stays on the to-do list and the next run
-    # redoes both cleanly, rather than being marked done with datasets missing.
-    upsert_datasets(data_con, fresh_datasets, fresh_pkgs)
-    # Before the code rows, so a failed text write leaves these packages unmarked.
     upsert_release_text(text_con, fresh_text$description,
                         fresh_text$release_notes, fresh_text$versions)
-    upsert_shard(con, fresh_summary, fresh_churn, fresh_api,
-                 fresh_functions, fresh_edges, fresh_vignettes,
-                 description_df = fresh_text$description_latest,
-                 release_notes_df = fresh_text$release_notes_latest,
+  }
+  if (length(walked) > 0L) {
+    upsert_shard(con, of_walked(fresh_summary), of_walked(fresh_churn), of_walked(fresh_api),
+                 of_walked(fresh_functions), of_walked(fresh_edges), of_walked(fresh_vignettes),
+                 description_df = of_walked(fresh_text$description_latest),
+                 release_notes_df = of_walked(fresh_text$release_notes_latest),
                  analyzer_version = analyzer_version,
-                 state_df = fresh_state)
+                 state_df = of_walked(fresh_state))
+  }
+  if (length(partial) > 0L) {
+    upsert_versions(con, of_partial(fresh_summary), derived, of_partial(fresh_churn),
+                    of_partial(fresh_api), of_partial(fresh_functions), of_partial(fresh_edges),
+                    of_partial(fresh_vignettes), state_df = of_partial(fresh_state),
+                    row_keys = row_keys, api_keys = api_keys, newest = newest,
+                    latest_pkgs = latest_pkgs,
+                    description_df = of_partial(fresh_text$description_latest),
+                    release_notes_df = of_partial(fresh_text$release_notes_latest),
+                    analyzer_version = analyzer_version)
   }
 
   # ---- 7b. Project archived-package metadata into the narrow lookup table ----
@@ -1759,8 +1982,17 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   telemetry <- .shard_telemetry(results)
   cat(.analyzer_stats_line(telemetry$analyzer), "\n",
       .analyzer_memory_line(telemetry$analyzer), "\n",
-      .worker_phase_line(telemetry$phases), "\n",
-      .worker_memory_line(telemetry$workers), "\n", sep = "", file = stdout())
+      .worker_phase_line(telemetry$phases), "\n", sep = "", file = stdout())
+  skip_invariants <- .version_skip_invariants(con, data_con, as.character(fresh_pkgs))
+  if (skip_on) {
+    cat(.version_skip_line(shard_plans, n_nothing_read), "\n",
+        sprintf("version skip invariants: %d of %d written packages with other than one latest row, %d with current rows off the newest",
+                skip_invariants[["latest_off"]], length(fresh_pkgs), skip_invariants[["current_off"]]),
+        "\n", sep = "", file = stdout())
+  } else if (!isTRUE(VERSION_SKIP)) {
+    cat("version skip: off\n", file = stdout())
+  }
+  cat(.worker_memory_line(telemetry$workers), "\n", sep = "", file = stdout())
 
   # ---- 8b. Shard receipt ----------------------------------------------------
   # One-line closing summary, printed after the collection loop and before the
@@ -1768,7 +2000,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   cat(sprintf(
     "shard done in %.0fs: %d/%d ok, %d failed; %d versions, %d functions, %d edges written; DB %d/%d; %d queued; complete=%s\n",
     as.numeric(difftime(Sys.time(), t_shard0, units = "secs")),
-    length(fresh_pkgs), length(shard_pkgs), length(shard_failures),
+    length(fresh_pkgs) + n_nothing_read, length(shard_pkgs), length(shard_failures),
     nrow(fresh_summary), nrow(fresh_functions), nrow(fresh_edges),
     n_analyzed_pkgs, n_universe, length(remaining_after),
     tolower(as.character(bootstrap_complete))),
@@ -1820,6 +2052,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     }
   }
 
+  db_invariants <- .version_skip_invariants(con, data_con)
   bootstrap <- list(n_analyzed = n_analyzed_pkgs, n_universe = n_universe,
                     n_remaining = length(remaining_after),
                     bootstrap_complete = bootstrap_complete,
@@ -1832,6 +2065,11 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                     analyzer_version = analyzer_version,
                     output_class = I(output_class),
                     n_latest_on_build = .n_latest_on_class(con, analyzer_version)[["on_class"]],
+                    n_versions_unrecorded = .n_versions_unrecorded(con),
+                    # Whole database, like the line above: a shard's own figures
+                    # are in its log, and the last shard may have written nothing.
+                    latest_off = db_invariants[["latest_off"]],
+                    current_off = db_invariants[["current_off"]],
                     parked = verdict_counts$parked,
                     failed_this_run = verdict_counts$failed_this_run,
                     over_cap_ok = verdict_counts$over_cap_ok,
@@ -1912,6 +2150,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       analyzer_version = bootstrap$analyzer_version,
                       output_class = bootstrap$output_class,
                       n_latest_on_build = bootstrap$n_latest_on_build,
+                      n_versions_unrecorded = bootstrap$n_versions_unrecorded,
+                      latest_off = bootstrap$latest_off,
+                      current_off = bootstrap$current_off,
                       failed_by_stage = .stage_counts(shard_stages),
                       parked = verdict_counts$parked,
                       failed_this_run = verdict_counts$failed_this_run,

@@ -50,10 +50,13 @@
 .RETENTION_CHECKS <- list(
   code = list(
     # No tolerance. The only paths that remove summary rows are force_full's
-    # DELETE (exempted below, and reachable only by workflow_dispatch) and
-    # upsert_shard's per-package delete, and the latter cannot remove a
-    # package: it takes its package list from the frame it is about to insert,
-    # so a package that yields zero rows is skipped rather than emptied.
+    # DELETE (exempted below, and reachable only by workflow_dispatch),
+    # upsert_shard's per-package delete and upsert_versions' per-version one,
+    # and neither upsert can remove a package. upsert_shard takes its package
+    # list from the frame it is about to insert, so a package that yields zero
+    # rows is skipped rather than emptied. upsert_versions writes only a
+    # package that skipped versions, and a skipped row is kept, so a partly
+    # read package always keeps at least one row.
     # Archival does not delete either. A lost download drops this by 98.8%.
     list(path = "n_packages",                min_ratio = 1,     max_loss = 0),
     # A package whose tag set on the cran mirror shrank while staying non-empty
@@ -64,7 +67,9 @@
     list(path = "n_versions",                min_ratio = 0.999, max_loss = 250),
     # upsert_shard deletes ALL of a re-analysed package's detail rows and
     # re-inserts only its latest version's, so a release that removed functions
-    # lowers the corpus total with nothing wrong. Worst measured: -0.053%
+    # lowers the corpus total with nothing wrong. A package that skips versions
+    # replaces detail rows only for the versions it read, which deletes fewer
+    # rows; the floors stay. Worst measured: -0.053%
     # (cran_functions) and -0.022% (cran_call_edges) on 2026-07-24. 2% is 37x
     # that and ~4x the largest one-day movement in either direction (+0.53%).
     # These are also the tables force_full does NOT wipe, which is what tells a

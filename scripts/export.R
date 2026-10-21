@@ -154,6 +154,27 @@ metrics_fingerprint <- function(summary_df) {
   invisible(NULL)
 }
 
+# Delete the rows of each (package, version) in `keys` from one table.
+# Silently no-ops if the table does not exist or keys is empty.
+.delete_by_version <- function(con, table, keys) {
+  if (is.null(keys) || nrow(keys) == 0L || !table %in% DBI::dbListTables(con)) {
+    return(invisible(NULL))
+  }
+  DBI::dbExecute(con, sprintf('DELETE FROM "%s" WHERE package = ? AND version = ?', table),
+                 params = list(as.character(keys$package), as.character(keys$version)))
+  invisible(NULL)
+}
+
+# Clear is_current on each package's rows of any version but its newest.
+# `newest` is a character vector named by package.
+.mark_current_versions <- function(con, table, newest) {
+  if (length(newest) == 0L || !table %in% DBI::dbListTables(con)) return(invisible(NULL))
+  DBI::dbExecute(con, sprintf(
+    'UPDATE "%s" SET is_current = 0 WHERE package = ? AND version <> ? AND is_current <> 0',
+    table), params = list(names(newest), unname(as.character(newest))))
+  invisible(NULL)
+}
+
 # Append rows to a detail table, creating it (schema derived from the frame) on
 # first write and tolerating new columns via ALTER TABLE ... ADD COLUMN. Mirrors
 # the schema-flexible cran_code_summary path but without a UNIQUE index (detail
@@ -1026,14 +1047,20 @@ metrics_fingerprint <- function(summary_df) {
 #' row per (package, version, dataset) with columns package, name, version, file,
 #' internal, format, compression, confidence, class, kind, nrow, ncol,
 #' n_missing_total, content_fp, schema_fp, fp_algo_version, columns, row_sketch,
-#' is_current. Runs inside the caller's transaction.
-.write_datasets_normalized <- function(con, df, pkgs) {
+#' is_current. Runs inside the caller's transaction. With `row_keys`, a
+#' data.frame(package, version), only those versions' links are replaced, and
+#' only the identity rows of `latest_pkgs`, the packages whose newest was read.
+.write_datasets_normalized <- function(con, df, pkgs, row_keys = NULL, latest_pkgs = pkgs) {
   .migrate_legacy_dataset_table(con, pkgs)
   .ensure_dataset_tables(con)
   # Per-package wipe: children (version links) then parents (identity). Contents
   # and sketches are shared/immutable and are reclaimed by GC, not deleted here.
-  .delete_by_package(con, "cran_dataset_versions", pkgs)
-  .delete_by_package(con, "cran_datasets",         pkgs)
+  if (is.null(row_keys)) {
+    .delete_by_package(con, "cran_dataset_versions", pkgs)
+  } else {
+    .delete_by_version(con, "cran_dataset_versions", row_keys)
+  }
+  .delete_by_package(con, "cran_datasets", latest_pkgs)
   if (is.null(df) || nrow(df) == 0L) return(invisible(NULL))
 
   # What the reader measured and no table has a column for. Said before the
@@ -1198,7 +1225,7 @@ metrics_fingerprint <- function(summary_df) {
       params = list(sk$content_id, sk$row_sketch))
   }
 
-  # 3. Version links (package was wiped above, so a plain append is idempotent).
+  # 3. Version links (their versions were wiped above, so a plain append is idempotent).
   ver_cols <- c("package", "name", "version", "content_id", "format",
                 "compression", "confidence", "is_current",
                 intersect(names(.DATASET_VERSION_COLS), names(df)))
@@ -1397,26 +1424,43 @@ open_or_init_data_db <- function(path) {
 # replaced with them; pipeline state that nothing downstream reads.
 .VERSION_STATE_COLS <- c("package", "version", "commit_sha", "tree_sha",
                          "prev_version", "prev_commit", "deprecated",
-                         "uses_lifecycle", "read_at")
+                         "uses_lifecycle", "read_at", "rows_generation")
 
 .ensure_version_state_table <- function(con) {
   DBI::dbExecute(con, sprintf('
     CREATE TABLE IF NOT EXISTS "%s" (
       package TEXT NOT NULL, version TEXT NOT NULL,
       commit_sha TEXT, tree_sha TEXT, prev_version TEXT, prev_commit TEXT,
-      deprecated TEXT, uses_lifecycle INTEGER, read_at TEXT,
+      deprecated TEXT, uses_lifecycle INTEGER, read_at TEXT, rows_generation INTEGER,
       PRIMARY KEY (package, version)) WITHOUT ROWID', VERSION_STATE_TABLE))
+  # A table from before rows_generation gains it, its rows keeping NULL.
+  if (!"rows_generation" %in% DBI::dbListFields(con, VERSION_STATE_TABLE)) {
+    DBI::dbExecute(con, sprintf('ALTER TABLE "%s" ADD COLUMN rows_generation INTEGER',
+                                VERSION_STATE_TABLE))
+  }
   invisible(NULL)
 }
 
-# The state rows of the summary rows a write keeps, one per (package, version),
-# with every column of the table.
-.version_state_write <- function(state_df, summary_df) {
+# The state rows of the keys a write keeps (any frame with package and version),
+# one per (package, version), with every column of the table.
+.version_state_write <- function(state_df, keys) {
   key <- function(df) paste(df$package, df$version, sep = "\x1f")
-  out <- state_df[key(state_df) %in% key(summary_df), , drop = FALSE]
+  out <- state_df[key(state_df) %in% key(keys), , drop = FALSE]
   out <- out[!duplicated(key(out), fromLast = TRUE), , drop = FALSE]
   for (col in setdiff(.VERSION_STATE_COLS, names(out))) out[[col]] <- rep(NA, nrow(out))
   out[, .VERSION_STATE_COLS, drop = FALSE]
+}
+
+# Replace the state rows of `pkgs` with those of the versions in summary_df.
+# A write with no state rows leaves the packages with none, so nothing claims a
+# commit for rows it did not see read. Runs inside the caller's transaction.
+.write_version_state <- function(con, pkgs, summary_df, state_df) {
+  .ensure_version_state_table(con)
+  .delete_by_package(con, VERSION_STATE_TABLE, pkgs)
+  if (is.null(state_df) || nrow(state_df) == 0L) return(invisible(NULL))
+  state_write <- .version_state_write(state_df, summary_df)
+  if (nrow(state_write) > 0L) DBI::dbAppendTable(con, VERSION_STATE_TABLE, state_write)
+  invisible(NULL)
 }
 
 # The columns a failure verdict adds to cran_metrics_failures, with their types.
@@ -1694,6 +1738,50 @@ db_analyzed_state <- function(con) {
   invisible(n)
 }
 
+#' Append summary rows to cran_code_summary, typed as declared, creating the
+#' table or adding the columns it lacks, and its unique (package, version)
+#' index. Runs inside the caller's transaction.
+.append_summary_rows <- function(con, summary_df, analyzer_version) {
+  # Defensive dedup: cran_code_summary has a UNIQUE(package, version) index, so a
+  # single package that somehow yields two rows for one version would otherwise
+  # abort the whole shard. Keep the last occurrence per (package, version).
+  dup_key <- paste(summary_df$package, summary_df$version, sep = "\x1f")
+  if (anyDuplicated(dup_key)) {
+    keep_row  <- !duplicated(dup_key, fromLast = TRUE)
+    summary_df <- summary_df[keep_row, , drop = FALSE]
+  }
+
+  summary_write <- .coerce_logicals(summary_df)
+  summary_write <- .apply_declared_types(summary_write, analyzer_version)
+  summary_write <- .strip_retired_columns(summary_write, analyzer_version)
+  .drop_retired_columns(con, analyzer_version)
+  tables        <- DBI::dbListTables(con)
+
+  if (!"cran_code_summary" %in% tables) {
+    # First-ever write: create the table from the data.frame schema.
+    DBI::dbWriteTable(con, "cran_code_summary", summary_write,
+                      row.names = FALSE, overwrite = FALSE, append = FALSE)
+    .ensure_summary_columns(con, analyzer_version)
+  } else {
+    .ensure_summary_columns(con, analyzer_version)
+    # Possibly new columns have appeared since the table was first created.
+    existing_cols <- DBI::dbListFields(con, "cran_code_summary")
+    for (col in setdiff(names(summary_write), existing_cols)) {
+      col_type <- if (is.integer(summary_write[[col]])) "INTEGER"
+                  else if (is.numeric(summary_write[[col]])) "REAL"
+                  else "TEXT"
+      DBI::dbExecute(con,
+        sprintf("ALTER TABLE cran_code_summary ADD COLUMN \"%s\" %s",
+                col, col_type))
+    }
+    DBI::dbAppendTable(con, "cran_code_summary", summary_write)
+  }
+  DBI::dbExecute(con,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_summary_pkg_ver
+     ON cran_code_summary(package, version)")
+  invisible(NULL)
+}
+
 #' Upsert one shard's rows into the pipeline database in-place.
 #'
 #' For each package present in summary_df, deletes all prior rows from the
@@ -1723,9 +1811,10 @@ db_analyzed_state <- function(con) {
 #'   stale rows survive a re-analysis.
 #' @param description_df,release_notes_df Latest-only text rows; NULL leaves both tables untouched.
 #' @param analyzer_version The running analyzer build; gates the 0.5.0 schema steps.
-#' @param state_df   Optional version state rows (see .version_state_rows), which
-#'   replace those of the same packages for the versions whose summary rows
-#'   are written. NULL (the default) leaves cran_version_state untouched.
+#' @param state_df   Version state rows (.version_state_rows). The packages'
+#'   state rows are replaced with those of the versions whose summary rows are
+#'   written; NULL leaves the packages with none, so nothing claims a commit
+#'   for rows it did not see read.
 #' @return invisible(NULL)
 upsert_shard <- function(con, summary_df, churn_df, api_df,
                          functions_df = NULL, edges_df = NULL,
@@ -1734,15 +1823,6 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
                          analyzer_version = NA_character_, state_df = NULL) {
   pkgs <- unique(as.character(summary_df$package))
   if (length(pkgs) == 0L) return(invisible(NULL))
-
-  # Defensive dedup: cran_code_summary has a UNIQUE(package, version) index, so a
-  # single package that somehow yields two rows for one version would otherwise
-  # abort the whole shard. Keep the last occurrence per (package, version).
-  dup_key <- paste(summary_df$package, summary_df$version, sep = "\x1f")
-  if (anyDuplicated(dup_key)) {
-    keep_row  <- !duplicated(dup_key, fromLast = TRUE)
-    summary_df <- summary_df[keep_row, , drop = FALSE]
-  }
 
   DBI::dbWithTransaction(con, {
     # -- Delete prior rows for these packages from every table ---------------
@@ -1759,34 +1839,7 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     if (!is.null(vignettes_df))  .delete_by_package(con, "cran_vignettes", pkgs)
 
     # -- Insert fresh summary rows (with schema-growth handling) -------------
-    summary_write <- .coerce_logicals(summary_df)
-    summary_write <- .apply_declared_types(summary_write, analyzer_version)
-    summary_write <- .strip_retired_columns(summary_write, analyzer_version)
-    .drop_retired_columns(con, analyzer_version)
-    tables        <- DBI::dbListTables(con)
-
-    if (!"cran_code_summary" %in% tables) {
-      # First-ever write: create the table from the data.frame schema.
-      DBI::dbWriteTable(con, "cran_code_summary", summary_write,
-                        row.names = FALSE, overwrite = FALSE, append = FALSE)
-      .ensure_summary_columns(con, analyzer_version)
-    } else {
-      .ensure_summary_columns(con, analyzer_version)
-      # Possibly new columns have appeared since the table was first created.
-      existing_cols <- DBI::dbListFields(con, "cran_code_summary")
-      for (col in setdiff(names(summary_write), existing_cols)) {
-        col_type <- if (is.integer(summary_write[[col]])) "INTEGER"
-                    else if (is.numeric(summary_write[[col]])) "REAL"
-                    else "TEXT"
-        DBI::dbExecute(con,
-          sprintf("ALTER TABLE cran_code_summary ADD COLUMN \"%s\" %s",
-                  col, col_type))
-      }
-      DBI::dbAppendTable(con, "cran_code_summary", summary_write)
-    }
-    DBI::dbExecute(con,
-      "CREATE UNIQUE INDEX IF NOT EXISTS idx_summary_pkg_ver
-       ON cran_code_summary(package, version)")
+    .append_summary_rows(con, summary_df, analyzer_version)
     .null_repository_only_columns(con)
 
     # -- Insert fresh churn rows ---------------------------------------------
@@ -1812,12 +1865,98 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     }
 
     # -- Replace what each version was read from, beside the rows it gave -----
-    if (!is.null(state_df)) {
-      .ensure_version_state_table(con)
-      .delete_by_package(con, VERSION_STATE_TABLE, pkgs)
-      state_write <- .version_state_write(state_df, summary_df)
-      if (nrow(state_write) > 0L) DBI::dbAppendTable(con, VERSION_STATE_TABLE, state_write)
+    .write_version_state(con, pkgs, summary_df, state_df)
+  })
+
+  invisible(NULL)
+}
+
+#' Replace packages' rows version by version, when some of their versions were
+#' not read. The rows of the versions read or gone are replaced, and a skipped
+#' version keeps its rows with only its cross-version columns rewritten in
+#' place. Everything runs inside one transaction.
+#'
+#' @param con          Open DBI connection from open_or_init_db().
+#' @param summary_df   Summary rows of the versions read.
+#' @param derived_df   Package, version and .CROSS_VERSION_COLS of the versions skipped.
+#' @param churn_df     The packages' whole churn, replaced per package.
+#' @param api_df       API rows of the versions read or with a redone diff.
+#' @param functions_df,edges_df Detail of the newest version; written only for latest_pkgs.
+#' @param vignettes_df Vignette rows of the versions read.
+#' @param state_df     State rows of the versions read or with a redone diff. Required,
+#'   so a write never leaves rows that no state row claims.
+#' @param row_keys     data.frame(package, version) of the versions read or gone,
+#'   whose summary and vignette rows are replaced.
+#' @param api_keys     data.frame(package, version) of the versions read, gone or with
+#'   a redone diff, whose API and state rows are replaced.
+#' @param newest       Each package's newest listed version, named by package.
+#' @param latest_pkgs  The packages whose newest version was read: only their
+#'   functions, edges and latest-only text are replaced.
+#' @param description_df,release_notes_df Latest-only text rows.
+#' @param analyzer_version The running analyzer build; gates the 0.5.0 schema steps.
+#' @return invisible(NULL)
+upsert_versions <- function(con, summary_df, derived_df, churn_df, api_df,
+                            functions_df, edges_df, vignettes_df, state_df,
+                            row_keys, api_keys, newest, latest_pkgs,
+                            description_df = NULL, release_notes_df = NULL,
+                            analyzer_version = NA_character_) {
+  if (missing(state_df) || !is.data.frame(state_df)) {
+    stop("upsert_versions() needs state_df, the state rows of the versions it writes",
+         call. = FALSE)
+  }
+  pkgs        <- names(newest)
+  latest_pkgs <- as.character(latest_pkgs)
+  of_latest   <- function(df) if (!is.null(df)) df[df$package %in% latest_pkgs, , drop = FALSE]
+  # The versions whose rows the write keeps: those read and those skipped.
+  keys <- data.frame(package = as.character(c(summary_df$package, derived_df$package)),
+                     version = as.character(c(summary_df$version, derived_df$version)),
+                     stringsAsFactors = FALSE)
+
+  DBI::dbWithTransaction(con, {
+    .ensure_version_state_table(con)
+    .delete_by_version(con, "cran_code_summary", row_keys)
+    .delete_by_version(con, "cran_vignettes",    row_keys)
+    .delete_by_version(con, "cran_api_history",  api_keys)
+    .delete_by_version(con, VERSION_STATE_TABLE, api_keys)
+    # CRAN churn is keyed by a version parsed from each commit subject, so the
+    # run's whole recomputation replaces it.
+    .delete_by_package(con, "cran_code_churn", pkgs)
+    # Functions and edges are the newest's alone.
+    .delete_by_package(con, "cran_functions",  latest_pkgs)
+    .delete_by_package(con, "cran_call_edges", latest_pkgs)
+
+    .append_summary_rows(con, summary_df, analyzer_version)
+    .null_repository_only_columns(con)
+
+    if (!is.null(derived_df) && nrow(derived_df) > 0L) {
+      d    <- .coerce_logicals(derived_df)
+      cols <- intersect(.CROSS_VERSION_COLS, names(d))
+      DBI::dbExecute(con, sprintf(
+        'UPDATE "cran_code_summary" SET %s WHERE package = ? AND version = ?',
+        paste(sprintf('"%s" = ?', cols), collapse = ", ")),
+        params = c(unname(as.list(d[cols])), list(d$package, d$version)))
     }
+
+    churn_write <- .coerce_logicals(churn_df)
+    if (!is.null(churn_write) && nrow(churn_write) > 0L) {
+      DBI::dbAppendTable(con, "cran_code_churn", churn_write)
+    }
+    api_write <- .coerce_logicals(api_df)
+    if (!is.null(api_write) && nrow(api_write) > 0L) {
+      DBI::dbAppendTable(con, "cran_api_history", api_write)
+    }
+    .append_detail_table(con, "cran_functions",  of_latest(functions_df))
+    .append_detail_table(con, "cran_call_edges", of_latest(edges_df))
+    .append_detail_table(con, "cran_vignettes",  vignettes_df)
+    .mark_current_versions(con, "cran_vignettes", newest)
+
+    if (length(latest_pkgs) > 0L) {
+      .write_latest_text(con, latest_pkgs, of_latest(description_df),
+                         of_latest(release_notes_df))
+    }
+
+    state_write <- .version_state_write(state_df, keys)
+    if (nrow(state_write) > 0L) DBI::dbAppendTable(con, VERSION_STATE_TABLE, state_write)
   })
 
   invisible(NULL)
@@ -1837,6 +1976,25 @@ upsert_datasets <- function(data_con, datasets_df, pkgs) {
   pkgs <- unique(as.character(pkgs))
   DBI::dbWithTransaction(data_con, {
     .write_datasets_normalized(data_con, datasets_df, pkgs)
+    .gc_dataset_contents(data_con)
+  })
+  invisible(NULL)
+}
+
+#' Upsert dataset rows version by version, when some of the packages' versions
+#' were not read. The links of the versions read or gone are replaced, the
+#' identity rows only where the newest was read, and every link but the
+#' newest's is marked not current. One transaction on the dataset connection.
+#'
+#' @param row_keys    data.frame(package, version) of the versions read or gone.
+#' @param newest      Each package's newest listed version, named by package.
+#' @param latest_pkgs The packages whose newest version was read.
+#' @return invisible(NULL)
+upsert_dataset_versions <- function(data_con, datasets_df, row_keys, newest, latest_pkgs) {
+  DBI::dbWithTransaction(data_con, {
+    .write_datasets_normalized(data_con, datasets_df, names(newest),
+                               row_keys = row_keys, latest_pkgs = latest_pkgs)
+    .mark_current_versions(data_con, "cran_dataset_versions", newest)
     .gc_dataset_contents(data_con)
   })
   invisible(NULL)
@@ -1980,10 +2138,13 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
   )
 
   # The code series also carries the failure verdicts: parked by class, the
-  # packages failed this run, and the over-cap list.
+  # packages failed this run, the over-cap list and the stored versions with no
+  # recorded commit.
   if (identical(series, "code")) {
     extra <- bootstrap[intersect(c("parked", "failed_this_run", "over_cap_ok",
-                                   "over_cap_this_run"), names(bootstrap))]
+                                   "over_cap_this_run",
+                                   "n_versions_unrecorded", "latest_off",
+                                   "current_off"), names(bootstrap))]
     out$bootstrap <- c(out$bootstrap, Filter(Negate(is.null), extra))
   }
 

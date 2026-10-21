@@ -555,9 +555,9 @@ test_that("analyze_package fails as a whole when one version cannot be extracted
   on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
   .make_fake_clone("pkgX", repo, versions = c("1.0", "1.1"))
   real <- extract_version
-  .local_global("extract_version", function(repo, ref, dest) {
+  .local_global("extract_version", function(repo, ref, dest, ...) {
     if (identical(ref, "1.1")) stop(.extract_failure("archive", ref, 128L, "fatal: bad object"))
-    real(repo, ref, dest)
+    real(repo, ref, dest, ...)
   })
   err <- tryCatch(analyze_package(repo, "pkgX"), error = function(e) e)
   expect_s3_class(err, "extract_failure")
@@ -573,17 +573,19 @@ test_that("a cap during extraction extracts again into an emptied directory", {
 
   real  <- extract_version
   fired <- FALSE
-  .local_global("extract_version", function(repo, ref, dest) {
+  .local_global("extract_version", function(repo, ref, dest, ...) {
     if (!fired && identical(ref, "1.1")) {
       fired <<- TRUE
-      real(repo, ref, dest)
+      real(repo, ref, dest, ...)
       writeLines("leftover <- function() 1", file.path(dest, "R", "leftover.R"))
       stop(.cap_error())
     }
-    real(repo, ref, dest)
+    real(repo, ref, dest, ...)
   })
   got <- suppressWarnings(analyze_package(repo, "pkgX"))
   expect_true(fired)
+  got$state$read_at <- NULL
+  want$state$read_at <- NULL
   expect_identical(got, want)
 })
 
@@ -604,9 +606,9 @@ test_that("a version that cannot be extracted leaves the package's stored rows a
   expect_gt(nrow(before[[paste(DB_FILENAME, SUMMARY_TABLE)]]), 0L)
 
   real <- extract_version
-  .local_global("extract_version", function(repo, ref, dest) {
+  .local_global("extract_version", function(repo, ref, dest, ...) {
     if (identical(ref, "1.1")) stop(.extract_failure("archive", ref, 128L, "fatal: bad object"))
-    real(repo, ref, dest)
+    real(repo, ref, dest, ...)
   })
   v2 <- data.frame(package = "pkgA", latest_version = "1.1", stringsAsFactors = FALSE)
   logged <- capture.output(
@@ -701,6 +703,7 @@ test_that("a cap in a per-version step of analyze_package changes nothing it ret
   analyse <- function() {
     res <- analyze_package(repo, "pkgCap")
     res$text$versions$read_at <- NULL
+    res$state$read_at <- NULL
     res
   }
   want <- analyse()
@@ -965,7 +968,8 @@ test_that("the shard sums the analyzer's statistics lines and prints them with t
   expect_true(all(unlist(st$worker_phases) >= 0))
   expect_setequal(names(st$worker_phases),
                   c("packages", "clone_s", "extract_s", "analyzer_s", "parse_s", "metrics_s",
-                    "other_s", "dataset_memo_hits", "dataset_memo_misses"))
+                    "other_s", "dataset_memo_hits", "dataset_memo_misses", "skip_s",
+                    "versions_read"))
   published <- jsonlite::fromJSON(file.path(out_dir, "code-manifest.json"), simplifyVector = FALSE)
   expect_false(any(c("analyzer_stats", "worker_phases") %in%
                      c(names(published), names(published$bootstrap))))
@@ -1351,8 +1355,9 @@ test_that("the shard prints its worker memory line and writes it to run-status.j
   } else {
     expect_match(line, "^worker memory: no peak figure on this platform, ")
   }
-  # After the worker time, which it follows in the log.
-  expect_identical(grep("^worker memory: ", log), grep("^worker time: ", log) + 1L)
+  # After the worker time and the version skip line, which it follows in the log.
+  expect_identical(grep("^version skip: off$", log), grep("^worker time: ", log) + 1L)
+  expect_identical(grep("^worker memory: ", log), grep("^version skip: off$", log) + 1L)
 
   st <- .run_status(out_dir)$worker_memory
   expect_setequal(names(st),

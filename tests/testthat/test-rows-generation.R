@@ -230,6 +230,54 @@ test_that("the rows R writes for a version match the golden under the pinned ana
   }
 })
 
+# The prior .prior_state() gives after `walk`, its rows in a stand-in output class.
+.rg_prior <- function(walk, class = "rg-test") {
+  s <- walk$summary
+  list(
+    stored = data.frame(version = s$version, analyzer_version = class, n_fns_r_null = FALSE,
+                        detail_scanned = as.integer(s$detail_scanned), datasets_scanned = 1L,
+                        latest = !is.na(s$latest_release_date), released = s$released,
+                        dep_list = s$dep_list, authors = s$authors, stringsAsFactors = FALSE),
+    api = walk$api[, c("version", "exports_added", "exports_removed", "n_exports")],
+    state = walk$state[, setdiff(.VERSION_STATE_COLS, "package")],
+    text_ok = s$version, class = class)
+}
+
+# The cross-version columns of `versions` in a summary or derived frame.
+.rg_xv <- function(df, versions, cols = .CROSS_VERSION_COLS) {
+  out <- df[match(versions, df$version), cols, drop = FALSE]
+  rownames(out) <- NULL
+  out
+}
+
+test_that("a skip on the fallback path carries the skipped versions' inputs into the package columns", {
+  .local_global("rpkg_analyzer_bin", function() "")
+  root <- withr::local_tempdir()
+  src <- .rg_source(root)
+  full <- analyze_package(src, "rgpkg")
+  date <- .RG_RELEASES[["2.0"]]$date
+
+  # Stored through 1.2: 1.0 to 1.2 are skipped and 2.0 is read.
+  to12 <- file.path(root, "to12", "rgpkg")
+  .rg_git(root, date, "clone", "-q", shQuote(src), shQuote(to12))
+  .rg_git(to12, date, "tag", "-d", "2.0")
+  res <- analyze_package(src, "rgpkg", prior = .rg_prior(analyze_package(to12, "rgpkg")))
+  expect_identical(res$skip$plan$read, c(FALSE, FALSE, FALSE, TRUE))
+  expect_identical(.rg_xv(res$summary, "2.0"), .rg_xv(full$summary, "2.0"))
+  old <- c("1.0", "1.1", "1.2")
+  expect_identical(.rg_xv(res$skip$derived, old), .rg_xv(full$summary, old))
+
+  # Stored whole with 1.0 unrecorded: 1.0 is read and the newest is skipped. The
+  # stand-in prior marks the newest scanned for datasets, which the fallback never does.
+  pr <- .rg_prior(full)
+  pr$state <- pr$state[pr$state$version != "1.0", ]
+  res <- analyze_package(src, "rgpkg", prior = pr)
+  expect_identical(res$skip$plan$read, c(TRUE, FALSE, FALSE, FALSE))
+  later <- c("1.1", "1.2", "2.0")
+  cols <- setdiff(.CROSS_VERSION_COLS, "datasets_scanned")
+  expect_identical(.rg_xv(res$skip$derived, later, cols), .rg_xv(full$summary, later, cols))
+})
+
 test_that("the cross-version columns need only the inputs a skipped version carries", {
   .local_global("rpkg_analyzer_bin", function() "")
   res <- .rg_analyze()

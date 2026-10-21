@@ -89,10 +89,12 @@
     params = list(pkg))
 }
 
-# The stub analyzer, reading `versions`, for the calling test.
-.vs_stub <- function(versions = names(.VST_RELEASES), frame = parent.frame()) {
+# The stub analyzer, reading `versions`, for the calling test. Each version's
+# dataset has a content of its own, so a link to the wrong one shows.
+.vs_stub <- function(versions = names(.VST_RELEASES), detail = FALSE, frame = parent.frame()) {
   withr::local_envvar(
     RPKG_ANALYZER_BIN = .stub_analyzer_bin(withr::local_tempdir(.local_envir = frame),
-                                           "0.4.0-test", reads = versions),
+                                           "0.4.0-test", reads = versions, detail = detail,
+                                           content_by_version = TRUE),
     .local_envir = frame)
 }

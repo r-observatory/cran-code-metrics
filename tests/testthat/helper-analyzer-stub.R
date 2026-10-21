@@ -27,9 +27,13 @@
 #'   RPKG_ANALYZER_STATS names, as a 0.5.1 build does.
 #' @param detail When TRUE, each read also emits one function record, one call
 #'   edge and a DESCRIPTION record carrying RoxygenNote.
+#' @param content_by_version When TRUE, the dataset's content_fp names the
+#'   version read, so each version links to a content of its own.
 .stub_analyzer_bin <- function(dir, version, reads = character(0L),
-                              input_kind = NULL, stats = FALSE, detail = FALSE) {
+                              input_kind = NULL, stats = FALSE, detail = FALSE,
+                              content_by_version = FALSE) {
   stub <- file.path(dir, "stub-analyzer.sh")
+  content <- if (isTRUE(content_by_version)) "cf-$v" else "cf"
   kind <- if (is.null(input_kind)) "" else
     sprintf(',\\"input_kind\\":\\"%s\\"', input_kind)
   stats_line <- if (isTRUE(stats)) {
@@ -53,7 +57,7 @@
       paste0('  echo "{\\"rec\\":\\"dataset\\",\\"name\\":\\"d\\",',
              '\\"file\\":\\"data/d.rda\\",\\"class\\":\\"data.frame\\",',
              '\\"kind\\":\\"table\\",\\"confidence\\":\\"exact\\",',
-             '\\"content_fp\\":\\"cf\\",\\"schema_fp\\":\\"sf\\"}"'),
+             '\\"content_fp\\":\\"', content, '\\",\\"schema_fp\\":\\"sf\\"}"'),
       detail_lines,
       stats_line,
       "  exit 0",

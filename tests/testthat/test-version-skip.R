@@ -511,8 +511,7 @@ test_that("--bootstrap and VERSION_SKIP off read every version and give a full w
 test_that("a shard that walks one package whole and skips versions of another writes both as full walks would", {
   .vst_local_run_env()
   # Detail records too, so both packages have latest text.
-  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_analyzer_bin(
-    withr::local_tempdir(), "0.4.0-test", reads = names(.VST_RELEASES), detail = TRUE))
+  .vs_stub(detail = TRUE)
   root <- withr::local_tempdir()
   src <- .vst_source(root, "vstpkg", c("1.0", "1.9", "1.10"))
   skip <- withr::local_tempdir(); full <- withr::local_tempdir()
@@ -677,9 +676,7 @@ test_that("moved, deleted, out-of-class and requeued versions give a full walk's
   for (p in pkgs) expect_identical(.vs_rows(skip, p), .vs_rows(full, p), info = p)
 })
 test_that("a new newest replaces the previous newest's functions and edges, its vignettes' is_current and the package's churn", {
-  .vst_local_run_env()
-  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_analyzer_bin(
-    withr::local_tempdir(), "0.4.0-test", reads = names(.VST_RELEASES), detail = TRUE))
+  .vst_local_run_env(); .vs_stub(detail = TRUE)
   root <- withr::local_tempdir()
   src <- .vst_source(root, "vstpkg", character(0L))
   dir.create(file.path(src, "vignettes"))
@@ -689,11 +686,17 @@ test_that("a new newest replaces the previous newest's functions and edges, its 
   skip <- withr::local_tempdir()
   .vs_run(skip, root, c(vstpkg = "1.10"))
   current <- function(out) {
+    data_con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DATA_DB_FILENAME))
+    on.exit(DBI::dbDisconnect(data_con))
     c(fns = .vst_query(out, "SELECT DISTINCT version FROM cran_functions")$version,
       edges = .vst_query(out, "SELECT DISTINCT version FROM cran_call_edges")$version,
-      vignettes = .vst_query(out, "SELECT version FROM cran_vignettes WHERE is_current = 1")$version)
+      vignettes = .vst_query(out, "SELECT version FROM cran_vignettes WHERE is_current = 1")$version,
+      dataset = DBI::dbGetQuery(data_con, paste(
+        "SELECT c.content_fp FROM cran_datasets d JOIN cran_dataset_contents c",
+        "ON c.content_id = d.current_content_id"))$content_fp)
   }
-  expect_identical(current(skip), c(fns = "1.10", edges = "1.10", vignettes = "1.10"))
+  expect_identical(current(skip), c(fns = "1.10", edges = "1.10", vignettes = "1.10",
+                                    dataset = "cf-1.10"))
   expect_identical(.vst_query(skip, "SELECT COUNT(*) n FROM cran_vignettes")$n, 3L)
   full <- .vs_copy(skip)
   .vst_release(src, "vstpkg", "2.0")
@@ -702,7 +705,8 @@ test_that("a new newest replaces the previous newest's functions and edges, its 
   expect_identical(.vs_versions_read(skip), 1L)
   expect_identical(.vst_query(skip, "SELECT DISTINCT version FROM cran_functions")$version, "2.0")
   expect_identical(.vst_query(skip, "SELECT DISTINCT version FROM cran_vignettes WHERE is_current = 1")$version, "2.0")
-  expect_identical(current(skip), c(fns = "2.0", edges = "2.0", vignettes = "2.0"))
+  expect_identical(current(skip), c(fns = "2.0", edges = "2.0", vignettes = "2.0",
+                                    dataset = "cf-2.0"))
   expect_true("2.0" %in% .vst_query(skip, "SELECT DISTINCT version FROM cran_code_churn")$version)
   expect_identical(.vs_rows(skip, "vstpkg"), .vs_rows(full, "vstpkg"))
 })

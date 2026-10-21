@@ -9,13 +9,30 @@
   .vst_run(out_dir, root, latest, ...)
 }
 
-# .package_rows() without the columns a run stamps with its own time or
-# numbering, each frame ordered by the columns it keeps.
+# The profile_fp each dataset content id of out_dir links to, named by id.
+.vs_profiles <- function(out_dir) {
+  path <- file.path(out_dir, DATA_DB_FILENAME)
+  if (!file.exists(path)) return(character(0L))
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con))
+  if (!"cran_dataset_contents" %in% DBI::dbListTables(con)) return(character(0L))
+  ids <- DBI::dbGetQuery(con, "SELECT content_id, profile_fp FROM cran_dataset_contents")
+  stats::setNames(ids$profile_fp, ids$content_id)
+}
+
+# .package_rows() without the columns a run stamps with its own time, each
+# content id read as the profile it links to (the ids are row numbers), and
+# each frame ordered by the columns it keeps.
 .vs_rows <- function(out_dir, pkg) {
   rows <- .package_rows(out_dir, pkg)
+  fp <- .vs_profiles(out_dir)
   lapply(rows, function(df) {
-    df <- df[, setdiff(names(df), c("read_at", "assessed_at", "last_attempt", "content_id",
-                                    "current_content_id")), drop = FALSE]
+    for (cn in intersect(c("content_id", "current_content_id"), names(df))) {
+      id <- as.character(df[[cn]])
+      df[[cn]] <- ifelse(is.na(id), NA_character_,
+                         ifelse(id %in% names(fp), unname(fp[id]), paste("no content", id)))
+    }
+    df <- df[, setdiff(names(df), c("read_at", "assessed_at", "last_attempt")), drop = FALSE]
     df <- df[do.call(order, unname(as.list(df))), , drop = FALSE]
     rownames(df) <- NULL
     df

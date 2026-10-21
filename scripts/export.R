@@ -1904,6 +1904,8 @@ upsert_versions <- function(con, summary_df, derived_df, churn_df, api_df,
     stop("upsert_versions() needs state_df, the state rows of the versions it writes",
          call. = FALSE)
   }
+  # NULL keys would replace nothing and append beside the stored rows.
+  stopifnot(is.data.frame(row_keys), is.data.frame(api_keys))
   pkgs        <- names(newest)
   latest_pkgs <- as.character(latest_pkgs)
   of_latest   <- function(df) if (!is.null(df)) df[df$package %in% latest_pkgs, , drop = FALSE]
@@ -1991,6 +1993,8 @@ upsert_datasets <- function(data_con, datasets_df, pkgs) {
 #' @param latest_pkgs The packages whose newest version was read.
 #' @return invisible(NULL)
 upsert_dataset_versions <- function(data_con, datasets_df, row_keys, newest, latest_pkgs) {
+  # NULL keys would replace each package's links whole.
+  stopifnot(is.data.frame(row_keys))
   DBI::dbWithTransaction(data_con, {
     .write_datasets_normalized(data_con, datasets_df, names(newest),
                                row_keys = row_keys, latest_pkgs = latest_pkgs)

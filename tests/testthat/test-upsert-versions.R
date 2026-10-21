@@ -354,6 +354,17 @@ test_that("a per-version write needs its state rows", {
   expect_identical(fx$all_rows(), before)
 })
 
+test_that("a per-version write needs its row and API keys, and writes nothing without them", {
+  fx <- .uv_fixture()
+  before <- fx$all_rows()
+  args <- .uv_newest_read()
+  expect_error(.uv_write(fx, c(args[setdiff(names(args), "row_keys")], list(row_keys = NULL))),
+               "is.data.frame\\(row_keys\\)")
+  expect_error(.uv_write(fx, c(args[setdiff(names(args), "api_keys")], list(api_keys = NULL))),
+               "is.data.frame\\(api_keys\\)")
+  expect_identical(fx$all_rows(), before)
+})
+
 test_that("a per-version write that fails leaves every table as it was", {
   fx <- .uv_fixture()
   before <- fx$all_rows()
@@ -392,6 +403,16 @@ test_that("upsert_dataset_versions replaces the links of the versions read or go
   expect_identical(fx$current_link_versions(), "1.2")
   expect_identical(fx$identity(), before_identity)
   expect_identical(before_identity$current_version, "1.2")
+})
+
+test_that("a dataset write without row keys stops and deletes no link", {
+  fx <- .uv_fixture()
+  before_links <- fx$links()
+  expect_error(upsert_dataset_versions(fx$dcon, .uv_datasets("1.3", "cf4", 1),
+                                       row_keys = NULL, newest = c(p = "1.3"),
+                                       latest_pkgs = "p"),
+               "is.data.frame\\(row_keys\\)")
+  expect_identical(fx$links(), before_links)
 })
 
 test_that("the version helpers do nothing on a missing table or no keys", {

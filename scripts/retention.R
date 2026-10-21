@@ -64,7 +64,9 @@
     list(path = "n_versions",                min_ratio = 0.999, max_loss = 250),
     # upsert_shard deletes ALL of a re-analysed package's detail rows and
     # re-inserts only its latest version's, so a release that removed functions
-    # lowers the corpus total with nothing wrong. Worst measured: -0.053%
+    # lowers the corpus total with nothing wrong. A package that skips versions
+    # replaces detail rows only for the versions it read, which deletes fewer
+    # rows; the floors stay. Worst measured: -0.053%
     # (cran_functions) and -0.022% (cran_call_edges) on 2026-07-24. 2% is 37x
     # that and ~4x the largest one-day movement in either direction (+0.53%).
     # These are also the tables force_full does NOT wipe, which is what tells a

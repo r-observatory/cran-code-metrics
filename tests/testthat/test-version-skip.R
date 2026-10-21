@@ -802,3 +802,128 @@ test_that("a package read for a backfill marker leaves the queue", {
   .vs_run(out, root, c(vstpkg = "1.10"))
   expect_identical(jsonlite::fromJSON(file.path(out, "run-status.json"))$n_shard, 0L)
 })
+
+# ---- What a run says about the skip ----------------------------------------------
+
+test_that("the version skip line counts versions read by reason, diffs redone and the packages passed in as reading nothing", {
+  plans <- list(
+    a = data.frame(version = c("1", "2", "3"), read = c(FALSE, FALSE, TRUE),
+                   reason = c(NA, NA, "new"), pred_changed = FALSE),
+    b = data.frame(version = c("1", "2"), read = c(TRUE, FALSE), reason = c("moved", NA),
+                   pred_changed = c(FALSE, TRUE)),
+    c = data.frame(version = "1", read = FALSE, reason = NA_character_, pred_changed = FALSE))
+  expect_identical(.version_skip_line(plans, 1L),
+    "version skip: read 2 of 6 listed versions (new 1, moved 1); diffs redone: 1; queued with nothing read: 1")
+  expect_identical(.version_skip_line(list(), 0L),
+    "version skip: read 0 of 0 listed versions (none); diffs redone: 0; queued with nothing read: 0")
+})
+test_that("a plan that reads nothing is not counted as queued with nothing read unless the caller says so", {
+  gone_only <- list(a = data.frame(version = "1", read = FALSE, reason = NA_character_,
+                                   pred_changed = FALSE))
+  expect_match(.version_skip_line(gone_only, 0L), "queued with nothing read: 0$")
+})
+test_that("the version skip line lists reasons in rule order", {
+  plans <- list(a = data.frame(version = c("1", "2", "3", "4"), read = TRUE,
+                               reason = c("text", "moved", "new", "detail"),
+                               pred_changed = FALSE))
+  expect_match(.version_skip_line(plans, 0L), "(new 1, moved 1, detail 1, text 1)", fixed = TRUE)
+})
+
+# Two packages, each with its newest read; apkg then gets a second latest row and
+# bpkg a current dataset link on a version that is not its newest.
+.vs_invariants_dbs <- function(frame = parent.frame()) {
+  root <- withr::local_tempdir(.local_envir = frame)
+  .vst_source(root, "apkg", c("1.0", "1.9"))
+  .vst_source(root, "bpkg", c("1.0", "1.9"))
+  out <- withr::local_tempdir(.local_envir = frame)
+  .vs_run(out, root, c(apkg = "1.9", bpkg = "1.9"))
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  data_con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DATA_DB_FILENAME))
+  withr::defer({ DBI::dbDisconnect(con); DBI::dbDisconnect(data_con) }, envir = frame)
+  list(con = con, data_con = data_con)
+}
+
+test_that("the invariants are clean after a run", {
+  .vst_local_run_env(); .vs_stub()
+  d <- .vs_invariants_dbs()
+  expect_identical(.version_skip_invariants(d$con, d$data_con, c("apkg", "bpkg")),
+                   c(latest_off = 0L, current_off = 0L))
+})
+test_that("the invariants find a second latest row and a current row off the newest", {
+  .vst_local_run_env(); .vs_stub()
+  d <- .vs_invariants_dbs()
+  DBI::dbExecute(d$con, "UPDATE cran_code_summary SET latest_release_date = '2026-01-01'
+                          WHERE package = 'apkg' AND version = '1.0'")
+  expect_identical(DBI::dbGetQuery(d$data_con, "SELECT COUNT(*) n FROM cran_dataset_versions
+                                                 WHERE package = 'bpkg' AND version = '1.0'")$n > 0L, TRUE)
+  DBI::dbExecute(d$data_con, "UPDATE cran_dataset_versions SET is_current = 1
+                               WHERE package = 'bpkg' AND version = '1.0'")
+  expect_identical(.version_skip_invariants(d$con, d$data_con, c("apkg", "bpkg")),
+                   c(latest_off = 1L, current_off = 1L))
+  expect_identical(.version_skip_invariants(d$con, d$data_con, "bpkg"),
+                   c(latest_off = 0L, current_off = 1L))
+  expect_identical(.version_skip_invariants(d$con, d$data_con, "apkg"),
+                   c(latest_off = 1L, current_off = 0L))
+})
+test_that("a vignette current row off the newest is counted", {
+  .vst_local_run_env(); .vs_stub()
+  d <- .vs_invariants_dbs()
+  DBI::dbExecute(d$con, "INSERT INTO cran_vignettes (package, version, is_current)
+                          VALUES ('apkg', '1.0', 1)")
+  expect_identical(.version_skip_invariants(d$con, d$data_con, "apkg")[["current_off"]], 1L)
+})
+test_that("no packages written means no invariants broken", {
+  .vst_local_run_env(); .vs_stub()
+  d <- .vs_invariants_dbs()
+  expect_identical(.version_skip_invariants(d$con, d$data_con, character(0L)),
+                   c(latest_off = 0L, current_off = 0L))
+})
+
+test_that("a skip run prints the version skip line and its invariants", {
+  .vst_local_run_env(); .vs_stub()
+  root <- withr::local_tempdir()
+  src <- .vst_source(root, "vstpkg", c("1.0", "1.9", "1.10"))
+  out <- withr::local_tempdir()
+  .vs_run(out, root, c(vstpkg = "1.10"))
+  .vst_release(src, "vstpkg", "2.0")
+  log <- attr(.vs_run(out, root, c(vstpkg = "2.0")), "log")
+  expect_true(any(grepl("^version skip: read 1 of 4 listed versions \\(new 1\\); diffs redone: 0; queued with nothing read: 0$", log)))
+  expect_true(any(grepl("^version skip invariants: 0 of 1 written packages with other than one latest row, 0 with current rows off the newest$", log)))
+  i <- grep("^worker time:", log)
+  expect_identical(grep("^version skip: ", log), i + 1L)
+})
+test_that("a package queued with nothing read is counted on the skip line and has no written package", {
+  .vst_local_run_env(); .vs_stub()
+  root <- withr::local_tempdir()
+  .vst_source(root, "vstpkg", c("1.0", "1.9", "1.10"))
+  out <- withr::local_tempdir()
+  .vs_run(out, root, c(vstpkg = "1.10"))
+  log <- attr(.vs_run(out, root, c(vstpkg = "2.0")), "log")
+  expect_true(any(grepl("^version skip: read 0 of 3 listed versions \\(none\\); diffs redone: 0; queued with nothing read: 1$", log)))
+  expect_true(any(grepl("^version skip invariants: 0 of 0 written packages", log)))
+})
+test_that("a run with the skip off prints no version skip lines", {
+  .vst_local_run_env(); .vs_stub()
+  root <- withr::local_tempdir()
+  .vst_source(root, "vstpkg", c("1.0", "1.9"))
+  out <- withr::local_tempdir()
+  log <- attr(.vs_run(out, root, c(vstpkg = "1.9"), skip = FALSE), "log")
+  expect_false(any(grepl("^version skip", log)))
+})
+test_that("the code manifest and run status carry both invariants, the data manifest does not", {
+  .vst_local_run_env(); .vs_stub()
+  root <- withr::local_tempdir()
+  .vst_source(root, "vstpkg", c("1.0", "1.9"))
+  out <- withr::local_tempdir()
+  .local_global(".version_skip_invariants", function(con, data_con, pkgs) c(latest_off = 3L, current_off = 2L))
+  .vs_run(out, root, c(vstpkg = "1.9"))
+  b <- jsonlite::fromJSON(file.path(out, "code-manifest.json"))$bootstrap
+  expect_identical(c(b$latest_off, b$current_off), c(3L, 2L))
+  rs <- jsonlite::fromJSON(file.path(out, "run-status.json"))
+  expect_identical(c(rs$latest_off, rs$current_off), c(3L, 2L))
+  for (f in c("data-manifest.json", "text-manifest.json")) {
+    b <- jsonlite::fromJSON(file.path(out, f))$bootstrap
+    expect_null(b$latest_off)
+    expect_null(b$current_off)
+  }
+})

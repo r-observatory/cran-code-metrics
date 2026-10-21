@@ -1356,6 +1356,51 @@ ANALYZER_PEAKS_KEPT <- 5L
           p$clone_s, p$extract_s, p$analyzer_s, p$parse_s, p$metrics_s, p$other_s)
 }
 
+# The reasons a version is read, in the order the rules ask them.
+.SKIP_REASONS <- c("all", "new", "unrecorded", "moved", "tree", "class",
+                   "generation", "metrics", "detail", "newest", "text")
+
+# The shard's skip for the run log: versions read by reason, diffs redone, and
+# the packages queued with nothing read (counted by the caller, as a plan that
+# reads nothing can still write a gone version or a redone diff).
+.version_skip_line <- function(plans, n_nothing_read) {
+  all_plans <- do.call(rbind, c(list(data.frame(
+    version = character(0L), read = logical(0L), reason = character(0L),
+    pred_changed = logical(0L))), unname(plans)))
+  reasons <- all_plans$reason[all_plans$read]
+  counts <- vapply(.SKIP_REASONS, function(r) sum(reasons %in% r), integer(1L))
+  counts <- counts[counts > 0L]
+  sprintf("version skip: read %d of %d listed versions (%s); diffs redone: %d; queued with nothing read: %d",
+          sum(all_plans$read), nrow(all_plans),
+          if (length(counts)) paste(names(counts), counts, collapse = ", ") else "none",
+          sum(all_plans$pred_changed), as.integer(n_nothing_read))
+}
+
+# Packages among `pkgs` whose summary rows carry other than one latest row, and
+# those with a current dataset link or vignette off the version that carries it.
+.version_skip_invariants <- function(con, data_con, pkgs) {
+  out <- c(latest_off = 0L, current_off = 0L)
+  pkgs <- as.character(pkgs)
+  if (length(pkgs) == 0L || !SUMMARY_TABLE %in% DBI::dbListTables(con) ||
+      !"latest_release_date" %in% DBI::dbListFields(con, SUMMARY_TABLE)) return(out)
+  ph <- paste(rep("?", length(pkgs)), collapse = ",")
+  latest <- DBI::dbGetQuery(con, sprintf(
+    'SELECT package, version FROM "%s" WHERE latest_release_date IS NOT NULL AND package IN (%s)',
+    SUMMARY_TABLE, ph), params = as.list(pkgs))
+  out[["latest_off"]] <- sum(table(factor(latest$package, levels = pkgs)) != 1L)
+  off <- character(0L)
+  for (spec in list(list(con, "cran_vignettes"), list(data_con, "cran_dataset_versions"))) {
+    if (!spec[[2L]] %in% DBI::dbListTables(spec[[1L]])) next
+    cur <- DBI::dbGetQuery(spec[[1L]], sprintf(
+      'SELECT DISTINCT package, version FROM "%s" WHERE is_current = 1 AND package IN (%s)',
+      spec[[2L]], ph), params = as.list(pkgs))
+    keys <- paste(cur$package, cur$version, sep = "\r")
+    off <- c(off, cur$package[!keys %in% paste(latest$package, latest$version, sep = "\r")])
+  }
+  out[["current_off"]] <- length(unique(off))
+  out
+}
+
 # ---------------------------------------------------------------------------
 # run_update
 # ---------------------------------------------------------------------------
@@ -1932,8 +1977,15 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   telemetry <- .shard_telemetry(results)
   cat(.analyzer_stats_line(telemetry$analyzer), "\n",
       .analyzer_memory_line(telemetry$analyzer), "\n",
-      .worker_phase_line(telemetry$phases), "\n",
-      .worker_memory_line(telemetry$workers), "\n", sep = "", file = stdout())
+      .worker_phase_line(telemetry$phases), "\n", sep = "", file = stdout())
+  skip_invariants <- .version_skip_invariants(con, data_con, fresh_pkgs)
+  if (skip_on) {
+    cat(.version_skip_line(shard_plans, n_nothing_read), "\n",
+        sprintf("version skip invariants: %d of %d written packages with other than one latest row, %d with current rows off the newest",
+                skip_invariants[["latest_off"]], length(fresh_pkgs), skip_invariants[["current_off"]]),
+        "\n", sep = "", file = stdout())
+  }
+  cat(.worker_memory_line(telemetry$workers), "\n", sep = "", file = stdout())
 
   # ---- 8b. Shard receipt ----------------------------------------------------
   # One-line closing summary, printed after the collection loop and before the
@@ -2006,6 +2058,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                     output_class = I(output_class),
                     n_latest_on_build = .n_latest_on_class(con, analyzer_version)[["on_class"]],
                     n_versions_unrecorded = .n_versions_unrecorded(con),
+                    latest_off = skip_invariants[["latest_off"]],
+                    current_off = skip_invariants[["current_off"]],
                     parked = verdict_counts$parked,
                     failed_this_run = verdict_counts$failed_this_run,
                     over_cap_ok = verdict_counts$over_cap_ok,
@@ -2087,6 +2141,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       output_class = bootstrap$output_class,
                       n_latest_on_build = bootstrap$n_latest_on_build,
                       n_versions_unrecorded = bootstrap$n_versions_unrecorded,
+                      latest_off = bootstrap$latest_off,
+                      current_off = bootstrap$current_off,
                       failed_by_stage = .stage_counts(shard_stages),
                       parked = verdict_counts$parked,
                       failed_this_run = verdict_counts$failed_this_run,

@@ -5,17 +5,21 @@
 # still flagged: it catches the cap before the retry can see it.
 
 .HANDLER_ALLOWLIST <- data.frame(
-  file = c("analyze.R", "analyze.R", "update.R", "update.R", "update.R"),
-  fn   = c("analyze_package", ".xv_json_token", ".done", ".pkg_worker", ".pkg_worker"),
-  call = c("try", "tryCatch", "try", "tryCatch", "tryCatch"),
-  expr = c(NA, NA, NA, "io$clone(pkg, dest)",
+  file = c("analyze.R", "analyze.R", "git.R", "update.R", "update.R", "update.R", "update.R"),
+  fn   = c("analyze_package", ".xv_json_token", "add_transit_versions", ".done", ".pkg_worker",
+           ".pkg_worker", ".pkg_worker"),
+  call = c("try", "tryCatch", "tryCatch", "try", "tryCatch", "tryCatch", "tryCatch"),
+  expr = c(NA, NA, ".add_transit_version(repo, row, fetch)", NA, "io$clone(pkg, dest)",
+           "add_transit_versions(dest, transit_of[[pkg]])",
            paste0("analyze_package(dest, pkg, stamped = stamped_of[[pkg]] %||% character(0L),\n",
-                  "                      limit = analyzer_limit, prior = prior_of[[pkg]])")),
+                  "                      limit = analyzer_limit, prior = prior_of[[pkg]], refs = refs)")),
   reason = c(
     "the per-version heartbeat only prints a progress line",
     "reached only from the parent's author span projection in export.R, where no cap is armed",
+    "it raises every error again, and a cap that fires as itself",
     "the worker's completion line only prints",
     "the clone is the worker's first step and ends by GIT_TIMEOUT, before the cap can fire",
+    "a Transit version that cannot be added fails the fetch, and a cap that fires is a timeout",
     "this is where the package's verdict is made"),
   stringsAsFactors = FALSE)
 
@@ -37,7 +41,7 @@ test_that("every allowlisted handler is still there, exactly once", {
 
 test_that("the scan sees every wrapped handler, so it cannot pass by reading nothing", {
   inv <- .worker_handler_inventory()
-  expect_identical(attr(inv, "n_retry"), 41L)
+  expect_identical(attr(inv, "n_retry"), 42L)
   expect_identical(sum(inv$flagged), nrow(.HANDLER_ALLOWLIST))
 })
 

@@ -2,6 +2,9 @@
 # Source this first; all other scripts assume these are defined.
 
 CRAN_GIT_BASE <- "https://github.com/cran"
+# Versions CRAN served from src/contrib/Transit and deleted when they were
+# replaced, so no mirror tag holds them, with a pinned copy of each.
+TRANSIT_VERSIONS_FILE <- file.path("scripts", "transit-versions.csv")
 PUBLISH_REPO  <- "r-observatory/cran-code-metrics"
 DB_FILENAME   <- "cran-code-metrics.db"
 DATA_DB_FILENAME <- "cran-data-metrics.db"

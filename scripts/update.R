@@ -1026,6 +1026,27 @@
   sort(as.character(pkgs))
 }
 
+#' Packages with a listed Transit version that has no summary row, restricted to
+#' the current universe and excluding the packages the caller names.
+#'
+#' @param transit read_transit_versions() rows, or NULL.
+.transit_todo <- function(con, transit, universe_pkgs, skip_pkgs) {
+  if (is.null(transit) || nrow(transit) == 0L) return(character(0L))
+  want <- transit[transit$package %in% as.character(universe_pkgs) &
+                    !transit$package %in% skip_pkgs, , drop = FALSE]
+  if (nrow(want) == 0L) return(character(0L))
+  stored <- if (SUMMARY_TABLE %in% DBI::dbListTables(con)) {
+    pkgs <- unique(want$package)
+    DBI::dbGetQuery(con, sprintf(
+      'SELECT package, version FROM "%s" WHERE package IN (%s)', SUMMARY_TABLE,
+      paste(rep("?", length(pkgs)), collapse = ",")), params = as.list(pkgs))
+  } else {
+    data.frame(package = character(0L), version = character(0L))
+  }
+  have <- paste(stored$package, stored$version, sep = "\r")
+  sort(unique(want$package[!paste(want$package, want$version, sep = "\r") %in% have]))
+}
+
 # ---------------------------------------------------------------------------
 # default_io
 # ---------------------------------------------------------------------------
@@ -1035,6 +1056,7 @@
 #' @return A list with:
 #'   \item{package_list}{function() -> data.frame(package, latest_version)}
 #'   \item{clone}{function(pkg, dest) -> logical}
+#'   \item{transit_versions}{function() -> read_transit_versions()}
 default_io <- function() {
   list(
     package_list = function() {
@@ -1082,7 +1104,9 @@ default_io <- function() {
 
     clone = function(pkg, dest) {
       clone_package(pkg, dest, token = Sys.getenv("GITHUB_TOKEN", ""))
-    }
+    },
+
+    transit_versions = function() read_transit_versions(TRANSIT_VERSIONS_FILE)
   )
 }
 
@@ -1426,7 +1450,8 @@ ANALYZER_PEAKS_KEPT <- 5L
 #' analyzer build, its release or WORKER_TIMEOUT changes, or an operator
 #' releases it.
 #'
-#' @param io         IO interface: list with $package_list() and $clone().
+#' @param io         IO interface: list with $package_list() and $clone(), and
+#'   $transit_versions() when CRAN Transit versions are to be read.
 #'   Use default_io() for production; inject a fake for tests.
 #' @param out_dir    Directory to read prior DB from and write outputs to.
 #' @param shard_size Maximum packages to analyze in this run.
@@ -1533,6 +1558,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                            stringsAsFactors = FALSE)
   }
   n_universe <- nrow(universe)
+  # CRAN's Transit versions, which the worker commits onto their base tags.
+  transit    <- if (is.function(io$transit_versions)) io$transit_versions()
+  transit_of <- if (is.null(transit)) list() else split(transit, transit$package)
 
   # ---- 4. Permanent failures: exclude from to-do ----------------------------
   verdicts       <- .verdict_state(con, analyzer_version, WORKER_TIMEOUT, universe)
@@ -1617,7 +1645,12 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     dataset_backfill <- .recollect_todo(
       con, universe$package, c(skip_pkgs, unread_pkgs),
       sentinel = "datasets_scanned", latest_only = TRUE)
-    todo_pkgs <- sort(unique(c(changed, backfill, detail_backfill, dataset_backfill)))
+    # And any package with a listed Transit version that has no row yet, an
+    # archived one included. Once the row is stored the listing queues it no more.
+    transit_todo <- .transit_todo(con, transit, universe$package, skip_pkgs)
+    message(sprintf("packages with a Transit version to read: %d", length(transit_todo)))
+    todo_pkgs <- sort(unique(c(changed, backfill, detail_backfill, dataset_backfill,
+                               transit_todo)))
   }
 
   # Take the first shard_size packages from the to-do list (deterministic order).
@@ -1734,10 +1767,16 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     ok <- tryCatch(io$clone(pkg, dest),
                    error = function(e) structure(FALSE, reason = conditionMessage(e)))
     if (!isTRUE(ok)) return(.fail(.clone_stage(ok), .clone_reason(ok)))
+    # A Transit version that cannot be added fails the fetch, and the stored rows stand.
+    refs <- tryCatch(add_transit_versions(dest, transit_of[[pkg]]), error = function(e) e)
+    if (inherits(refs, "error")) {
+      return(.fail(if (inherits(refs, "transit_failure")) "clone"
+                   else .classify_failure(refs, .elapsed()), conditionMessage(refs)))
+    }
     err <- NULL
     res <- tryCatch(
       analyze_package(dest, pkg, stamped = stamped_of[[pkg]] %||% character(0L),
-                      limit = analyzer_limit, prior = prior_of[[pkg]]),
+                      limit = analyzer_limit, prior = prior_of[[pkg]], refs = refs),
       error = function(e) {
         err <<- e
         NULL
@@ -2548,6 +2587,7 @@ if (identical(sys.nframe(), 0L)) {
   source(file.path(.script_dir, "export.R"))
   source(file.path(.script_dir, "release_text.R"))
   source(file.path(.script_dir, "retention.R"))
+  TRANSIT_VERSIONS_FILE <- file.path(.script_dir, "transit-versions.csv")
 
   args <- commandArgs(trailingOnly = TRUE)
 

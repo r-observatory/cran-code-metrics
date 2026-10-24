@@ -1,0 +1,9 @@
+package,version,base_version,released,url,sha256
+Rcpp,1.1.1-1,1.1.1,2026-04-15T19:04:53Z,https://packagemanager.posit.co/cran/2026-04-20/src/contrib/Archive/Rcpp/Rcpp_1.1.1-1.tar.gz,f7fa3e371a2a16f190a46d9699b4539238915088a17d68d93e5fc2e7e19c288c
+S7,0.2.1-1,0.2.1,2026-04-15T19:04:53Z,https://packagemanager.posit.co/cran/2026-04-20/src/contrib/Archive/S7/S7_0.2.1-1.tar.gz,fa3a255a4d6bed632f383fde59c353efcef0333a75b21a4bba00cba458650d87
+pak,0.9.3-1,0.9.3,2026-04-15T19:04:53Z,https://packagemanager.posit.co/cran/2026-04-17/src/contrib/Archive/pak/pak_0.9.3-1.tar.gz,71e55a0e3353c25b54e69df1cf1b3ce694a4e6301030f482cf671323c163d9c9
+QuickJSR,1.9.1-2,1.9.1,2026-04-15T19:04:53Z,https://packagemanager.posit.co/cran/2026-04-17/src/contrib/Archive/QuickJSR/QuickJSR_1.9.1-2.tar.gz,9b07519bd086064f1283a390b3b3a313427506cd9082e9bba61af016e349bd35
+phutil,0.0.1-2,0.0.1,2026-04-15T19:04:53Z,https://packagemanager.posit.co/cran/2026-04-17/src/contrib/Archive/phutil/phutil_0.0.1-2.tar.gz,7b9621325e70af8f4e5243db5ada2f1a460e971f4ba3edf884c82f1e3d740c96
+IP,0.1.6-1,0.1.6,2026-04-15T19:04:53Z,https://packagemanager.posit.co/cran/2026-04-20/src/contrib/Archive/IP/IP_0.1.6-1.tar.gz,73ba36be94316fd602219abad1757babbadfcd58019b9405785f8643585699fe
+dsdp,0.1.1-1,0.1.1,2026-04-15T19:04:53Z,https://packagemanager.posit.co/cran/2026-04-20/src/contrib/Archive/dsdp/dsdp_0.1.1-1.tar.gz,7a63865b49c677e9175788990af0d658aacc88c4d03dfc8c0489b477117acfec
+precondition,0.1.0-1,0.1.0,2026-04-15T19:04:53Z,https://packagemanager.posit.co/cran/2026-04-20/src/contrib/Archive/precondition/precondition_0.1.0-1.tar.gz,5a76d97b85500cfc0009dcf92efd3358563c2dfb4d7a102280253512d8b89089

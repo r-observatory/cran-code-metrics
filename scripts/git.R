@@ -232,13 +232,15 @@ extract_version <- function(repo, ref, dest, paths = character(0L)) {
 #' Binary files for which numstat reports "-" are recorded with NA added/deleted.
 #'
 #' @param repo  Path to a local git repository.
+#' @param refs  Tags whose commits HEAD does not reach (add_transit_versions),
+#'   logged with HEAD so their churn against their base is recorded too.
 #' @return data.frame(commit, version, file, added, deleted).
 #'   commit  - full SHA (character)
 #'   version - version string parsed from subject, or NA_character_
 #'   file    - repository-relative file path
 #'   added   - integer lines added, NA for binary files
 #'   deleted - integer lines deleted, NA for binary files
-package_churn <- function(repo) {
+package_churn <- function(repo, refs = character(0L)) {
   empty <- data.frame(
     commit  = character(0L), version = character(0L),
     file    = character(0L), added   = integer(0L),  deleted = integer(0L),
@@ -254,7 +256,8 @@ package_churn <- function(repo) {
     system2("git",
             c("-C", repo, "log", "--numstat",
               "--format=__C__%H%x09%ai%x09%s",
-              "--diff-filter=ACMRD"),
+              "--diff-filter=ACMRD",
+              if (length(refs)) c("HEAD", shQuote(paste0("refs/tags/", refs)))),
             stdout = TRUE, stderr = FALSE, timeout = GIT_TIMEOUT)
   )
   if (length(raw) == 0L) return(empty)
@@ -328,4 +331,174 @@ read_at <- function(repo, ref, path) {
   if (length(out) == 0L || identical(out, character(0L))) return("")
   if (!is.null(attr(out, "status")) && attr(out, "status") != 0L) return("")
   paste(out, collapse = "\n")
+}
+
+# ---------------------------------------------------------------------------
+# CRAN Transit versions
+# ---------------------------------------------------------------------------
+
+.TRANSIT_COLS <- c("package", "version", "base_version", "released", "url", "sha256")
+
+#' The CRAN Transit versions listed in `path`, one row each.
+#'
+#' CRAN served these from src/contrib/Transit and deleted each when it was
+#' replaced, so the mirror never tagged them and CRAN's archive does not hold
+#' them. Each row names the mirror tag it follows, when CRAN listed it, and a
+#' copy pinned by its SHA-256.
+#'
+#' @param path The listing, a CSV file with the columns of .TRANSIT_COLS.
+#' @return data.frame with .TRANSIT_COLS, all character. A missing column, a
+#'   malformed checksum or date stops the run rather than drop a version.
+read_transit_versions <- function(path = TRANSIT_VERSIONS_FILE) {
+  df <- utils::read.csv(path, colClasses = "character", stringsAsFactors = FALSE,
+                        strip.white = TRUE)
+  missing <- setdiff(.TRANSIT_COLS, names(df))
+  if (length(missing)) {
+    stop(sprintf("%s lacks the column(s) %s", path, paste(missing, collapse = ", ")),
+         call. = FALSE)
+  }
+  df <- df[.TRANSIT_COLS]
+  bad <- !grepl("^[0-9a-f]{64}$", df$sha256) |
+    is.na(as.POSIXct(df$released, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"))
+  if (any(bad)) {
+    stop(sprintf("%s: malformed checksum or date for %s", path,
+                 paste(df$package[bad], df$version[bad], collapse = ", ")), call. = FALSE)
+  }
+  rownames(df) <- NULL
+  df
+}
+
+# The condition a Transit version that cannot be added raises, naming it.
+.transit_failure <- function(row, what) {
+  structure(
+    class = c("transit_failure", "error", "condition"),
+    list(message = sprintf("CRAN Transit version %s %s: %s", row$package, row$version, what),
+         call = NULL))
+}
+
+#' Download a Transit version's copy, with linear backoff.
+#' @return TRUE only when a non-empty file lands at destfile.
+.fetch_transit_tarball <- function(url, destfile, tries = 3L, sleep = 2) {
+  for (attempt in seq_len(tries)) {
+    ok <- .retry_after_time_limit({
+      suppressWarnings(utils::download.file(url, destfile, mode = "wb", quiet = TRUE))
+      file.exists(destfile) && file.info(destfile)$size > 0
+    }, error = function(e) FALSE)
+    if (isTRUE(ok)) return(TRUE)
+    if (attempt < tries) Sys.sleep(sleep * attempt)
+  }
+  FALSE
+}
+
+# git in `repo`, its stdout as lines; NULL when it exits non-zero.
+.git_lines <- function(repo, args, ...) {
+  out <- suppressWarnings(system2("git", c("-C", shQuote(repo), args), stdout = TRUE,
+                                  stderr = FALSE, timeout = GIT_TIMEOUT, ...))
+  if (!is.null(attr(out, "status")) && attr(out, "status") != 0L) return(NULL)
+  out
+}
+
+#' The tree of a source tarball's <package>/ directory, written into `repo`.
+#'
+#' Every file goes in as its bytes, with no filter, so a .gitignore or
+#' .gitattributes inside the tarball drops or rewrites nothing.
+.transit_tree <- function(repo, row, tarball, work) {
+  ex <- file.path(work, "x")
+  dir.create(ex)
+  rc <- suppressWarnings(system2("tar", c("-xzf", shQuote(tarball), "-C", shQuote(ex)),
+                                 stdout = FALSE, stderr = FALSE, timeout = GIT_TIMEOUT))
+  if (!identical(rc, 0L)) stop(.transit_failure(row, sprintf("tar exited %d", rc)))
+  if (!identical(list.files(ex, all.files = TRUE, no.. = TRUE), row$package)) {
+    stop(.transit_failure(row, sprintf("its tarball does not hold %s/ alone", row$package)))
+  }
+  top   <- file.path(ex, row$package)
+  paths <- list.files(top, recursive = TRUE, all.files = TRUE, no.. = TRUE)
+  full  <- file.path(top, paths)
+  link  <- Sys.readlink(full)
+  is_link <- nzchar(link)
+  # A link's blob is its target, written to a file of its own to be hashed.
+  src <- full
+  for (i in which(is_link)) {
+    src[[i]] <- file.path(work, sprintf("link-%d", i))
+    writeBin(charToRaw(link[[i]]), src[[i]])
+  }
+  mode <- ifelse(is_link, "120000",
+                 ifelse(bitwAnd(as.integer(file.info(full)$mode), 64L) > 0L, "100755", "100644"))
+  list_file <- file.path(work, "paths")
+  writeLines(src, list_file)
+  blobs <- if (length(src)) {
+    .git_lines(repo, c("hash-object", "-w", "--no-filters", "--stdin-paths"), stdin = list_file)
+  } else character(0L)
+  if (length(blobs) != length(src)) stop(.transit_failure(row, "git hash-object failed"))
+  info <- file.path(work, "index-info")
+  writeBin(unlist(lapply(sprintf("%s %s\t%s", mode, blobs, paths), function(s)
+    c(charToRaw(enc2utf8(s)), as.raw(0L)))) %||% raw(0L), info)
+  env <- paste0("GIT_INDEX_FILE=", shQuote(file.path(work, "index")))
+  if (is.null(.git_lines(repo, c("update-index", "-z", "--index-info"), stdin = info, env = env))) {
+    stop(.transit_failure(row, "git update-index failed"))
+  }
+  tree <- .git_lines(repo, "write-tree", env = env)
+  if (length(tree) != 1L) stop(.transit_failure(row, "git write-tree failed"))
+  tree
+}
+
+.add_transit_version <- function(repo, row, fetch) {
+  ver <- row$version
+  # The mirror tagged it after all: its own commit stands.
+  if (!is.null(.git_lines(repo, c("rev-parse", "--verify", "-q", shQuote(paste0("refs/tags/", ver)))))) {
+    return(ver)
+  }
+  base <- .git_lines(repo, c("rev-parse", "--verify", "-q",
+                             shQuote(paste0("refs/tags/", row$base_version, "^{commit}"))))
+  if (length(base) != 1L) {
+    stop(.transit_failure(row, sprintf("its base %s has no tag in the clone", row$base_version)))
+  }
+  work <- tempfile("ccm_transit_")
+  dir.create(work)
+  on.exit(unlink(work, recursive = TRUE, force = TRUE), add = TRUE)
+  tarball <- file.path(work, "source.tar.gz")
+  if (!isTRUE(fetch(row$url, tarball)) || !file.exists(tarball)) {
+    stop(.transit_failure(row, sprintf("its tarball could not be downloaded from %s", row$url)))
+  }
+  got <- digest::digest(file = tarball, algo = "sha256")
+  if (!identical(got, row$sha256)) {
+    stop(.transit_failure(row, sprintf("its tarball's checksum is %s, not the listed %s",
+                                       got, row$sha256)))
+  }
+  tree <- .transit_tree(repo, row, tarball, work)
+  # Fixed names and dates, so the same copy gives the same commit on every run.
+  who <- c("cran-code-metrics", "cran-code-metrics@users.noreply.github.com")
+  env <- c(paste0("GIT_AUTHOR_NAME=", who[[1L]]), paste0("GIT_AUTHOR_EMAIL=", who[[2L]]),
+           paste0("GIT_COMMITTER_NAME=", who[[1L]]), paste0("GIT_COMMITTER_EMAIL=", who[[2L]]),
+           paste0("GIT_AUTHOR_DATE=", row$released), paste0("GIT_COMMITTER_DATE=", row$released))
+  commit <- .git_lines(repo, c("commit-tree", "--no-gpg-sign", tree, "-p", base,
+                               "-m", shQuote(paste("version", ver))), env = env)
+  if (length(commit) != 1L ||
+      is.null(.git_lines(repo, c("update-ref", shQuote(paste0("refs/tags/", ver)), commit)))) {
+    stop(.transit_failure(row, "its commit could not be written"))
+  }
+  ver
+}
+
+#' Add each Transit version in `rows` to a clone, as a commit of its copy whose
+#' parent is its base tag, tagged with its version, so list_versions walks it
+#' between its base and the next release.
+#'
+#' @param repo  A clone of the package's mirror.
+#' @param rows  The package's rows of read_transit_versions(), or NULL.
+#' @param fetch function(url, destfile) -> TRUE when the copy landed.
+#' @return The tags, one per row. A version that cannot be added raises a
+#'   transit_failure, so its package fails rather than walk without it: a whole
+#'   write would delete its stored row. A cap that fires goes on as itself.
+add_transit_versions <- function(repo, rows, fetch = .fetch_transit_tarball) {
+  if (is.null(rows) || nrow(rows) == 0L) return(character(0L))
+  vapply(seq_len(nrow(rows)), function(i) {
+    row <- rows[i, , drop = FALSE]
+    tryCatch(.add_transit_version(repo, row, fetch),
+             transit_failure = function(e) stop(e),
+             error = function(e) {
+               if (.is_time_limit(e)) stop(e)
+               stop(.transit_failure(row, conditionMessage(e)))
+             })
+  }, character(1L))
 }

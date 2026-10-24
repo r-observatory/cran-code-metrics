@@ -884,6 +884,8 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series,
 #'   .analyzer_limit().
 #' @param prior     The package's stored rows from .prior_state(). The walk then
 #'   reads only the versions .read_plan() names; NULL reads every version.
+#' @param refs      Tags add_transit_versions() put on commits HEAD does not
+#'   reach, so their churn is read with the rest.
 #' @return Named list: $summary, $churn, $api, $functions, $edges, $datasets,
 #'   $vignettes, $text (DESCRIPTION and release-notes rows from
 #'   .release_text_collect()), $binary_versions: the versions whose metrics
@@ -896,9 +898,10 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series,
 #'   the versions read, the diffs redone and the whole churn. An unchanged
 #'   package's frames are empty.
 analyze_package <- function(repo_dir, package, stamped = character(0L),
-                            limit = .analyzer_limit(), prior = NULL) {
+                            limit = .analyzer_limit(), prior = NULL,
+                            refs = character(0L)) {
   versions_df <- list_versions(repo_dir)
-  churn_all   <- package_churn(repo_dir)
+  churn_all   <- package_churn(repo_dir, refs)
   # When the walk listed the versions, before any is read, and each one's tree.
   read_at     <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
   t_plan      <- proc.time()[["elapsed"]]

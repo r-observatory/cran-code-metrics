@@ -33,11 +33,13 @@ clone_package <- function(pkg, dest, base = CRAN_GIT_BASE, token = NULL) {
 
 #' List version-like tags in a local clone, ordered by commit author date.
 #'
-#' Keeps tags whose name starts with a digit (e.g. "1.0", "2.0.1") or that
-#' match the legacy pattern "R-<digit>..." (the "R-" prefix is stripped to
-#' produce the version string).  De-duplicates by commit SHA so that two tags
-#' pointing at the same commit produce only one row (the one whose tag comes
-#' first in date order).
+#' Keeps tags whose name starts with a digit (e.g. "1.0", "2.0.1"), each its own
+#' version. The mirror's "R-x.y.z" tags mark the package as it stood at R
+#' release x.y.z, on commits of an older import of its history, so an R tag
+#' takes the version its commit's subject names ("version 0.11.0") and is left
+#' out when that names none. De-duplicates by commit SHA so that two tags
+#' pointing at the same commit produce only one row, a plain tag before an R
+#' tag, then by version, a plain tag over an R tag and otherwise the latest.
 #'
 #' @param repo  Path to a local git repository directory.
 #' @return data.frame(version, ref, date, commit) ordered by date ascending.
@@ -55,6 +57,7 @@ list_versions <- function(repo) {
 
   # %(objectname)       = SHA of the tag object (commit SHA for lightweight tags)
   # %(authordate:short) = author/tagger date YYYY-MM-DD
+  # %(contents:subject) = the commit's subject, for lightweight tags
   #
   # Note: the %(*objectname) form (dereference annotated tags) contains a
   # literal '(' which the shell misinterprets when system2 pipes stdout through
@@ -66,7 +69,8 @@ list_versions <- function(repo) {
   fmt <- paste0(
     "%(refname:short)%09",
     "%(objectname)%09",
-    "%(authordate:short)"
+    "%(authordate:short)%09",
+    "%(contents:subject)"
   )
   # system2 with stdout=TRUE pipes through /bin/sh; shQuote the format argument
   # so the shell does not interpret the '(' characters in %(field) as a subshell.
@@ -84,30 +88,37 @@ list_versions <- function(repo) {
     tag    <- p[1L]
     sha    <- p[2L]
     adate  <- p[3L]
-    list(tag = tag, commit = sha, date = adate)
+    # An empty subject leaves no fourth field.
+    subj   <- if (length(p) >= 4L) p[4L] else ""
+    list(tag = tag, commit = sha, date = adate, subject = subj)
   })
   rows <- Filter(Negate(is.null), rows)
   if (length(rows) == 0L) return(empty)
 
-  tags    <- vapply(rows, `[[`, character(1L), "tag")
-  commits <- vapply(rows, `[[`, character(1L), "commit")
-  dates   <- vapply(rows, `[[`, character(1L), "date")
+  tags     <- vapply(rows, `[[`, character(1L), "tag")
+  commits  <- vapply(rows, `[[`, character(1L), "commit")
+  dates    <- vapply(rows, `[[`, character(1L), "date")
+  subjects <- vapply(rows, `[[`, character(1L), "subject")
 
-  # Keep only version-like tags: starts with digit, or "R-" + digit
-  is_ver <- grepl("^[0-9]", tags) | grepl("^R-[0-9]", tags)
-  tags    <- tags[is_ver]
-  commits <- commits[is_ver]
-  dates   <- dates[is_ver]
-  if (length(tags) == 0L) return(empty)
+  # A plain tag is its version. An R tag is the version its commit names, or nothing.
+  named   <- "^\\s*version\\s+([0-9][^[:space:]]*)\\s*$"
+  plain   <- grepl("^[0-9]", tags)
+  r_named <- grepl("^R-[0-9]", tags) & grepl(named, subjects, ignore.case = TRUE, perl = TRUE)
+  is_ver  <- plain | r_named
+  if (!any(is_ver)) return(empty)
+  versions <- ifelse(plain, tags, sub(named, "\\1", subjects, ignore.case = TRUE, perl = TRUE))[is_ver]
+  tags     <- tags[is_ver]
+  commits  <- commits[is_ver]
+  dates    <- dates[is_ver]
+  plain    <- plain[is_ver]
 
-  versions <- sub("^R-", "", tags)
-
-  # Sort by author date ascending (NAs last)
-  ord     <- order(dates, na.last = TRUE)
+  # Sort by author date ascending (NAs last), a plain tag before an R tag of the same day.
+  ord      <- order(dates, !plain, na.last = TRUE)
   versions <- versions[ord]
   tags     <- tags[ord]
   commits  <- commits[ord]
   dates    <- dates[ord]
+  plain    <- plain[ord]
 
   # De-duplicate by commit SHA: keep first (oldest) occurrence.
   # Use a hashed environment for O(1) membership tests instead of O(n) %in%.
@@ -121,12 +132,15 @@ list_versions <- function(repo) {
   }
 
   v <- versions[keep]; t <- tags[keep]; d <- dates[keep]; c <- commits[keep]
+  p <- plain[keep]
 
-  # De-duplicate by version string too: some packages tag the same version on
-  # more than one commit (e.g. a plain "1.0" and a legacy "R-1.0"). Keep the
-  # latest-dated occurrence so each version maps to exactly one commit (rows are
-  # ordered by date ascending, so fromLast keeps the newest).
-  vkeep <- !duplicated(v, fromLast = TRUE)
+  # De-duplicate by version string too: an R tag can name the version of a plain
+  # tag on another commit. Each version keeps one commit: its plain tag, or the
+  # latest R tag when it has none (rows are ordered by date ascending).
+  pick  <- vapply(split(seq_along(v), v), function(i) {
+    if (any(p[i])) max(i[p[i]]) else max(i)
+  }, integer(1L))
+  vkeep <- seq_along(v) %in% pick
 
   data.frame(
     version = v[vkeep],

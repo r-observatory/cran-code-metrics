@@ -45,21 +45,99 @@ test_that("list_versions returns versions in date order with correct fields", {
   expect_true(all(nzchar(v$commit)))
 })
 
-test_that("list_versions strips R- prefix from legacy tags", {
-  repo <- tempfile("ccm_git_legacy_")
-  on.exit(unlink(repo, recursive = TRUE), add = TRUE)
-
+# An empty commit dated `day`, its author date being what list_versions orders by.
+.commit_on <- function(repo, day, subject) {
+  stamp <- paste0(day, "T12:00:00")
+  system2("git", c("-C", repo, "-c", "user.email=t@t.test", "-c", "user.name=T",
+                   "commit", "--allow-empty", "-m", shQuote(subject)),
+          stdout = FALSE, stderr = FALSE,
+          env = c(paste0("GIT_AUTHOR_DATE=", stamp), paste0("GIT_COMMITTER_DATE=", stamp)))
+}
+.repo_init <- function(prefix) {
+  repo <- tempfile(prefix)
   dir.create(repo)
   system2("git", c("init", repo), stdout = FALSE, stderr = FALSE)
-  dir.create(file.path(repo, "R"))
-  writeLines("x <- 1", file.path(repo, "R", "x.R"))
-  .git(repo, "add", ".")
-  .gitc(repo, "commit", "-m", shQuote("version 0.9"))
+  repo
+}
+
+test_that("an R- tag whose commit names its version keeps that version", {
+  repo <- .repo_init("ccm_git_legacy_")
+  on.exit(unlink(repo, recursive = TRUE), add = TRUE)
+  .commit_on(repo, "2014-02-02", "version 0.9")
   .git(repo, "tag", "R-0.9")
 
   v <- list_versions(repo)
   expect_equal(v$version, "0.9")
   expect_equal(v$ref, "R-0.9")
+})
+
+test_that("an R release tag is named by the version its commit names, not by the R release", {
+  # The mirror's R-x.y.z tags mark the package as it stood at R release x.y.z, on
+  # commits of an older import of its history. Rcpp's R-3.0.3 is commit 9722a1e,
+  # "version 0.11.0", dated 2014-02-02, while tag 0.11.0 is a4f6408 of 2014-02-03.
+  # Named by the R release, it became a version 3.0.3 of Rcpp.
+  repo <- .repo_init("ccm_git_rrelease_")
+  on.exit(unlink(repo, recursive = TRUE), add = TRUE)
+  .commit_on(repo, "2013-12-09", "version 0.10.6")
+  .git(repo, "tag", "0.10.6")
+  .commit_on(repo, "2014-02-02", "version 0.11.0")
+  .git(repo, "tag", "R-3.0.3")
+  .commit_on(repo, "2014-02-03", "version 0.11.0")
+  .git(repo, "tag", "0.11.0")
+
+  v <- list_versions(repo)
+  expect_equal(v$version, c("0.10.6", "0.11.0"))
+  expect_equal(v$ref, c("0.10.6", "0.11.0"))
+})
+
+test_that("a plain tag wins over an R tag of the same version on the same day", {
+  repo <- .repo_init("ccm_git_sameday_")
+  on.exit(unlink(repo, recursive = TRUE), add = TRUE)
+  .commit_on(repo, "2014-02-03", "version 0.11.0")
+  .git(repo, "tag", "0.11.0")
+  .commit_on(repo, "2014-02-03", "version 0.11.0")
+  .git(repo, "tag", "R-3.0.3")
+
+  v <- list_versions(repo)
+  expect_equal(v$version, "0.11.0")
+  expect_equal(v$ref, "0.11.0")
+})
+
+test_that("an R tag on the same commit as a plain tag gives way to it", {
+  repo <- .repo_init("ccm_git_samecommit_")
+  on.exit(unlink(repo, recursive = TRUE), add = TRUE)
+  .commit_on(repo, "2014-02-03", "version 0.11.0")
+  .git(repo, "tag", "0.11.0")
+  .git(repo, "tag", "R-3.0.3")
+
+  v <- list_versions(repo)
+  expect_equal(nrow(v), 1L)
+  expect_equal(v$ref, "0.11.0")
+})
+
+test_that("an R tag naming a version no plain tag has is kept under that version", {
+  repo <- .repo_init("ccm_git_ronly_")
+  on.exit(unlink(repo, recursive = TRUE), add = TRUE)
+  .commit_on(repo, "2008-10-20", "version 0.6.0")
+  .git(repo, "tag", "R-2.8.0")
+  .commit_on(repo, "2009-01-05", "version 0.6.1")
+  .git(repo, "tag", "0.6.1")
+
+  v <- list_versions(repo)
+  expect_equal(v$version, c("0.6.0", "0.6.1"))
+  expect_equal(v$ref, c("R-2.8.0", "0.6.1"))
+})
+
+test_that("an R tag whose commit names no version is left out", {
+  repo <- .repo_init("ccm_git_rnoname_")
+  on.exit(unlink(repo, recursive = TRUE), add = TRUE)
+  .commit_on(repo, "2010-04-22", "import of the 2.11.0 library")
+  .git(repo, "tag", "R-2.11.0")
+  .commit_on(repo, "2010-05-01", "version 1.2")
+  .git(repo, "tag", "1.2")
+
+  v <- list_versions(repo)
+  expect_equal(v$version, "1.2")
 })
 
 test_that("list_versions deduplicates tags pointing at same commit", {
